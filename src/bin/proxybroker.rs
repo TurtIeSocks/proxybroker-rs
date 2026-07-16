@@ -264,6 +264,11 @@ struct FindArgs {
     #[arg(long)]
     strict: bool,
 
+    /// Fallback endpoint to probe when no judge verifies. Enables graceful degradation; proxies
+    /// confirmed via liveness report anonymity "None" (so combining it with --lvl yields nothing).
+    #[arg(long, value_name = "URL")]
+    liveness_url: Option<String>,
+
     /// Print an aggregate summary (by protocol/anonymity/country) to stderr when done.
     #[arg(long)]
     show_stats: bool,
@@ -722,7 +727,8 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         .max_conn(args.max_conn)
         .max_tries(args.max_tries)
         .post(args.post)
-        .strict(args.strict);
+        .strict(args.strict)
+        .liveness_url(args.liveness_url);
     if !args.countries.is_empty() {
         builder = builder.countries(args.countries);
     }
@@ -810,6 +816,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         max_tries: args.max_tries,
         post: args.post,
         strict: args.strict,
+        liveness_url: None, // --liveness-url is a find-only flag; check works from an explicit list
     };
 
     let mut stream = broker

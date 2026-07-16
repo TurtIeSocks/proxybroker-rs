@@ -82,6 +82,9 @@ pub struct FindQuery {
     pub post: bool,
     /// Require the anonymity level to match exactly.
     pub strict: bool,
+    /// Fallback liveness URL: when no judge verifies, validate proxies with a 200 from this URL
+    /// instead of failing. `None` keeps strict judge-required behavior (A2).
+    pub liveness_url: Option<String>,
 }
 
 impl Default for FindQuery {
@@ -97,6 +100,7 @@ impl Default for FindQuery {
             max_tries: 3,
             post: false,
             strict: false,
+            liveness_url: None,
         }
     }
 }
@@ -123,6 +127,7 @@ pub struct FindQueryBuilder {
     max_tries: Option<usize>,
     post: Option<bool>,
     strict: Option<bool>,
+    liveness_url: Option<String>,
 }
 
 impl FindQueryBuilder {
@@ -187,6 +192,12 @@ impl FindQueryBuilder {
         self
     }
 
+    /// Fallback liveness URL for graceful degradation when no judge verifies (A2).
+    pub fn liveness_url(mut self, url: Option<String>) -> Self {
+        self.liveness_url = url;
+        self
+    }
+
     /// Finalize. Unset fields take their [`FindQuery::default`] values. Note `limit` was already
     /// normalized by [`limit`](Self::limit) (0 → `None`), so `None` here means "unset", which
     /// `Default` also renders as unlimited.
@@ -203,6 +214,7 @@ impl FindQueryBuilder {
             max_tries: self.max_tries.unwrap_or(d.max_tries),
             post: self.post.unwrap_or(d.post),
             strict: self.strict.unwrap_or(d.strict),
+            liveness_url: self.liveness_url.or(d.liveness_url),
         }
     }
 }
@@ -377,6 +389,7 @@ impl Broker {
                 post: query.post,
                 strict: query.strict,
                 dnsbl: query.dnsbl.clone(),
+                liveness_url: query.liveness_url.clone(),
             },
             resolver,
             &self.client,
@@ -716,6 +729,7 @@ mod tests {
                 max_tries: 2,
                 post: true,
                 strict: true,
+                liveness_url: None,
             }
         );
     }

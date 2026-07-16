@@ -12,7 +12,7 @@ use crate::judge::{Judge, JudgePool};
 use crate::negotiator::{negotiate, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
-use crate::types::{AnonLevel, Proto, TypeSpec};
+use crate::types::{AnonLevel, JudgeScheme, Proto, TypeSpec};
 use crate::utils::{fresh_marker, get_all_ip, get_status_code, request_headers};
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
@@ -33,6 +33,48 @@ pub struct Checker {
     /// reject a listed proxy before doing any real work.
     dnsbl: Vec<String>,
     resolver: std::sync::Arc<Resolver>,
+    /// Judged (a verified judge pool) or Liveness (graceful degradation, A2).
+    mode: CheckMode,
+}
+
+/// How the checker validates a proxy: against a verified judge, or — when no judge came up and the
+/// caller supplied a liveness URL — by a plain fetch-through-the-proxy 200 check (A2).
+enum CheckMode {
+    Judged,
+    Liveness(LivenessTarget),
+}
+
+/// A resolved liveness endpoint: a plain URL the checker GETs through the proxy, expecting 200.
+struct LivenessTarget {
+    host: String,
+    path: String,
+    ip: IpAddr,
+    scheme: JudgeScheme,
+}
+
+impl LivenessTarget {
+    /// Parse + resolve a liveness URL. Reuses [`Judge::parse`] for scheme/host/path. `None` if the
+    /// URL is malformed, is an SMTP URL (liveness is an HTTP GET), or the host does not resolve.
+    async fn resolve(url: &str, resolver: &Resolver) -> Option<LivenessTarget> {
+        let judge = Judge::parse(url)?;
+        if judge.scheme == JudgeScheme::Smtp {
+            return None;
+        }
+        let ip = resolver.resolve(&judge.host).await.ok()?;
+        Some(LivenessTarget {
+            host: judge.host,
+            path: judge.path,
+            ip,
+            scheme: judge.scheme,
+        })
+    }
+}
+
+/// What a single [`Checker::attempt`] validates against — a judge (with anonymity classification)
+/// or a liveness target (200 = working, level `None`).
+enum Probe<'a> {
+    Judged(&'a Judge),
+    Liveness(&'a LivenessTarget),
 }
 
 impl std::fmt::Debug for Checker {
@@ -62,6 +104,10 @@ pub struct CheckerConfig {
     pub strict: bool,
     /// DNS blocklist zones (`--dnsbl`); a proxy whose IP is listed in any zone is rejected.
     pub dnsbl: Vec<String>,
+    /// When the judge pool is empty, fall back to a plain liveness check against this URL instead
+    /// of failing with `NoJudges`. `None` keeps the strict judge-required behavior. Proxies
+    /// confirmed this way carry anonymity level `None` (unclassifiable without a judge).
+    pub liveness_url: Option<String>,
 }
 
 impl Checker {
@@ -85,9 +131,20 @@ impl Checker {
         let candidates: Vec<Judge> = urls.iter().filter_map(|u| Judge::parse(u)).collect();
         let judges =
             JudgePool::probe_all(candidates, &resolver, client, &real_ext_ips, cfg.timeout).await;
-        if judges.is_empty() {
-            return Err(Error::NoJudges);
-        }
+        // No judge came up: fail as before, unless a liveness URL enables graceful degradation
+        // (A2). A malformed/unresolvable liveness URL still errors — there is nothing to check.
+        let mode = if judges.is_empty() {
+            match &cfg.liveness_url {
+                Some(url) => CheckMode::Liveness(
+                    LivenessTarget::resolve(url, &resolver)
+                        .await
+                        .ok_or(Error::NoJudges)?,
+                ),
+                None => return Err(Error::NoJudges),
+            }
+        } else {
+            CheckMode::Judged
+        };
         Ok(Checker {
             judges,
             real_ext_ips,
@@ -98,6 +155,7 @@ impl Checker {
             strict: cfg.strict,
             dnsbl: cfg.dnsbl,
             resolver,
+            mode,
         })
     }
 
@@ -157,18 +215,35 @@ impl Checker {
     /// a timeout retries (`continue`), any other proxy error stops (`break`).
     async fn check_one(&self, proxy: &mut Proxy, proto: Proto) -> bool {
         let scheme = proto.judge_scheme();
-        let Some(judge) = self.judges.random(scheme) else {
-            return false; // no judge for this scheme
-        };
-        let target = Target {
-            host: judge.host.clone(),
-            ip: judge.ip,
-            port: scheme.default_port(),
+        // Resolve the probe + target for this protocol. Judged mode routes to a random judge for
+        // the scheme; Liveness mode always probes the single liveness endpoint.
+        let judge; // holds the Arc alive across the retry loop in Judged mode
+        let (probe, target) = match &self.mode {
+            CheckMode::Judged => {
+                let Some(j) = self.judges.random(scheme) else {
+                    return false; // no judge for this scheme
+                };
+                judge = j;
+                let target = Target {
+                    host: judge.host.clone(),
+                    ip: judge.ip,
+                    port: scheme.default_port(),
+                };
+                (Probe::Judged(&judge), target)
+            }
+            CheckMode::Liveness(lt) => {
+                let target = Target {
+                    host: lt.host.clone(),
+                    ip: Some(lt.ip),
+                    port: lt.scheme.default_port(),
+                };
+                (Probe::Liveness(lt), target)
+            }
         };
 
         for _ in 0..self.max_tries {
             let start = Instant::now();
-            match self.attempt(proxy, proto, &judge, &target).await {
+            match self.attempt(proxy, proto, &probe, &target).await {
                 Ok(Attempt::Working(level)) => {
                     proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
                     proxy.add_type(proto, level);
@@ -199,7 +274,7 @@ impl Checker {
         &self,
         proxy: &Proxy,
         proto: Proto,
-        judge: &Judge,
+        probe: &Probe<'_>,
         target: &Target,
     ) -> Result<Attempt, ProxyError> {
         let tcp = tokio::time::timeout(self.timeout, TcpStream::connect((proxy.host, proxy.port)))
@@ -216,7 +291,15 @@ impl Checker {
             return Ok(Attempt::Working(None));
         }
 
-        let (request, marker) = self.build_request(judge, proto);
+        // Build + send the request; the connect/negotiate/send/read/status handling is identical
+        // for both modes — only what we assert about the 200 response differs.
+        let (request, marker) = match probe {
+            Probe::Judged(judge) => {
+                let (req, marker) = self.build_request(judge, proto);
+                (req, Some(marker))
+            }
+            Probe::Liveness(lt) => (self.build_liveness_request(lt, proto), None),
+        };
         tokio::time::timeout(self.timeout, stream.write_all(&request))
             .await
             .map_err(|_| ProxyError::Timeout)?
@@ -227,17 +310,45 @@ impl Checker {
         if get_status_code(head, 9, 12) != 200 {
             return Err(ProxyError::BadStatus);
         }
-        let content = decompress(head, body);
 
-        if !response_is_valid(&content, &marker) {
-            return Ok(Attempt::Invalid);
+        match probe {
+            // Liveness: a 200 through the proxy is the whole check; there is no judge to reflect
+            // markers/IPs, so anonymity is unclassifiable → level None.
+            Probe::Liveness(_) => Ok(Attempt::Working(None)),
+            Probe::Judged(judge) => {
+                let content = decompress(head, body);
+                let marker = marker.expect("judged mode always builds a marker");
+                if !response_is_valid(&content, &marker) {
+                    return Ok(Attempt::Invalid);
+                }
+                let level = if proto.checks_anon_level() {
+                    Some(self.anonymity_level(&content, judge))
+                } else {
+                    None
+                };
+                Ok(Attempt::Working(level))
+            }
         }
-        let level = if proto.checks_anon_level() {
-            Some(self.anonymity_level(&content, judge))
+    }
+
+    /// A plain `GET` for the liveness endpoint (A2), routed like the test request: absolute-form
+    /// for plain HTTP (it goes to the proxy), origin-form when tunnelled. No marker/cookie/referer
+    /// — there is no judge to reflect them; only the 200 matters.
+    fn build_liveness_request(&self, lt: &LivenessTarget, proto: Proto) -> Vec<u8> {
+        let mut hdrs = request_headers(None);
+        hdrs.insert("Host", lt.host.clone());
+        hdrs.insert("Connection", "close".to_owned());
+        let path = if proto.uses_full_path() {
+            format!("http://{}{}", lt.host, lt.path)
         } else {
-            None
+            lt.path.clone()
         };
-        Ok(Attempt::Working(level))
+        let headers: String = hdrs
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        format!("GET {path} HTTP/1.1\r\n{headers}\r\n\r\n").into_bytes()
     }
 
     /// Build the test request. HTTP uses an absolute-form request URI (it goes to the proxy,
