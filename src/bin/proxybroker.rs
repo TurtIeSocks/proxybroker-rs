@@ -74,7 +74,7 @@ enum Command {
 }
 
 #[cfg(feature = "server")]
-#[derive(clap::Args)]
+#[derive(clap::Args, Default)]
 struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8888")]
@@ -88,6 +88,22 @@ struct ServeArgs {
     /// of finding fresh ones. The pool serves these, then drains (no top-up).
     #[arg(long, value_name = "PATH", conflicts_with = "types")]
     load: Option<PathBuf>,
+
+    /// Anonymity levels to accept for HTTP (e.g. High Anonymous). Default: any.
+    #[arg(long, num_args = 1.., value_name = "LVL", value_parser = parse_lvl)]
+    lvl: Vec<AnonLevel>,
+
+    /// DNS blocklist zones; reject proxies listed in any (e.g. zen.spamhaus.org).
+    #[arg(long, num_args = 1.., value_name = "ZONE")]
+    dnsbl: Vec<String>,
+
+    /// Use POST instead of GET for the pool-fill test request.
+    #[arg(long)]
+    post: bool,
+
+    /// Require the anonymity level to match exactly.
+    #[arg(long)]
+    strict: bool,
 
     /// Keep the pool topped up to this many working proxies.
     #[arg(long, default_value_t = 100)]
@@ -369,18 +385,9 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         eprintln!("loaded {} proxies from {}", loaded.len(), path.display());
         Pool::from_proxies(loaded, pool_config)
     } else {
-        let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
-        // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
-        // would grab forever), matching api.py's `if limit <= 0: raise ValueError` — so
-        // `.limit(max(1))` here can never resolve to the builder's unlimited (None).
-        let mut fq = FindQuery::builder()
-            .types(types)
-            .limit(args.limit.max(1))
-            .timeout(Duration::from_secs(args.timeout));
-        if !args.countries.is_empty() {
-            fq = fq.countries(args.countries);
-        }
-        let stream = broker.find(fq.build()).await?;
+        // Find proxies to fill the pool, filtered by the serve flags (types/lvl/strict/post/
+        // dnsbl/countries). The flag→query mapping lives in the pure `serve_query`.
+        let stream = broker.find(serve_query(&args)).await?;
         Pool::spawn(stream, pool_config)
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
@@ -394,6 +401,25 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     handle.shutdown();
     eprintln!("shutting down");
     Ok(())
+}
+
+/// Build the pool-fill `FindQuery` from the serve flags. Pure (no I/O, no broker) so the
+/// flag→query mapping is unit-testable offline — the filtering itself runs upstream in `find`.
+/// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
+/// matching api.py's `if limit <= 0: raise ValueError`.
+#[cfg(feature = "server")]
+fn serve_query(args: &ServeArgs) -> FindQuery {
+    let mut b = FindQuery::builder()
+        .types(types_from(args.types.clone(), args.lvl.clone()))
+        .limit(args.limit.max(1))
+        .dnsbl(args.dnsbl.clone())
+        .timeout(Duration::from_secs(args.timeout))
+        .post(args.post)
+        .strict(args.strict);
+    if !args.countries.is_empty() {
+        b = b.countries(args.countries.clone());
+    }
+    b.build()
 }
 
 async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -579,4 +605,28 @@ fn init_tracing(level: &str) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_query_threads_lvl_and_strict() {
+        // The four passthrough flags must reach the FindQuery that fills the pool; before B3 they
+        // were dropped, so anonymity-filtered serving was impossible.
+        let args = ServeArgs {
+            types: vec![Proto::Http],
+            lvl: vec![AnonLevel::High],
+            strict: true,
+            post: true,
+            dnsbl: vec!["zen.spamhaus.org".into()],
+            ..Default::default()
+        };
+        let q = serve_query(&args);
+        assert_eq!(q.types[0].levels, Some(vec![AnonLevel::High]));
+        assert!(q.strict);
+        assert!(q.post);
+        assert_eq!(q.dnsbl, vec!["zen.spamhaus.org".to_string()]);
+    }
 }
