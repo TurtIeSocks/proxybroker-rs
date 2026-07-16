@@ -625,5 +625,40 @@ mod tests {
             ],
             "top-level Proxy JSON keys are frozen at v1"
         );
+
+        // A top-level-only check is addition-blind: a new key nested inside geo / geo.country /
+        // geo.region / a types[] element (serde_json indexes a missing key to Null, so only
+        // *removals* trip a path assertion) would drift the schema silently. Freeze the nested
+        // key sets too so any added field must consciously bump the format variant.
+        fn sorted_keys(val: &serde_json::Value) -> Vec<&str> {
+            let mut k: Vec<&str> = val
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            k.sort_unstable();
+            k
+        }
+        assert_eq!(
+            sorted_keys(&v["geo"]),
+            ["city", "country", "region"],
+            "geo shape frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["geo"]["country"]),
+            ["code", "name"],
+            "geo.country frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["geo"]["region"]),
+            ["code", "name"],
+            "geo.region frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["types"][0]),
+            ["level", "type"],
+            "types[] element frozen"
+        );
     }
 }
