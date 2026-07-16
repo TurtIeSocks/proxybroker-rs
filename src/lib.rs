@@ -8,8 +8,11 @@
 //! **Status: in development.** The module tree is being built out against
 //! `docs/systematic-refactor/map.md`.
 
+pub mod error;
+pub mod parse;
 pub mod types;
 
+pub use error::{Error, ProxyError};
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
 
 /// Country lookup against a MaxMind-format database.
