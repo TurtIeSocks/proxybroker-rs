@@ -47,6 +47,8 @@ pub mod server;
 pub mod stats;
 pub mod types;
 pub mod utils;
+#[cfg(all(feature = "server", feature = "watch"))]
+pub mod watch;
 
 pub use broker::{Broker, FindQuery, FindQueryBuilder, GrabQuery, ProxyStream};
 pub use checker::{Checker, CheckerConfig, RetryPolicy, TrustReport, TrustSignal};
@@ -70,3 +72,5 @@ pub use server::{render_metrics, serve_metrics};
 pub use server::{serve, ClientKey, Pool, PoolConfig, PoolSnapshot, ServerHandle, Strategy};
 pub use stats::Stats;
 pub use types::{AnonLevel, Caps, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
+#[cfg(all(feature = "server", feature = "watch"))]
+pub use watch::{reconcile, spawn_watch, WatchHandle};

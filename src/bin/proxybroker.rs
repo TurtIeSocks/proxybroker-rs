@@ -227,6 +227,11 @@ struct ServeArgs {
     /// Score half-life for an unseen proxy, seconds.
     #[arg(long, default_value_t = 21600)]
     decay_halflife: u64,
+
+    /// Live-reload the --load file: apply additions/removals to the running pool without a restart
+    /// (E3; requires --load and the `watch` build feature).
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(clap::Args)]
@@ -815,6 +820,24 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
             }
             None => {
                 eprintln!("--recheck requires --state; re-checking disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // E3: live-reload the --load file into the running pool. Needs --load (nothing to watch
+    // otherwise). Handle lives until shutdown (its Drop stops the watcher). Cloned before `serve`
+    // takes the pool.
+    #[cfg(feature = "watch")]
+    let _watcher = if args.watch {
+        match args.load.as_ref() {
+            Some(path) => {
+                eprintln!("live-reloading {} on change", path.display());
+                Some(proxybroker::spawn_watch(pool.clone(), path.clone())?)
+            }
+            None => {
+                eprintln!("--watch requires --load; live-reload disabled");
                 None
             }
         }

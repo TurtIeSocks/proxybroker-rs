@@ -39,6 +39,8 @@ persist = []
 store-sqlite = ["persist", "dep:rusqlite"]
 # store-redis (deferred to Wave 9): store-redis = ["persist", "dep:redis"] — an atomic EWMA upsert
 # needs a Lua EVAL / WATCH-MULTI (no SQL ON CONFLICT), plus an async client + test infra.
+# Live-reload the `serve --load` file (E3): a filesystem watcher reconciles the running pool.
+watch = ["server", "dep:notify"]
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.
@@ -83,6 +85,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optio
 indicatif = { version = "0.18", optional = true }
 # `bundled` compiles SQLite from source: no system libsqlite3, static link (matches the musl goal).
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+notify = { version = "8", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
