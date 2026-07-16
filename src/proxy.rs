@@ -284,10 +284,22 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             #[serde(default)]
             name: String,
         }
+        // region/city sit beside `country` under `geo` in the JSON (see Serialize), not inside it.
+        #[derive(serde::Deserialize, Default)]
+        struct RawRegion {
+            #[serde(default)]
+            code: String,
+            #[serde(default)]
+            name: String,
+        }
         #[derive(serde::Deserialize, Default)]
         struct RawGeo {
             #[serde(default)]
             country: RawCountry,
+            #[serde(default)]
+            region: RawRegion,
+            #[serde(default)]
+            city: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RawType {
@@ -315,10 +327,21 @@ impl<'de> serde::Deserialize<'de> for Proxy {
         let geo = if code.is_empty() {
             None
         } else {
+            // Round-trip region/city too (a City DB populates them): empty region → None,
+            // matching how Serialize renders an absent region as {code:"",name:""}.
+            let region = if raw.geo.region.code.is_empty() && raw.geo.region.name.is_empty() {
+                None
+            } else {
+                Some(Region {
+                    code: raw.geo.region.code,
+                    name: raw.geo.region.name,
+                })
+            };
             Some(Country {
                 code,
                 name: raw.geo.country.name,
-                ..Default::default()
+                region,
+                city: raw.geo.city.filter(|s| !s.is_empty()),
             })
         };
         let mut types = BTreeMap::new();
@@ -426,6 +449,26 @@ mod tests {
         x.add_type(Proto::Socks5, None);
         let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
         assert_eq!(back.geo, None);
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn geo_region_city_round_trip() {
+        // A City DB populates region/city; the save/load round-trip must preserve them (they are
+        // never re-resolved on --load, so dropping them would be silent, irrecoverable data loss).
+        let mut x = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        x.geo = Some(Country {
+            code: "SE".into(),
+            name: "Sweden".into(),
+            region: Some(Region {
+                code: "E".into(),
+                name: "Östergötland".into(),
+            }),
+            city: Some("Linköping".into()),
+        });
+        x.add_type(Proto::Http, Some(AnonLevel::High));
+        let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+        assert_eq!(back.geo, x.geo);
         assert_eq!(back, x);
     }
 
