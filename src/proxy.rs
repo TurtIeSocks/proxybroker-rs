@@ -263,10 +263,15 @@ impl<'de> serde::Deserialize<'de> for Proxy {
         let raw = Raw::deserialize(d)?;
         let host: IpAddr = raw.host.parse().map_err(D::Error::custom)?;
         // Serialize emits an empty code for "no geo"; map that back to None.
-        let geo = (!raw.geo.country.code.is_empty()).then(|| Country {
-            code: raw.geo.country.code,
-            name: raw.geo.country.name,
-        });
+        let code = raw.geo.country.code;
+        let geo = if code.is_empty() {
+            None
+        } else {
+            Some(Country {
+                code,
+                name: raw.geo.country.name,
+            })
+        };
         let mut types = BTreeMap::new();
         for t in raw.types {
             let proto: Proto = t.proto.parse().map_err(D::Error::custom)?;
@@ -289,6 +294,34 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             runtimes: Vec::new(),
         })
     }
+}
+
+/// Write proxies as NDJSON — one `serde_json` object per line, the exact bytes `Format::Json`
+/// already emits to stdout. This is the roadmap's deliberate minimal persistence step (flat file,
+/// no schema/index/migration) that must ship before SQLite; see `docs/roadmap` (C2).
+pub fn write_ndjson<W: std::io::Write>(mut writer: W, proxies: &[Proxy]) -> std::io::Result<()> {
+    for p in proxies {
+        // to_writer can't fail on a Proxy (no non-string map keys, no NaN in the wire shape), but
+        // the writer can — surface that as the io::Error it already is.
+        serde_json::to_writer(&mut writer, p).map_err(std::io::Error::from)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Read proxies from NDJSON. Blank lines are skipped; the first malformed line aborts with an
+/// [`std::io::ErrorKind::InvalidData`] error. Reader-generic so tests use an in-memory cursor.
+pub fn read_ndjson<R: std::io::BufRead>(reader: R) -> std::io::Result<Vec<Proxy>> {
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let p = serde_json::from_str(&line).map_err(std::io::Error::from)?;
+        out.push(p);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -356,6 +389,44 @@ mod tests {
         assert_eq!(p.avg_resp_time(), 0.0); // not restored
         assert_eq!(p.error_rate(), 0.0);
         assert_eq!(p.types().get(&Proto::Http), Some(&Some(AnonLevel::High)));
+    }
+
+    #[test]
+    fn ndjson_round_trips_via_cursor() {
+        // Persist a checked pool and reload it — fully in-memory, no temp files (constraint C5).
+        let mut a = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        a.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+        });
+        a.add_type(Proto::Http, Some(AnonLevel::High));
+        let mut b = Proxy::new("5.6.7.8".parse().unwrap(), 3128, BTreeSet::new());
+        b.add_type(Proto::Socks5, None);
+        let proxies = vec![a, b];
+
+        let mut buf = Vec::new();
+        write_ndjson(&mut buf, &proxies).unwrap();
+        // One object per line, so N proxies => N newlines.
+        assert_eq!(buf.iter().filter(|&&c| c == b'\n').count(), proxies.len());
+
+        let back = read_ndjson(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(back, proxies);
+    }
+
+    #[test]
+    fn read_ndjson_skips_blank_lines() {
+        let p = Proxy::new("1.2.3.4".parse().unwrap(), 80, BTreeSet::new());
+        let line = serde_json::to_string(&p).unwrap();
+        // Leading, interior, and trailing blank lines must not break parsing.
+        let text = format!("\n{line}\n\n{line}\n\n");
+        let back = read_ndjson(std::io::Cursor::new(text.into_bytes())).unwrap();
+        assert_eq!(back, vec![p.clone(), p]);
+    }
+
+    #[test]
+    fn read_ndjson_propagates_parse_error() {
+        let err = read_ndjson(std::io::Cursor::new(b"not json\n".to_vec())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

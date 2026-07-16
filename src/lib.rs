@@ -51,7 +51,7 @@ pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
 pub use parse::parse_proxy_lines;
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
-pub use proxy::{Country, Proxy};
+pub use proxy::{read_ndjson, write_ndjson, Country, Proxy};
 pub use resolver::Resolver;
 #[cfg(feature = "server")]
 pub use server::{serve, Pool, PoolConfig, ServerHandle};
