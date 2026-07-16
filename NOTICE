@@ -1,0 +1,62 @@
+proxybroker-rs
+Copyright 2026 proxybroker-rs contributors
+
+This product includes software developed as part of ProxyBroker and ProxyBroker2:
+
+  ProxyBroker
+  Copyright 2015-2018 Constverum <constverum@gmail.com>
+  https://github.com/constverum/ProxyBroker
+
+  ProxyBroker2
+  Copyright 2018-2025 BlueT - Matthew Lien - 練喆明 <bluet@bluet.org>
+  https://github.com/bluet/proxybroker2
+
+Both are licensed under the Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+STATEMENT OF CHANGES (Apache License 2.0, Section 4(b))
+--------------------------------------------------------------------------------
+
+proxybroker-rs is a derivative work: a rewrite of ProxyBroker2 (Python 3 /
+asyncio) into Rust (tokio). It is not a copy, a translation, or a binding. No
+Python source is redistributed. The following changes were made relative to the
+original work:
+
+  1. Language and runtime. Python 3.10+/asyncio replaced by Rust/tokio. All
+     source was rewritten. Program structure, protocol handling, provider list,
+     and the observable behaviour of proxy discovery, checking, and serving are
+     derived from the original.
+
+  2. Geolocation data. The original bundles MaxMind's GeoLite2-Country database
+     inside its distributed package. proxybroker-rs does NOT redistribute any
+     MaxMind data. It bundles DB-IP Country Lite instead (see LICENSE-DATA), and
+     supports a user-supplied database path. See docs/systematic-refactor/
+     research.md for the analysis behind this change.
+
+  3. Public API. The Python API (Broker, Proxy, Judge, Provider, Checker,
+     Server, ProxyPool and the provider_utils helpers) was redesigned to be
+     idiomatic Rust rather than transliterated. Behavioural parity is the goal;
+     API-shape parity is not. Deliberate behavioural deviations are recorded in
+     docs/systematic-refactor/map.md.
+
+  4. Provider registry. Providers whose domains no longer resolve as of
+     2026-07-15 were not carried over. Providers are expressed as data
+     (configuration) rather than as subclasses.
+
+  5. Bug fixes. Defects identified in the original during the port are fixed
+     rather than reproduced. Each is recorded as a deviation in
+     docs/systematic-refactor/map.md.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY DATA
+--------------------------------------------------------------------------------
+
+When built with the "geo-bundled" feature (enabled by default), this product
+includes the DB-IP Country Lite database:
+
+  IP Geolocation by DB-IP (https://db-ip.com)
+  Licensed under the Creative Commons Attribution 4.0 International License
+  (CC BY 4.0). See LICENSE-DATA for the full terms.
+
+Build with --no-default-features, or with default-features off and without the
+"geo-bundled" feature, to exclude this data entirely.
