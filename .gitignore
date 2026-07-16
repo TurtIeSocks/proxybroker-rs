@@ -1,8 +1,3 @@
 /target
 **/*.rs.bk
 *.pdb
-
-# The bundled geo database is fetched by `xtask fetch-geo` / build script, not
-# committed. See docs/systematic-refactor/research.md — it is CC BY 4.0 data, and
-# it is refreshed per release rather than tracked in git history.
-/data/*.mmdb
