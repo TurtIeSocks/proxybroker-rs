@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Find, check, and serve public HTTP(S) and SOCKS4/5 proxies. Library + CLI."
-repository = "https://github.com/rin/proxybroker-rs"
+repository = "https://github.com/TurtIeSocks/proxybroker-rs"
+homepage = "https://github.com/TurtIeSocks/proxybroker-rs"
 license = "Apache-2.0"
 readme = "README.md"
 keywords = ["proxy", "socks", "http", "scraper", "checker"]
@@ -12,7 +13,10 @@ categories = ["network-programming", "command-line-utilities"]
 # The bundled geo database is data, not code, and is licensed separately (CC BY 4.0).
 # See LICENSE-DATA and NOTICE. Never let the blanket Apache-2.0 imply we can
 # sublicense the data — that is precisely the mistake proxybroker2 made.
-include = ["src/**/*", "data/*.mmdb", "LICENSE", "LICENSE-DATA", "NOTICE", "README.md"]
+# data/* covers the geo mmdb (runtime, via include_bytes!) AND providers.yaml (runtime, via
+# include_str!). Missing providers.yaml here makes a published crate fail to compile — caught
+# by `cargo publish --dry-run`, which is why release CI runs it.
+include = ["src/**/*", "examples/**/*", "data/*", "LICENSE", "LICENSE-DATA", "NOTICE", "README.md"]
 
 [features]
 default = ["cli", "server", "geo", "geo-bundled"]
