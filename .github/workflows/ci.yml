@@ -1,0 +1,60 @@
+name: CI
+
+# Gate every pull request (and pushes to main) on the same checks enforced locally: formatting,
+# clippy with warnings-as-errors, and the full offline test suite across the feature matrix —
+# both --all-features (the geo path) and --no-default-features (the geo-free path a pure-library
+# consumer gets, which has genuinely divergent runtime code).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One in-flight run per ref. A PR's merge ref (refs/pull/N/merge) is stable per PR, so a newer
+# push to the PR cancels its previous run. Every push to main shares refs/heads/main, so cancel
+# is gated to pull_request events only — that way each commit landing on main keeps its own CI
+# result instead of a back-to-back merge cancelling the earlier commit's in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml already pins stable; installing it explicitly (with the components
+      # clippy/rustfmt need) matches the release workflow and avoids an implicit toolchain
+      # install on the first cargo call.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      # The suite is designed to run fully offline (local mock servers only), so it is safe and
+      # deterministic in CI — no network, no flakiness. --all-features covers the geo path; since
+      # `default` == all four features, this also compiles the default lib + CLI binary.
+      - name: Test (all features)
+        run: cargo test --all-features --locked
+
+      # Exercise the geo-free path too. The broker has divergent no-geo runtime code (the no-op
+      # attach_geo, the geo-less BrokerBuilder::build arm) that the all-features run never hits;
+      # the find/check integration tests assemble it under --no-default-features. The CLI binary
+      # is skipped here (required-features = ["cli"]), so no test changes are needed.
+      - name: Test (no default features)
+        run: cargo test --no-default-features --locked

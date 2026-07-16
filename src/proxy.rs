@@ -22,7 +22,13 @@ pub struct Country {
 }
 
 /// A proxy: where it is, what it can do, and how well it has done it.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (not `Eq` — the `runtimes: Vec<f64>` field blocks it) lets a save/load round-trip
+/// be asserted. The round-trip is **lossy on stats by design**: `Serialize` emits the computed
+/// `avg_resp_time`/`error_rate` for humans, but `Deserialize` restores only the persistent
+/// identity (host, port, geo, confirmed types) with `requests`/`errors`/`runtimes` empty — a
+/// loaded proxy's timing history restarts.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Proxy {
     pub host: IpAddr,
     pub port: u16,
@@ -215,6 +221,109 @@ impl Serialize for Proxy {
     }
 }
 
+/// Read a `Proxy` back from the JSON its [`Serialize`] emits, so a saved pool reloads without
+/// re-checking (Wave 1 C2). Restores the persistent identity — host, port, geo, confirmed
+/// types — and leaves `expected_types`/`requests`/`errors`/`runtimes` empty (they are not
+/// serialized; the computed `avg_resp_time`/`error_rate` fields are read and discarded).
+impl<'de> serde::Deserialize<'de> for Proxy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        #[derive(serde::Deserialize, Default)]
+        struct RawCountry {
+            #[serde(default)]
+            code: String,
+            #[serde(default)]
+            name: String,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct RawGeo {
+            #[serde(default)]
+            country: RawCountry,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawType {
+            #[serde(rename = "type")]
+            proto: String,
+            #[serde(default)]
+            level: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            host: String,
+            port: u16,
+            #[serde(default)]
+            geo: RawGeo,
+            #[serde(default)]
+            types: Vec<RawType>,
+            // avg_resp_time / error_rate are present in the JSON but computed, not stored —
+            // serde ignores them (no field here).
+        }
+
+        let raw = Raw::deserialize(d)?;
+        let host: IpAddr = raw.host.parse().map_err(D::Error::custom)?;
+        // Serialize emits an empty code for "no geo"; map that back to None.
+        let code = raw.geo.country.code;
+        let geo = if code.is_empty() {
+            None
+        } else {
+            Some(Country {
+                code,
+                name: raw.geo.country.name,
+            })
+        };
+        let mut types = BTreeMap::new();
+        for t in raw.types {
+            let proto: Proto = t.proto.parse().map_err(D::Error::custom)?;
+            let level = if t.level.is_empty() {
+                None
+            } else {
+                Some(t.level.parse::<AnonLevel>().map_err(D::Error::custom)?)
+            };
+            types.insert(proto, level);
+        }
+
+        Ok(Proxy {
+            host,
+            port: raw.port,
+            expected_types: BTreeSet::new(),
+            geo,
+            types,
+            requests: 0,
+            errors: HashMap::new(),
+            runtimes: Vec::new(),
+        })
+    }
+}
+
+/// Write proxies as NDJSON — one `serde_json` object per line, the exact bytes `Format::Json`
+/// already emits to stdout. This is the roadmap's deliberate minimal persistence step (flat file,
+/// no schema/index/migration) that must ship before SQLite; see `docs/roadmap` (C2).
+pub fn write_ndjson<W: std::io::Write>(mut writer: W, proxies: &[Proxy]) -> std::io::Result<()> {
+    for p in proxies {
+        // to_writer can't fail on a Proxy (no non-string map keys, no NaN in the wire shape), but
+        // the writer can — surface that as the io::Error it already is.
+        serde_json::to_writer(&mut writer, p).map_err(std::io::Error::from)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Read proxies from NDJSON. Blank lines are skipped; the first malformed line aborts with an
+/// [`std::io::ErrorKind::InvalidData`] error. Reader-generic so tests use an in-memory cursor.
+pub fn read_ndjson<R: std::io::BufRead>(reader: R) -> std::io::Result<Vec<Proxy>> {
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let p = serde_json::from_str(&line).map_err(std::io::Error::from)?;
+        out.push(p);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +349,84 @@ mod tests {
         assert_eq!(x.error_rate(), 0.0);
         assert_eq!(x.avg_resp_time(), 0.0);
         assert!(!x.is_working());
+    }
+
+    #[test]
+    fn deserialize_round_trips_serialized_fields() {
+        // A proxy with no recorded attempts (empty stats) round-trips exactly: identity fields
+        // (host/port/geo/types) survive; the lossy stats fields are empty on both sides.
+        let mut x = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        x.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+        });
+        x.add_type(Proto::Http, Some(AnonLevel::High));
+        x.add_type(Proto::Connect80, None);
+
+        let json = serde_json::to_string(&x).unwrap();
+        let back: Proxy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn no_geo_round_trips_to_none() {
+        // Serialize emits an empty country code for no-geo; Deserialize must map it back to None.
+        let mut x = Proxy::new("9.9.9.9".parse().unwrap(), 53, BTreeSet::new());
+        x.add_type(Proto::Socks5, None);
+        let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+        assert_eq!(back.geo, None);
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn deserialize_ignores_computed_stat_fields() {
+        // avg_resp_time/error_rate are present in the JSON (from a checked proxy) but are not
+        // restored — the loaded proxy's timing history starts empty.
+        let json = r#"{"host":"1.2.3.4","port":80,
+            "geo":{"country":{"code":"US","name":"United States"},"region":{"code":"","name":""},"city":null},
+            "types":[{"type":"HTTP","level":"High"}],"avg_resp_time":0.42,"error_rate":0.1}"#;
+        let p: Proxy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.avg_resp_time(), 0.0); // not restored
+        assert_eq!(p.error_rate(), 0.0);
+        assert_eq!(p.types().get(&Proto::Http), Some(&Some(AnonLevel::High)));
+    }
+
+    #[test]
+    fn ndjson_round_trips_via_cursor() {
+        // Persist a checked pool and reload it — fully in-memory, no temp files (constraint C5).
+        let mut a = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        a.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+        });
+        a.add_type(Proto::Http, Some(AnonLevel::High));
+        let mut b = Proxy::new("5.6.7.8".parse().unwrap(), 3128, BTreeSet::new());
+        b.add_type(Proto::Socks5, None);
+        let proxies = vec![a, b];
+
+        let mut buf = Vec::new();
+        write_ndjson(&mut buf, &proxies).unwrap();
+        // One object per line, so N proxies => N newlines.
+        assert_eq!(buf.iter().filter(|&&c| c == b'\n').count(), proxies.len());
+
+        let back = read_ndjson(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(back, proxies);
+    }
+
+    #[test]
+    fn read_ndjson_skips_blank_lines() {
+        let p = Proxy::new("1.2.3.4".parse().unwrap(), 80, BTreeSet::new());
+        let line = serde_json::to_string(&p).unwrap();
+        // Leading, interior, and trailing blank lines must not break parsing.
+        let text = format!("\n{line}\n\n{line}\n\n");
+        let back = read_ndjson(std::io::Cursor::new(text.into_bytes())).unwrap();
+        assert_eq!(back, vec![p.clone(), p]);
+    }
+
+    #[test]
+    fn read_ndjson_propagates_parse_error() {
+        let err = read_ndjson(std::io::Cursor::new(b"not json\n".to_vec())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

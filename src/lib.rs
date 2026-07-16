@@ -15,11 +15,12 @@
 //! use futures_util::StreamExt;
 //!
 //! let broker = Broker::builder().build();
-//! let mut stream = broker.find(FindQuery {
-//!     types: vec![TypeSpec::any(Proto::Http)],
-//!     limit: Some(10),
-//!     ..Default::default()
-//! }).await?;
+//! let mut stream = broker.find(
+//!     FindQuery::builder()
+//!         .types(vec![TypeSpec::any(Proto::Http)])
+//!         .limit(10)
+//!         .build(),
+//! ).await?;
 //! while let Some(proxy) = stream.next().await {
 //!     println!("{}", proxy.addr());
 //! }
@@ -43,14 +44,15 @@ pub mod stats;
 pub mod types;
 pub mod utils;
 
-pub use broker::{Broker, FindQuery, GrabQuery, ProxyStream};
+pub use broker::{Broker, FindQuery, FindQueryBuilder, GrabQuery, ProxyStream};
 pub use checker::{Checker, CheckerConfig};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
+pub use parse::parse_proxy_lines;
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
-pub use proxy::{Country, Proxy};
+pub use proxy::{read_ndjson, write_ndjson, Country, Proxy};
 pub use resolver::Resolver;
 #[cfg(feature = "server")]
 pub use server::{serve, Pool, PoolConfig, ServerHandle};

@@ -107,8 +107,9 @@ impl Resolver {
 }
 
 /// Parse an IP literal, accepting leading-zero IPv4 octets (decimal, not octal — matching
-/// Python's `int("010") == 10`). Returns the normalized address.
-fn parse_ip_lenient(host: &str) -> Option<IpAddr> {
+/// Python's `int("010") == 10`). Returns the normalized address. Shared with `parse.rs` so
+/// user-supplied `host:port` lines normalize the same way provider-scraped ones do.
+pub(crate) fn parse_ip_lenient(host: &str) -> Option<IpAddr> {
     if host.is_empty() {
         return None;
     }

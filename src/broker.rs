@@ -60,7 +60,7 @@ pub struct GrabQuery {
 }
 
 /// What to find and check. `types` is required (empty is [`Error::NoTypes`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FindQuery {
     /// Protocols (and optional anonymity levels) a proxy must support.
     pub types: Vec<TypeSpec>,
@@ -97,6 +97,112 @@ impl Default for FindQuery {
             max_tries: 3,
             post: false,
             strict: false,
+        }
+    }
+}
+
+impl FindQuery {
+    /// Start building a [`FindQuery`]. Consuming setters, unset fields fall back to
+    /// [`FindQuery::default`] — the same shape as [`BrokerBuilder`].
+    pub fn builder() -> FindQueryBuilder {
+        FindQueryBuilder::default()
+    }
+}
+
+/// Builds a [`FindQuery`]. `build()` is infallible — `find`/`check` own the [`Error::NoTypes`]
+/// guard, so the builder must not duplicate it (a builder that can't fail is more composable).
+#[derive(Default)]
+pub struct FindQueryBuilder {
+    types: Option<Vec<TypeSpec>>,
+    countries: Option<Vec<String>>,
+    limit: Option<usize>,
+    judges: Option<Vec<String>>,
+    dnsbl: Option<Vec<String>>,
+    timeout: Option<Duration>,
+    max_conn: Option<usize>,
+    max_tries: Option<usize>,
+    post: Option<bool>,
+    strict: Option<bool>,
+}
+
+impl FindQueryBuilder {
+    /// Protocols (and optional anonymity levels) a proxy must support. Required by `find`/`check`.
+    pub fn types(mut self, types: Vec<TypeSpec>) -> Self {
+        self.types = Some(types);
+        self
+    }
+
+    /// Keep only proxies in these ISO country codes.
+    pub fn countries(mut self, countries: Vec<String>) -> Self {
+        self.countries = Some(countries);
+        self
+    }
+
+    /// Stop after this many working proxies. `0` maps to unlimited — the one home for the CLI's
+    /// "`--limit 0` = unlimited" convention.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = (limit > 0).then_some(limit);
+        self
+    }
+
+    /// Judge URLs to probe. Empty defers to the bundled defaults.
+    pub fn judges(mut self, judges: Vec<String>) -> Self {
+        self.judges = Some(judges);
+        self
+    }
+
+    /// DNS blocklist zones; a proxy listed in any is rejected.
+    pub fn dnsbl(mut self, dnsbl: Vec<String>) -> Self {
+        self.dnsbl = Some(dnsbl);
+        self
+    }
+
+    /// Per-request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Max concurrent checks in flight.
+    pub fn max_conn(mut self, max_conn: usize) -> Self {
+        self.max_conn = Some(max_conn);
+        self
+    }
+
+    /// Attempts per protocol before giving up.
+    pub fn max_tries(mut self, max_tries: usize) -> Self {
+        self.max_tries = Some(max_tries);
+        self
+    }
+
+    /// Use `POST` for the test request.
+    pub fn post(mut self, post: bool) -> Self {
+        self.post = Some(post);
+        self
+    }
+
+    /// Require the anonymity level to match exactly.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
+    /// Finalize. Unset fields take their [`FindQuery::default`] values. Note `limit` was already
+    /// normalized by [`limit`](Self::limit) (0 → `None`), so `None` here means "unset", which
+    /// `Default` also renders as unlimited.
+    pub fn build(self) -> FindQuery {
+        let d = FindQuery::default();
+        FindQuery {
+            types: self.types.unwrap_or(d.types),
+            countries: self.countries.or(d.countries),
+            limit: self.limit.or(d.limit),
+            judges: self.judges.unwrap_or(d.judges),
+            dnsbl: self.dnsbl.unwrap_or(d.dnsbl),
+            timeout: self.timeout.unwrap_or(d.timeout),
+            max_conn: self.max_conn.unwrap_or(d.max_conn),
+            max_tries: self.max_tries.unwrap_or(d.max_tries),
+            post: self.post.unwrap_or(d.post),
+            strict: self.strict.unwrap_or(d.strict),
         }
     }
 }
@@ -190,14 +296,78 @@ impl Broker {
         if query.types.is_empty() {
             return Err(Error::NoTypes);
         }
-        // A resolver for external-IP discovery and judge-host resolution. Proxy candidates are
-        // already IP literals (from provider extraction), so no proxy-host DNS is needed.
+        let checker = self.build_checker(&query).await?;
+        let (tx, rx, cancel, stats) = new_run();
+        let broker = self.clone();
+        let task_cancel = cancel.clone();
+        let task_stats = stats.clone();
+        tokio::spawn(async move {
+            broker
+                .find_task(query, checker, tx, task_cancel, task_stats)
+                .await
+        });
+        Ok(ProxyStream {
+            rx,
+            _cancel_on_drop: Some(cancel.drop_guard()),
+            stats: Some(stats),
+        })
+    }
+
+    /// Gather **and check** proxies the caller already has, instead of scraping providers.
+    /// The counterpart to [`Broker::find`], sharing the same check pipeline — see `check_stream`.
+    ///
+    /// `proxies` is any stream of unchecked [`Proxy`]s (parse a file/stdin with
+    /// [`crate::parse::parse_proxy_lines`], or build them directly). Geo is attached per proxy so
+    /// serialized output carries country. The same errors surface up front as `find`
+    /// ([`Error::NoTypes`], [`Error::ExtIpUnknown`], [`Error::NoJudges`]).
+    pub async fn check<S>(&self, proxies: S, query: FindQuery) -> Result<ProxyStream, Error>
+    where
+        S: Stream<Item = Proxy> + Send + 'static,
+    {
+        if query.types.is_empty() {
+            return Err(Error::NoTypes);
+        }
+        let checker = self.build_checker(&query).await?;
+        let (tx, rx, cancel, stats) = new_run();
+        let broker = self.clone();
+        let task_cancel = cancel.clone();
+        let task_stats = stats.clone();
+        let countries = uppercase_set(query.countries.clone());
+        let (max_conn, limit) = (query.max_conn, query.limit);
+        tokio::spawn(async move {
+            // Attach geo + apply the country filter before checking, mirroring find's source.
+            let source = proxies.filter_map(move |mut proxy| {
+                broker.attach_geo(&mut proxy);
+                let keep = country_ok(&proxy, countries.as_ref()).then_some(proxy);
+                std::future::ready(keep)
+            });
+            check_stream(
+                source,
+                checker,
+                max_conn,
+                limit,
+                tx,
+                task_cancel,
+                task_stats,
+            )
+            .await;
+        });
+        Ok(ProxyStream {
+            rx,
+            _cancel_on_drop: Some(cancel.drop_guard()),
+            stats: Some(stats),
+        })
+    }
+
+    /// The resolver + external-IP discovery + [`Checker`] setup shared by `find` and `check`.
+    /// Proxy candidates are already IP literals, so the resolver is only for external-IP
+    /// discovery and judge-host resolution.
+    async fn build_checker(&self, query: &FindQuery) -> Result<Arc<Checker>, Error> {
         let resolver = match &self.resolver {
             Some(r) => r.clone(),
             None => Arc::new(Resolver::new(query.timeout)?),
         };
         let real_ext_ips = resolver.external_ips().await?;
-
         let checker = Checker::new(
             CheckerConfig {
                 judges: query.judges.clone(),
@@ -208,32 +378,12 @@ impl Broker {
                 strict: query.strict,
                 dnsbl: query.dnsbl.clone(),
             },
-            resolver.clone(),
+            resolver,
             &self.client,
             real_ext_ips,
         )
         .await?;
-
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        // Dropping the stream fires this token, aborting in-flight checks — no watcher task
-        // (a watcher holding a Sender would keep the channel open and deadlock termination).
-        let cancel = CancellationToken::new();
-        // Shared across every check task so stats cover ALL checked proxies, not just the
-        // working ones streamed out (design review F4).
-        let stats = Arc::new(std::sync::Mutex::new(StatsCollector::default()));
-        let broker = self.clone();
-        let task_cancel = cancel.clone();
-        let task_stats = stats.clone();
-        tokio::spawn(async move {
-            broker
-                .find_task(query, Arc::new(checker), tx, task_cancel, task_stats)
-                .await
-        });
-        Ok(ProxyStream {
-            rx,
-            _cancel_on_drop: Some(cancel.drop_guard()),
-            stats: Some(stats),
-        })
+        Ok(Arc::new(checker))
     }
 
     async fn find_task(
@@ -244,82 +394,44 @@ impl Broker {
         cancel: CancellationToken,
         stats: Arc<std::sync::Mutex<StatsCollector>>,
     ) {
-        let countries: Option<BTreeSet<String>> = query
-            .countries
-            .map(|cs| cs.into_iter().map(|c| c.to_uppercase()).collect());
-
-        let sem = Arc::new(Semaphore::new(query.max_conn));
-        let tracker = TaskTracker::new();
-        let sent = Arc::new(AtomicUsize::new(0));
-
-        let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+        let countries = uppercase_set(query.countries.clone());
         let client = self.client.clone();
         let specs: Vec<ProviderSpec> = self.providers.as_ref().clone();
-        let mut fetches = futures_util::stream::iter(specs)
+        let fetches = futures_util::stream::iter(specs)
             .map(|spec| {
                 let client = client.clone();
                 async move { fetch(&spec, &client).await }
             })
             .buffer_unordered(MAX_CONCURRENT_PROVIDERS);
 
-        'outer: while let Some(candidates) = fetches.next().await {
-            for cand in candidates {
-                if cancel.is_cancelled() || is_limit_reached(&sent, query.limit) {
-                    break 'outer;
-                }
-                let Ok(host) = cand.host.parse::<IpAddr>() else {
-                    continue;
-                };
-                if !seen.insert((host, cand.port)) {
-                    continue;
-                }
-                let mut proxy = Proxy::new(host, cand.port, cand.protocols.clone());
-                self.attach_geo(&mut proxy);
-                if !country_ok(&proxy, countries.as_ref()) {
-                    continue;
-                }
-
-                // Acquire a concurrency permit BEFORE spawning; move it into the task so its
-                // Drop frees the slot — race-free by construction (decisions.md §1).
-                let Ok(permit) = sem.clone().acquire_owned().await else {
-                    break 'outer;
-                };
-                let checker = checker.clone();
-                let tx = tx.clone();
-                let sent = sent.clone();
-                let cancel = cancel.clone();
-                let stats = stats.clone();
-                let limit = query.limit;
-                tracker.spawn(async move {
-                    let _permit = permit;
-                    tokio::select! {
-                        _ = cancel.cancelled() => {} // consumer gone — abort
-                        working = checker.check(&mut proxy) => {
-                            // Record EVERY checked proxy (working or not) before it is sent or
-                            // dropped, so the stats reflect the whole checked set (review F4).
-                            stats.lock().unwrap().record(&proxy);
-                            if working {
-                                // Reserve a slot atomically; emit only if under the limit.
-                                let n = sent.fetch_add(1, Ordering::SeqCst);
-                                match limit {
-                                    Some(l) if n >= l => cancel.cancel(),
-                                    _ => {
-                                        let _ = tx.send(proxy).await;
-                                        if limit.is_some_and(|l| n + 1 >= l) {
-                                            cancel.cancel();
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        // Flatten provider batches into a per-proxy stream: dedup on (host, port), attach geo,
+        // apply the country filter. `seen` is threaded through the FnMut closure.
+        let broker = self.clone();
+        let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+        let source = fetches
+            .flat_map(futures_util::stream::iter)
+            .filter_map(move |cand| {
+                let keep = match cand.host.parse::<IpAddr>() {
+                    Ok(host) if seen.insert((host, cand.port)) => {
+                        let mut proxy = Proxy::new(host, cand.port, cand.protocols.clone());
+                        broker.attach_geo(&mut proxy);
+                        country_ok(&proxy, countries.as_ref()).then_some(proxy)
                     }
-                });
-            }
-        }
+                    _ => None,
+                };
+                std::future::ready(keep)
+            });
 
-        // Wait-group: drain every spawned check before dropping tx and ending the stream.
-        tracker.close();
-        tracker.wait().await;
+        check_stream(
+            source,
+            checker,
+            query.max_conn,
+            query.limit,
+            tx,
+            cancel,
+            stats,
+        )
+        .await;
     }
 
     #[cfg(feature = "geo")]
@@ -336,6 +448,93 @@ impl Broker {
 /// Has the emit count reached the limit? `None` = unlimited.
 fn is_limit_reached(sent: &AtomicUsize, limit: Option<usize>) -> bool {
     limit.is_some_and(|l| sent.load(Ordering::SeqCst) >= l)
+}
+
+/// The channel + cancellation + stats triple every run (`find`/`check`) is built from.
+type Run = (
+    mpsc::Sender<Proxy>,
+    mpsc::Receiver<Proxy>,
+    CancellationToken,
+    Arc<std::sync::Mutex<StatsCollector>>,
+);
+
+fn new_run() -> Run {
+    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+    // Shared across every check task so stats cover ALL checked proxies, not just the working
+    // ones streamed out (design review F4).
+    let stats = Arc::new(std::sync::Mutex::new(StatsCollector::default()));
+    (tx, rx, cancel, stats)
+}
+
+/// Uppercase an optional country list into a set for case-insensitive matching.
+fn uppercase_set(countries: Option<Vec<String>>) -> Option<BTreeSet<String>> {
+    countries.map(|v| v.into_iter().map(|c| c.to_uppercase()).collect())
+}
+
+/// The per-proxy concurrency pipeline shared by `find` and `check`: a [`Semaphore`] concurrency
+/// cap, a [`TaskTracker`] wait-group drained before the stream ends, atomic limit accounting,
+/// per-check `stats.record`, and cancel-on-drop. Source-agnostic — `find` feeds provider
+/// candidates, `check` feeds user input.
+async fn check_stream<S>(
+    source: S,
+    checker: Arc<Checker>,
+    max_conn: usize,
+    limit: Option<usize>,
+    tx: mpsc::Sender<Proxy>,
+    cancel: CancellationToken,
+    stats: Arc<std::sync::Mutex<StatsCollector>>,
+) where
+    S: Stream<Item = Proxy> + Send,
+{
+    let sem = Arc::new(Semaphore::new(max_conn));
+    let tracker = TaskTracker::new();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let mut source = std::pin::pin!(source);
+
+    while let Some(mut proxy) = source.next().await {
+        if cancel.is_cancelled() || is_limit_reached(&sent, limit) {
+            break;
+        }
+        // Acquire a permit BEFORE spawning; move it into the task so its Drop frees the slot —
+        // race-free by construction (decisions.md §1).
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
+        let checker = checker.clone();
+        let tx = tx.clone();
+        let sent = sent.clone();
+        let cancel = cancel.clone();
+        let stats = stats.clone();
+        tracker.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = cancel.cancelled() => {} // consumer gone — abort
+                working = checker.check(&mut proxy) => {
+                    // Record EVERY checked proxy (working or not) before it is sent or dropped,
+                    // so the stats reflect the whole checked set (review F4).
+                    stats.lock().unwrap().record(&proxy);
+                    if working {
+                        // Reserve a slot atomically; emit only if under the limit.
+                        let n = sent.fetch_add(1, Ordering::SeqCst);
+                        match limit {
+                            Some(l) if n >= l => cancel.cancel(),
+                            _ => {
+                                let _ = tx.send(proxy).await;
+                                if limit.is_some_and(|l| n + 1 >= l) {
+                                    cancel.cancel();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Wait-group: drain every spawned check before dropping tx and ending the stream.
+    tracker.close();
+    tracker.wait().await;
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
@@ -460,5 +659,63 @@ impl std::fmt::Debug for Broker {
         f.debug_struct("Broker")
             .field("providers", &self.providers.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Proto, TypeSpec};
+
+    #[test]
+    fn find_query_builder_matches_default() {
+        let built = FindQuery::builder()
+            .types(vec![TypeSpec::any(Proto::Http)])
+            .limit(10)
+            .build();
+        let hand = FindQuery {
+            types: vec![TypeSpec::any(Proto::Http)],
+            limit: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(built, hand);
+    }
+
+    #[test]
+    fn find_query_builder_limit_zero_is_unlimited() {
+        // The CLI's "0 = unlimited" convention lives here, so callers never hand find() a
+        // take(0) that would yield nothing.
+        assert_eq!(FindQuery::builder().limit(0).build().limit, None);
+    }
+
+    #[test]
+    fn find_query_builder_sets_every_field() {
+        let q = FindQuery::builder()
+            .types(vec![TypeSpec::any(Proto::Socks5)])
+            .countries(vec!["US".into()])
+            .limit(5)
+            .judges(vec!["http://j/".into()])
+            .dnsbl(vec!["zen.example.org".into()])
+            .timeout(Duration::from_secs(3))
+            .max_conn(7)
+            .max_tries(2)
+            .post(true)
+            .strict(true)
+            .build();
+        assert_eq!(
+            q,
+            FindQuery {
+                types: vec![TypeSpec::any(Proto::Socks5)],
+                countries: Some(vec!["US".into()]),
+                limit: Some(5),
+                judges: vec!["http://j/".into()],
+                dnsbl: vec!["zen.example.org".into()],
+                timeout: Duration::from_secs(3),
+                max_conn: 7,
+                max_tries: 2,
+                post: true,
+                strict: true,
+            }
+        );
     }
 }

@@ -66,6 +66,8 @@ enum Command {
     Grab(GrabArgs),
     /// Gather proxies and check that they work, classifying anonymity.
     Find(FindArgs),
+    /// Check a list of proxies you already have (from stdin or --infile).
+    Check(CheckArgs),
     /// Run a local proxy server that rotates through working proxies.
     #[cfg(feature = "server")]
     Serve(ServeArgs),
@@ -78,9 +80,14 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8888")]
     host: String,
 
-    /// Protocols to find for the pool (required).
-    #[arg(long, num_args = 1.., required = true, value_name = "TYPE", value_parser = parse_proto)]
+    /// Protocols to find for the pool. Required unless --load.
+    #[arg(long, num_args = 1.., required_unless_present = "load", value_name = "TYPE", value_parser = parse_proto)]
     types: Vec<Proto>,
+
+    /// Fill the pool from an NDJSON file of already-checked proxies (from a prior --save) instead
+    /// of finding fresh ones. The pool serves these, then drains (no top-up).
+    #[arg(long, value_name = "PATH", conflicts_with = "types")]
+    load: Option<PathBuf>,
 
     /// Keep the pool topped up to this many working proxies.
     #[arg(long, default_value_t = 100)]
@@ -183,6 +190,84 @@ struct FindArgs {
     /// Write to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
     outfile: Option<PathBuf>,
+
+    /// Also append every working proxy as NDJSON to this file (for `check --load` / `serve
+    /// --load`). Independent of --format/--outfile.
+    #[arg(long, value_name = "PATH")]
+    save: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct CheckArgs {
+    /// Protocols to check. E.g. --types HTTP HTTPS SOCKS5 CONNECT:80. Required unless --load.
+    #[arg(long, num_args = 1.., required_unless_present = "load", value_name = "TYPE", value_parser = parse_proto)]
+    types: Vec<Proto>,
+
+    /// Read `host:port` addresses from this file instead of stdin.
+    #[arg(long, value_name = "PATH")]
+    infile: Option<PathBuf>,
+
+    /// Load already-checked proxies from an NDJSON file (from a prior --save) and emit them
+    /// WITHOUT re-checking. Stats restart from empty (a warm start, not a resumed history).
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["infile", "types"])]
+    load: Option<PathBuf>,
+
+    /// Anonymity levels to accept for HTTP (e.g. High Anonymous). Default: any.
+    #[arg(long, num_args = 1.., value_name = "LVL", value_parser = parse_lvl)]
+    lvl: Vec<AnonLevel>,
+
+    /// Stop after this many working proxies. 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+
+    /// Keep only proxies located in these ISO country codes.
+    #[arg(long, num_args = 1.., value_name = "CC")]
+    countries: Vec<String>,
+
+    /// Judge URLs to use instead of the bundled defaults.
+    #[arg(long, num_args = 1.., value_name = "URL")]
+    judges: Vec<String>,
+
+    /// DNS blocklist zones; reject proxies listed in any (e.g. zen.spamhaus.org).
+    #[arg(long, num_args = 1.., value_name = "ZONE")]
+    dnsbl: Vec<String>,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 8)]
+    timeout: u64,
+
+    /// Maximum concurrent checks.
+    #[arg(long, default_value_t = 200)]
+    max_conn: usize,
+
+    /// Attempts per protocol before giving up.
+    #[arg(long, default_value_t = 3)]
+    max_tries: usize,
+
+    /// Use POST instead of GET for the test request.
+    #[arg(long)]
+    post: bool,
+
+    /// Require the anonymity level to match exactly.
+    #[arg(long)]
+    strict: bool,
+
+    /// Print an aggregate summary to stderr when done.
+    #[arg(long)]
+    show_stats: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Default)]
+    format: Format,
+
+    /// Write to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    outfile: Option<PathBuf>,
+
+    /// Also append every working proxy as NDJSON to this file (reloadable via --load). Independent
+    /// of --format/--outfile.
+    #[arg(long, value_name = "PATH")]
+    save: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -257,6 +342,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Grab(args) => grab(broker, args).await,
         Command::Find(args) => find(broker, args).await,
+        Command::Check(args) => check(broker, args).await,
         #[cfg(feature = "server")]
         Command::Serve(args) => serve_cmd(broker, args).await,
     }
@@ -269,29 +355,34 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     use std::sync::Arc;
 
     let addr: std::net::SocketAddr = args.host.parse()?;
-    let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
+    let pool_config = PoolConfig {
+        max_tries: args.max_tries,
+        max_error_rate: args.max_error_rate,
+        max_resp_time: args.max_resp_time,
+        ..Default::default()
+    };
 
-    // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
-    // would grab forever), matching api.py's `if limit <= 0: raise ValueError`.
-    let stream = broker
-        .find(FindQuery {
-            types,
-            countries: (!args.countries.is_empty()).then_some(args.countries),
-            limit: Some(args.limit.max(1)),
-            timeout: Duration::from_secs(args.timeout),
-            ..Default::default()
-        })
-        .await?;
-
-    let pool = Pool::spawn(
-        stream,
-        PoolConfig {
-            max_tries: args.max_tries,
-            max_error_rate: args.max_error_rate,
-            max_resp_time: args.max_resp_time,
-            ..Default::default()
-        },
-    );
+    // --load: fill the pool from a saved NDJSON file (already-checked proxies) and serve those,
+    // no finding. The pool drains as it is used (no top-up); stats restart from empty.
+    let pool = if let Some(path) = &args.load {
+        let loaded = proxybroker::read_ndjson(std::io::BufReader::new(std::fs::File::open(path)?))?;
+        eprintln!("loaded {} proxies from {}", loaded.len(), path.display());
+        Pool::from_proxies(loaded, pool_config)
+    } else {
+        let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
+        // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
+        // would grab forever), matching api.py's `if limit <= 0: raise ValueError` — so
+        // `.limit(max(1))` here can never resolve to the builder's unlimited (None).
+        let mut fq = FindQuery::builder()
+            .types(types)
+            .limit(args.limit.max(1))
+            .timeout(Duration::from_secs(args.timeout));
+        if !args.countries.is_empty() {
+            fq = fq.countries(args.countries);
+        }
+        let stream = broker.find(fq.build()).await?;
+        Pool::spawn(stream, pool_config)
+    };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
     let handle = serve(addr, pool, resolver, Duration::from_secs(args.timeout)).await?;
     eprintln!(
@@ -313,37 +404,46 @@ async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::
         limit: (args.limit > 0).then_some(args.limit),
     };
     let mut stream = broker.grab(query);
-    write_stream(&mut stream, args.format, args.outfile.as_deref()).await
+    write_stream(&mut stream, args.format, args.outfile.as_deref(), None).await
 }
 
-async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Attach the requested anonymity levels to every requested type. `--lvl` applies only to
-    // HTTP; for other protocols the checker ignores levels.
-    let levels = (!args.lvl.is_empty()).then_some(args.lvl);
-    let types: Vec<TypeSpec> = args
-        .types
+/// Attach the requested anonymity levels to every requested type. `--lvl` applies only to
+/// HTTP; for other protocols the checker ignores levels.
+fn types_from(protos: Vec<Proto>, lvl: Vec<AnonLevel>) -> Vec<TypeSpec> {
+    let levels = (!lvl.is_empty()).then_some(lvl);
+    protos
         .into_iter()
         .map(|proto| TypeSpec {
             proto,
             levels: levels.clone(),
         })
-        .collect();
+        .collect()
+}
 
-    let query = FindQuery {
-        types,
-        countries: (!args.countries.is_empty()).then_some(args.countries),
-        limit: (args.limit > 0).then_some(args.limit),
-        judges: args.judges,
-        dnsbl: args.dnsbl,
-        timeout: Duration::from_secs(args.timeout),
-        max_conn: args.max_conn,
-        max_tries: args.max_tries,
-        post: args.post,
-        strict: args.strict,
-    };
+async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = FindQuery::builder()
+        .types(types_from(args.types, args.lvl))
+        .limit(args.limit)
+        .judges(args.judges)
+        .dnsbl(args.dnsbl)
+        .timeout(Duration::from_secs(args.timeout))
+        .max_conn(args.max_conn)
+        .max_tries(args.max_tries)
+        .post(args.post)
+        .strict(args.strict);
+    if !args.countries.is_empty() {
+        builder = builder.countries(args.countries);
+    }
+    let query = builder.build();
 
     let mut stream = broker.find(query).await?;
-    write_stream(&mut stream, args.format, args.outfile.as_deref()).await?;
+    write_stream(
+        &mut stream,
+        args.format,
+        args.outfile.as_deref(),
+        args.save.as_deref(),
+    )
+    .await?;
 
     if args.show_stats {
         // Stats come from the stream itself, which aggregated EVERY checked proxy (working or
@@ -357,13 +457,96 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+
+    // --load: the proxies are already checked. Read them and stream straight to output, no broker,
+    // no network. `--types` is optional here (enforced by clap), and unused.
+    if let Some(path) = &args.load {
+        let loaded = proxybroker::read_ndjson(std::io::BufReader::new(std::fs::File::open(path)?))?;
+        let mut stream = futures_util::stream::iter(loaded);
+        write_stream(
+            &mut stream,
+            args.format,
+            args.outfile.as_deref(),
+            args.save.as_deref(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Input: a file, or stdin by default.
+    let text = match &args.infile {
+        Some(path) => tokio::fs::read_to_string(path).await?,
+        None => {
+            let mut buf = String::new();
+            tokio::io::stdin().read_to_string(&mut buf).await?;
+            buf
+        }
+    };
+    let proxies = proxybroker::parse_proxy_lines(&text);
+    if proxies.is_empty() {
+        eprintln!("no proxy addresses parsed from input");
+    }
+
+    let query = FindQuery {
+        types: types_from(args.types, args.lvl),
+        countries: (!args.countries.is_empty()).then_some(args.countries),
+        limit: (args.limit > 0).then_some(args.limit),
+        judges: args.judges,
+        dnsbl: args.dnsbl,
+        timeout: Duration::from_secs(args.timeout),
+        max_conn: args.max_conn,
+        max_tries: args.max_tries,
+        post: args.post,
+        strict: args.strict,
+    };
+
+    let mut stream = broker
+        .check(futures_util::stream::iter(proxies), query)
+        .await?;
+    write_stream(
+        &mut stream,
+        args.format,
+        args.outfile.as_deref(),
+        args.save.as_deref(),
+    )
+    .await?;
+
+    if args.show_stats {
+        if let Some(s) = stream.stats() {
+            eprint!("\n{s}");
+        }
+    }
+    Ok(())
+}
+
 /// Drain a proxy stream to a file or stdout in the chosen format. Takes `&mut` so the caller
-/// keeps the stream afterwards (e.g. to read `stats()`).
-async fn write_stream(
-    stream: &mut proxybroker::ProxyStream,
+/// keeps the stream afterwards (e.g. to read `stats()`). When `save` is set, each streamed proxy
+/// is also appended to that file as NDJSON (the C2 warm-start artifact), independent of `format`.
+async fn write_stream<S>(
+    stream: &mut S,
     format: Format,
     outfile: Option<&std::path::Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    save: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: futures_util::Stream<Item = Proxy> + Unpin,
+{
+    // The save sink is the exact NDJSON bytes read_ndjson expects. Open once, before draining.
+    // ponytail: blocking std::fs write inside the async loop — one small line per proxy at CLI
+    // scale, not worth a spawn_blocking dance.
+    let mut save_file = match save {
+        Some(path) => Some(std::fs::File::create(path)?),
+        None => None,
+    };
+    let mut save_line = |proxy: &Proxy| -> std::io::Result<()> {
+        if let Some(f) = save_file.as_mut() {
+            proxybroker::write_ndjson(f, std::slice::from_ref(proxy))?;
+        }
+        Ok(())
+    };
+
     // Writing to a file is async I/O; stdout is a blocking lock. Keep them separate rather
     // than boxing a trait object over two very different sinks.
     if let Some(path) = outfile {
@@ -372,6 +555,7 @@ async fn write_stream(
         while let Some(proxy) = stream.next().await {
             file.write_all(format.render(&proxy).as_bytes()).await?;
             file.write_all(b"\n").await?;
+            save_line(&proxy)?;
             count += 1;
         }
         file.flush().await?;
@@ -381,6 +565,7 @@ async fn write_stream(
         let mut lock = stdout.lock();
         while let Some(proxy) = stream.next().await {
             writeln!(lock, "{}", format.render(&proxy))?;
+            save_line(&proxy)?;
         }
     }
     Ok(())
