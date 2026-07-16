@@ -121,6 +121,44 @@ async fn scheduler_reprobes_on_cadence() {
 }
 
 #[tokio::test]
+async fn newly_added_proxy_gets_enrolled() {
+    // A proxy added to the pool AFTER the scheduler started (by --watch reconcile or a find top-up)
+    // must still be re-checked — the heap seeds once at startup and stays non-empty, so enrollment
+    // cannot depend on the heap draining to empty.
+    let (judge, _j) = echo_server(JUDGE_PAGE, None).await;
+    let (addr_a, _a) = echo_server(HIGH_PAGE, None).await;
+    let checker = make_checker(judge).await;
+    let pool = Pool::from_proxies(vec![http_proxy(addr_a)], PoolConfig::default());
+    let store: Arc<dyn Store> = Arc::new(SqliteStore::open(tmp_db()).unwrap());
+    let cfg = RecheckConfig {
+        min_interval: Duration::from_millis(50),
+        rate_per_sec: 100.0,
+        ..Default::default() // max_interval default (3600s): A reschedules far out after one check
+    };
+    let _h = proxybroker::spawn_rechecker(pool.clone(), checker, store, cfg);
+
+    // Let A re-check once; the heap is now non-empty with A scheduled ~an hour out.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Add B after startup — this is the case the empty-heap-only re-seed missed.
+    let hits_b = Arc::new(AtomicUsize::new(0));
+    let (addr_b, _b) = echo_server(HIGH_PAGE, Some(hits_b.clone())).await;
+    pool.add(http_proxy(addr_b));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if hits_b.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a proxy added after startup was never re-checked (enrollment gap)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn rate_ceiling_caps_starts() {
     // 20 proxies come due at once; the token bucket must throttle STARTS to ~rate/sec regardless of
     // backlog. All echo through one shared counter, so it counts total re-check starts.

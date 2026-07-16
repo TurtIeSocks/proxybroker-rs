@@ -11,11 +11,15 @@ use crate::proxy::Proxy;
 use crate::server::Pool;
 use rand::Rng;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// A pooled proxy's identity: the `(host, port)` the scheduler tracks it by.
+type Key = (IpAddr, u16);
 
 /// Tuning for the re-check loop.
 #[derive(Debug, Clone)]
@@ -52,11 +56,24 @@ pub fn next_interval(ewma: f64, cfg: &RecheckConfig) -> Duration {
 }
 
 /// A proxy's decayed standing (higher = better): a base goodness from success rate and latency,
-/// halved for every `decay_halflife` it has gone unseen. Used to evict stale-flaky proxies.
+/// halved for every `decay_halflife` it has gone unseen. Used to evict stale-flaky proxies. A
+/// non-positive half-life disables decay (rather than dividing by zero into a NaN).
 pub fn decayed_score(ewma: f64, latency: f64, age: Duration, cfg: &RecheckConfig) -> f64 {
     let base = ewma.clamp(0.0, 1.0) / (1.0 + latency.max(0.0));
-    let decay = 0.5f64.powf(age.as_secs_f64() / cfg.decay_halflife.as_secs_f64());
+    let hl = cfg.decay_halflife.as_secs_f64();
+    let decay = if hl > 0.0 {
+        0.5f64.powf(age.as_secs_f64() / hl)
+    } else {
+        1.0
+    };
     base * decay
+}
+
+/// Whether a failed proxy is still worth retrying (`true`) or should be evicted (`false`): its
+/// decayed standing — folded score, latency, and time since it last worked — is still above the
+/// floor. Splitting this out keeps the decay/eviction decision unit-testable.
+fn should_retry(ewma: f64, latency: f64, age: Duration, cfg: &RecheckConfig) -> bool {
+    decayed_score(ewma, latency, age, cfg) >= EVICT_FLOOR
 }
 
 /// Handle to a running re-check loop; `shutdown` or drop stops it.
@@ -117,46 +134,55 @@ pub fn spawn_rechecker(
     let cancel = CancellationToken::new();
     let handle_cancel = cancel.clone();
     tokio::spawn(async move {
-        // Seed the heap from the current pool, staggered by jitter so a batch inserted together
-        // does not thundering-herd the judges.
+        // Per-address bookkeeping for this run (the durable score lives in the store):
+        //   ewma      folded success rate — drives cadence and eviction
+        //   last_ok   last time this address re-checked WORKING — the decay clock for eviction
+        //   retrying  failed + pulled from the pool but still scheduled, so a watcher-removed
+        //             address can be told apart from one we are mid-retry on
         let mut heap: BinaryHeap<Reverse<Scheduled>> = BinaryHeap::new();
-        let mut ewma: HashMap<(std::net::IpAddr, u16), f64> = HashMap::new();
-        let now = Instant::now();
-        for (host, port) in pool.addrs() {
-            heap.push(Reverse(Scheduled {
-                due: now + jitter(cfg.min_interval),
-                host,
-                port,
-            }));
-            ewma.insert((host, port), 1.0); // assume healthy until first re-check says otherwise
-        }
+        let mut ewma: HashMap<Key, f64> = HashMap::new();
+        let mut last_ok: HashMap<Key, Instant> = HashMap::new();
+        let mut retrying: HashSet<Key> = HashSet::new();
         // Token-bucket: at most one re-check START per `1/rate_per_sec`, regardless of backlog.
         let gap = Duration::from_secs_f64(1.0 / cfg.rate_per_sec.max(0.001));
         let mut next_start = Instant::now();
 
         loop {
+            // Enroll any pool address we are not yet tracking. This runs every pass, so proxies
+            // added after startup (watcher live-reload, find top-up) enter the schedule promptly —
+            // enrollment never waits for the heap to drain to empty. Jitter staggers a batch
+            // inserted together so it does not thundering-herd the judges.
+            let now = Instant::now();
+            for (host, port) in pool.addrs() {
+                if let std::collections::hash_map::Entry::Vacant(slot) = ewma.entry((host, port)) {
+                    slot.insert(1.0); // assume healthy until a re-check says otherwise
+                    last_ok.insert((host, port), now);
+                    heap.push(Reverse(Scheduled {
+                        due: now + jitter(cfg.min_interval),
+                        host,
+                        port,
+                    }));
+                }
+            }
+
             let Some(Reverse(top)) = heap.peek() else {
-                // Nothing scheduled (empty pool): wait a beat, then re-seed from the pool.
+                // Empty schedule (pool still filling / everything evicted): wait a beat, re-enroll.
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(cfg.min_interval) => {}
                 }
-                for (host, port) in pool.addrs() {
-                    if let std::collections::hash_map::Entry::Vacant(e) = ewma.entry((host, port)) {
-                        e.insert(1.0);
-                        heap.push(Reverse(Scheduled {
-                            due: Instant::now() + jitter(cfg.min_interval),
-                            host,
-                            port,
-                        }));
-                    }
-                }
                 continue;
             };
+            // Wait for the soonest due, but wake at least every min_interval to re-enroll newcomers
+            // even when every scheduled proxy is an hour out.
             let due = top.due;
+            let wake = due.min(Instant::now() + cfg.min_interval);
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(due) => {}
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+            if Instant::now() < due {
+                continue; // woke only to re-enroll; nothing due yet
             }
             // Rate ceiling: never start faster than the token bucket allows.
             let start_at = next_start.max(Instant::now());
@@ -168,6 +194,13 @@ pub fn spawn_rechecker(
 
             let Reverse(job) = heap.pop().expect("peeked");
             let key = (job.host, job.port);
+            // If the pool no longer holds this address and we are not mid-retry on it, the watcher
+            // removed it — drop it, never re-probe or resurrect a proxy the user just deleted.
+            if !retrying.contains(&key) && !pool.addrs().contains(&key) {
+                ewma.remove(&key);
+                last_ok.remove(&key);
+                continue;
+            }
 
             // Re-probe a fresh proxy for this address; the checker records attempts internally.
             let mut proxy = Proxy::new(job.host, job.port, std::collections::BTreeSet::new());
@@ -180,26 +213,35 @@ pub fn spawn_rechecker(
             let prev = ewma.get(&key).copied().unwrap_or(1.0);
             let e = 0.3 * sample + 0.7 * prev;
             ewma.insert(key, e);
+            let now = Instant::now();
+            let next_due = now + next_interval(e, &cfg) + jitter(cfg.min_interval);
 
             if working {
+                last_ok.insert(key, now);
+                retrying.remove(&key);
                 pool.add(proxy); // dedup on (host,port)
                 heap.push(Reverse(Scheduled {
-                    due: Instant::now() + next_interval(e, &cfg) + jitter(cfg.min_interval),
+                    due: next_due,
                     host: job.host,
                     port: job.port,
                 }));
             } else {
                 pool.remove_addr(job.host, job.port);
-                // Decayed below the floor → stop re-checking (drop from the heap); else retry soon.
-                let score = decayed_score(e, proxy.avg_resp_time(), Duration::ZERO, &cfg);
-                if score >= EVICT_FLOOR {
+                // Evict once the score, decayed by how long since it last worked, falls below the
+                // floor; else keep retrying. The `age` from last_ok is what gives --decay-halflife
+                // its effect — the eviction site used to pass a constant zero age.
+                let age = now.saturating_duration_since(*last_ok.get(&key).unwrap_or(&now));
+                if should_retry(e, proxy.avg_resp_time(), age, &cfg) {
+                    retrying.insert(key);
                     heap.push(Reverse(Scheduled {
-                        due: Instant::now() + next_interval(e, &cfg) + jitter(cfg.min_interval),
+                        due: next_due,
                         host: job.host,
                         port: job.port,
                     }));
                 } else {
                     ewma.remove(&key);
+                    last_ok.remove(&key);
+                    retrying.remove(&key);
                 }
             }
         }
@@ -250,5 +292,40 @@ mod tests {
         // Two half-lives → a quarter.
         let two_hl = decayed_score(1.0, 0.5, Duration::from_secs(7200), &cfg);
         assert!((two_hl - fresh * 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn staleness_drives_eviction() {
+        // A failed proxy with a healthy score is retried; the same score gone stale for many
+        // half-lives decays below the floor and is evicted. This is what makes --decay-halflife live.
+        let cfg = RecheckConfig {
+            decay_halflife: Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert!(
+            should_retry(0.5, 0.0, Duration::ZERO, &cfg),
+            "a decent, just-seen score keeps being retried"
+        );
+        assert!(
+            !should_retry(0.5, 0.0, Duration::from_secs(600), &cfg),
+            "ten half-lives of staleness must decay below the evict floor"
+        );
+    }
+
+    #[test]
+    fn zero_halflife_does_not_nan() {
+        // --decay-halflife 0 must not produce NaN (0.5^(age/0)); a non-positive half-life disables
+        // decay rather than evicting a proxy on its first failure.
+        let cfg = RecheckConfig {
+            decay_halflife: Duration::ZERO,
+            ..Default::default()
+        };
+        let s0 = decayed_score(1.0, 0.0, Duration::ZERO, &cfg);
+        let s1 = decayed_score(1.0, 0.0, Duration::from_secs(3600), &cfg);
+        assert!(
+            s0.is_finite() && s1.is_finite(),
+            "no NaN/Inf from a zero half-life"
+        );
+        assert!(should_retry(0.5, 0.0, Duration::from_secs(3600), &cfg));
     }
 }
