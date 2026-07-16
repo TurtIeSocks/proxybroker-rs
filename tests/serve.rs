@@ -86,6 +86,7 @@ async fn server_relays_http_request_through_a_pool_proxy() {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -189,6 +190,7 @@ async fn retries_next_proxy_when_first_connect_fails() {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -230,6 +232,7 @@ async fn emits_502_after_max_tries_all_fail() {
         Duration::from_secs(2),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -255,6 +258,7 @@ async fn serve_get(pool: Arc<Pool>) -> String {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -364,6 +368,7 @@ async fn http_allowed_codes_does_not_stall_a_body_request() {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -422,6 +427,7 @@ async fn serve_waits_for_min_queue() {
         Duration::from_secs(3),
         2, // min_queue
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -461,6 +467,7 @@ async fn backlog_sets_listen_queue() {
         Duration::from_secs(3),
         0,
         128, // non-default backlog
+        None,
     )
     .await
     .unwrap();
@@ -475,6 +482,75 @@ async fn backlog_sets_listen_queue() {
         .expect("read should not time out")
         .unwrap();
     assert!(String::from_utf8_lossy(&resp).contains("OK-BACKLOG"));
+}
+
+/// Serve a single GET (with optional extra request headers) through a one-proxy pool that requires
+/// `auth`, returning the raw client-visible response.
+async fn serve_get_auth(
+    upstream_body: &'static str,
+    auth: Option<String>,
+    extra_headers: &str,
+) -> String {
+    let (up, _u) = mock_upstream(upstream_body).await;
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        1024,
+        auth,
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    let req = format!("GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n{extra_headers}\r\n");
+    client.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+#[tokio::test]
+async fn missing_credentials_get_407() {
+    // No Proxy-Authorization → 407 + challenge, and the upstream body never reaches the client
+    // (no pool proxy consumed).
+    let text = serve_get_auth("SECRET-BODY", Some("user:pass".into()), "").await;
+    assert!(text.contains("407"), "{text:?}");
+    assert!(text.contains("Proxy-Authenticate: Basic"), "{text:?}");
+    assert!(
+        !text.contains("SECRET-BODY"),
+        "no proxy must be consumed on 407"
+    );
+}
+
+#[tokio::test]
+async fn valid_credentials_relay() {
+    // Basic base64("user:pass") == "dXNlcjpwYXNz".
+    let text = serve_get_auth(
+        "AUTHED-BODY",
+        Some("user:pass".into()),
+        "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n",
+    )
+    .await;
+    assert!(
+        text.contains("AUTHED-BODY"),
+        "correct creds must relay: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn wrong_credentials_get_407() {
+    let text = serve_get_auth(
+        "SECRET-BODY",
+        Some("user:pass".into()),
+        "Proxy-Authorization: Basic d3Jvbmc=\r\n", // base64("wrong")
+    )
+    .await;
+    assert!(text.contains("407"), "{text:?}");
+    assert!(!text.contains("SECRET-BODY"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -584,6 +660,7 @@ async fn sticky_pins_client_across_connections() {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -637,6 +714,7 @@ async fn serve_loads_a_saved_pool() {
         Duration::from_secs(3),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();
@@ -669,6 +747,7 @@ async fn server_returns_502_when_pool_is_empty() {
         Duration::from_secs(2),
         0,
         1024,
+        None,
     )
     .await
     .unwrap();

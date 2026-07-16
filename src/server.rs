@@ -467,7 +467,8 @@ impl Drop for ServerHandle {
 /// Start the local proxy server on `addr`, relaying through `pool`. Binds immediately and returns
 /// the handle (so `local_addr` works at once); the accept loop runs in a background task and, when
 /// `min_queue > 0`, does not start serving until the pool holds that many proxies (B13). `backlog`
-/// is the TCP listen backlog (queued pending connections).
+/// is the TCP listen backlog. `auth` (`user:pass`) gates clients: when `Some`, a client without a
+/// matching `Proxy-Authorization: Basic <b64>` gets `407` (B9).
 pub async fn serve(
     addr: SocketAddr,
     pool: Arc<Pool>,
@@ -475,6 +476,7 @@ pub async fn serve(
     timeout: Duration,
     min_queue: usize,
     backlog: u32,
+    auth: Option<String>,
 ) -> std::io::Result<ServerHandle> {
     // TcpListener::bind does not expose the backlog; go through TcpSocket to set it. Pick the
     // socket family from the bind address.
@@ -489,6 +491,11 @@ pub async fn serve(
     let local = listener.local_addr()?;
     let cancel = CancellationToken::new();
     let max_tries = pool.config.max_tries;
+    // Encode the expected header once at startup, not per request. `Arc` so each connection shares
+    // one copy.
+    let expected: Option<Arc<str>> = auth.map(|up| {
+        Arc::from(format!("Basic {}", crate::utils::base64_encode(up.as_bytes())).as_str())
+    });
 
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -509,8 +516,18 @@ pub async fn serve(
             };
             let pool = pool.clone();
             let resolver = resolver.clone();
+            let expected = expected.clone();
             tokio::spawn(async move {
-                let _ = handle_client(client, peer.ip(), pool, resolver, timeout, max_tries).await;
+                let _ = handle_client(
+                    client,
+                    peer.ip(),
+                    pool,
+                    resolver,
+                    timeout,
+                    max_tries,
+                    expected,
+                )
+                .await;
             });
         }
     });
@@ -521,15 +538,30 @@ pub async fn serve(
     })
 }
 
+/// How the client spoke to us — drives the *ack* the relay sends back, independently of the
+/// target [`Scheme`] (which still drives pool selection + `choose_proto`). R0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frontend {
+    /// Plain HTTP forward proxy (absolute-URI request): forward the buffered request upstream.
+    HttpForward,
+    /// HTTP `CONNECT`: acknowledge with `200 Connection established`, then tunnel.
+    HttpConnect,
+    // B12 adds `Socks5` here (acknowledge with a SOCKS5 success frame, then tunnel).
+}
+
 /// The client's intent, parsed from its first request.
 struct ClientRequest {
-    /// `HTTPS` for a `CONNECT`, else `HTTP`.
+    /// `HTTPS` for a `CONNECT`/SOCKS5 tunnel, else `HTTP`. Drives pool selection + `choose_proto`.
     scheme: Scheme,
+    /// How the client addressed us — drives the relay's client-ack. R0.
+    frontend: Frontend,
     /// Target host and port.
     host: String,
     port: u16,
-    /// The raw request bytes to forward (HTTP only; empty for CONNECT).
+    /// The raw request bytes to forward (HTTP forward only; empty for CONNECT/SOCKS5).
     raw: Vec<u8>,
+    /// The client's `Proxy-Authorization` header value, if present (B9 client auth).
+    proxy_auth: Option<String>,
 }
 
 async fn handle_client(
@@ -539,10 +571,24 @@ async fn handle_client(
     resolver: Arc<Resolver>,
     timeout: Duration,
     max_tries: usize,
+    expected_auth: Option<Arc<str>>,
 ) -> std::io::Result<()> {
     let Some(req) = parse_client_request(&mut client, timeout).await else {
         return Ok(());
     };
+    // B9: gate on client credentials before consuming any pool proxy. A plain `==` is fine — the
+    // secret is a shared static string, not a per-user hash, so constant-time compare is overkill.
+    if let Some(expected) = &expected_auth {
+        if req.proxy_auth.as_deref() != Some(expected.as_ref()) {
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"proxybroker\"\r\n\r\n",
+                )
+                .await;
+            return Ok(());
+        }
+    }
     let key = client_key(&pool.config, peer_ip, &req);
     let ip = resolver.resolve(&req.host).await.ok();
     let target = Target {
@@ -681,8 +727,9 @@ async fn relay(
         Ok(u) => u,
     };
 
-    match req.scheme {
-        Scheme::Https => {
+    // Ack the client per how it addressed us (R0), independently of the target scheme.
+    match req.frontend {
+        Frontend::HttpConnect => {
             // Acknowledging the CONNECT tunnel is the commit point: after this the client believes
             // it is talking to the target, so a later failure must not re-ack through another proxy.
             if client
@@ -695,7 +742,7 @@ async fn relay(
                 return RelayOutcome::ClientGone;
             }
         }
-        Scheme::Http => {
+        Frontend::HttpForward => {
             // The buffered request goes upstream first — the client has still received nothing, so
             // a write failure here is retryable.
             if upstream.write_all(&req.raw).await.is_err() {
@@ -825,14 +872,19 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
     let method = parts.next()?;
     let uri = parts.next()?;
 
+    // The client's Proxy-Authorization header (B9), present on either method.
+    let proxy_auth = header_value(&buf, "Proxy-Authorization");
+
     if method.eq_ignore_ascii_case("CONNECT") {
         // `CONNECT host:port HTTP/1.1`
         let (host, port) = split_host_port(uri, 443);
         Some(ClientRequest {
             scheme: Scheme::Https,
+            frontend: Frontend::HttpConnect,
             host,
             port,
             raw: Vec::new(),
+            proxy_auth,
         })
     } else {
         // Plain HTTP: target host comes from the absolute URI or the Host header.
@@ -848,9 +900,11 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
         let (host, port) = split_host_port(&host_port, 80);
         Some(ClientRequest {
             scheme: Scheme::Http,
+            frontend: Frontend::HttpForward,
             host,
             port,
             raw: buf,
+            proxy_auth,
         })
     }
 }

@@ -110,6 +110,39 @@ pub fn get_status_code(resp: &[u8], start: usize, stop: usize) -> u16 {
     }
 }
 
+/// Encode `input` as standard base64 (RFC 4648 alphabet, `=` padding). Encode-only — all Wave 3
+/// needs: the local server compares a client's `Proxy-Authorization` against a pre-encoded expected
+/// string (B9), and emits `Basic <b64>` to authenticated upstreams (B8). Hand-rolled (~15 lines) to
+/// avoid pulling a base64 crate into an always-compiled module for one header; if a decoder is ever
+/// needed, swap in the `base64` crate.
+pub fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        // Pack up to 3 bytes into a 24-bit group, then emit 4 sextets.
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        // Pad the sextets that had no input byte with '='.
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +183,19 @@ mod tests {
     fn zone_id_that_is_not_ipv6_is_rejected() {
         // A '%' on a v4 address is nonsense; Python's ip_address rejects it too.
         assert_eq!(canonicalize_ip("1.2.3.4%eth0"), None);
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648() {
+        // RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // The credential case B8/B9 rely on.
+        assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
     }
 }
