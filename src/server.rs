@@ -20,7 +20,7 @@ use crate::types::{Proto, Scheme};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,6 +125,10 @@ pub struct Pool {
     notify: Notify,
     config: PoolConfig,
     exhausted: std::sync::atomic::AtomicBool,
+    /// Cumulative count of proxies hard-evicted from the pool (F1 metrics).
+    evictions: AtomicU64,
+    /// Cumulative count of mid-request rotations to a different proxy (F1 metrics).
+    rotations: AtomicU64,
 }
 
 impl Pool {
@@ -146,6 +150,8 @@ impl Pool {
             notify: Notify::new(),
             config,
             exhausted: std::sync::atomic::AtomicBool::new(true),
+            evictions: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
         }
         .into()
     }
@@ -165,6 +171,8 @@ impl Pool {
             notify: Notify::new(),
             config,
             exhausted: std::sync::atomic::AtomicBool::new(false),
+            evictions: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
         });
         {
             let pool = pool.clone();
@@ -279,6 +287,7 @@ impl Pool {
             && (proxy.error_rate() > self.config.max_error_rate
                 || proxy.avg_resp_time() > self.config.max_resp_time);
         if unhealthy {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(addr = %proxy.addr(), "evicted from pool");
             return;
         }
@@ -325,6 +334,57 @@ impl Pool {
             waker.await;
         }
     }
+
+    /// A cheap live view of the pool for metrics (F1) — counts by scheme and mean health, taken
+    /// under a single `state` lock. Shared with the (deferred) F4 dashboard.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        let state = self.state.lock().unwrap();
+        let total = state.len();
+        let mut snap = PoolSnapshot::default();
+        let (mut err_sum, mut rt_sum) = (0.0_f64, 0.0_f64);
+        for p in state.iter() {
+            let schemes = p.proxy.schemes();
+            if schemes.contains(&Scheme::Http) {
+                snap.http += 1;
+            }
+            if schemes.contains(&Scheme::Https) {
+                snap.https += 1;
+            }
+            err_sum += p.proxy.error_rate();
+            rt_sum += p.proxy.avg_resp_time();
+        }
+        snap.total = total;
+        if total > 0 {
+            snap.avg_error_rate = err_sum / total as f64;
+            snap.avg_resp_time = rt_sum / total as f64;
+        }
+        snap
+    }
+
+    /// Cumulative proxies hard-evicted from the pool (F1 metrics).
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative mid-request rotations to a different proxy (F1 metrics).
+    pub fn rotations(&self) -> u64 {
+        self.rotations.load(Ordering::Relaxed)
+    }
+}
+
+/// A cheap, allocation-light snapshot of the pool's live state (F1). One producer, shared with the
+/// (deferred) F4 dashboard.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolSnapshot {
+    /// Proxies serving `Scheme::Http`.
+    pub http: usize,
+    /// Proxies serving `Scheme::Https`.
+    pub https: usize,
+    pub total: usize,
+    /// Mean of `Proxy::error_rate()` over the pool.
+    pub avg_error_rate: f64,
+    /// Mean of `Proxy::avg_resp_time()` over the pool, seconds.
+    pub avg_resp_time: f64,
 }
 
 /// Selection inputs for one `get`: the strategy plus the fields it needs — the resolved sticky
@@ -550,6 +610,80 @@ pub async fn serve(
     })
 }
 
+/// Render the pool's live state in Prometheus text exposition format (0.0.4) (F1). Hand-rolled —
+/// the surface is tiny and stable; adding the `prometheus` crate would bloat the build for no gain.
+/// Floats use `{:.2}` to match `Proxy`'s 2-dp rounding convention. Error rate is an **aggregate**
+/// gauge, not per-address (per-proxy labels are unbounded cardinality for a rotating pool — see
+/// `decisions.md`); per-proxy detail lives behind the control API.
+#[cfg(feature = "metrics")]
+pub fn render_metrics(pool: &Pool) -> String {
+    let s = pool.snapshot();
+    format!(
+        "# HELP proxybroker_pool_size Proxies currently available in the pool.\n\
+         # TYPE proxybroker_pool_size gauge\n\
+         proxybroker_pool_size{{scheme=\"http\"}} {http}\n\
+         proxybroker_pool_size{{scheme=\"https\"}} {https}\n\
+         # HELP proxybroker_pool_error_rate_avg Mean proxy error rate over the pool.\n\
+         # TYPE proxybroker_pool_error_rate_avg gauge\n\
+         proxybroker_pool_error_rate_avg {err:.2}\n\
+         # HELP proxybroker_pool_resp_time_avg_seconds Mean proxy response time over the pool.\n\
+         # TYPE proxybroker_pool_resp_time_avg_seconds gauge\n\
+         proxybroker_pool_resp_time_avg_seconds {rt:.2}\n\
+         # HELP proxybroker_evictions_total Proxies hard-evicted from the pool.\n\
+         # TYPE proxybroker_evictions_total counter\n\
+         proxybroker_evictions_total {evict}\n\
+         # HELP proxybroker_rotations_total Mid-request rotations to a different proxy.\n\
+         # TYPE proxybroker_rotations_total counter\n\
+         proxybroker_rotations_total {rot}\n",
+        http = s.http,
+        https = s.https,
+        err = s.avg_error_rate,
+        rt = s.avg_resp_time,
+        evict = pool.evictions(),
+        rot = pool.rotations(),
+    )
+}
+
+/// Serve [`render_metrics`] over a tiny HTTP `GET` responder on `addr` (F1). Any request returns the
+/// current metrics. Mirrors `serve`'s raw-tokio accept loop + `CancellationToken` shutdown; no hyper.
+#[cfg(feature = "metrics")]
+pub async fn serve_metrics(addr: SocketAddr, pool: Arc<Pool>) -> std::io::Result<ServerHandle> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let accept_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            let mut client = tokio::select! {
+                _ = accept_cancel.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((s, _)) => s,
+                    Err(_) => continue,
+                },
+            };
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                // Drain the request (any GET returns metrics); ignore the request line.
+                let mut buf = [0u8; 1024];
+                let _ = client.read(&mut buf).await;
+                let body = render_metrics(&pool);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = client.write_all(resp.as_bytes()).await;
+                let _ = client.flush().await;
+            });
+        }
+    });
+    Ok(ServerHandle {
+        addr: local,
+        cancel,
+    })
+}
+
 /// How the client spoke to us — drives the *ack* the relay sends back, independently of the
 /// target [`Scheme`] (which still drives pool selection + `choose_proto`). R0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,12 +761,18 @@ async fn handle_client(
         port: req.port,
     };
 
-    for _ in 0..max_tries {
+    for attempt in 0..max_tries {
         let Some(mut proxy) = pool.get(req.scheme, &key).await else {
             // No proxy available and the source is exhausted — tell the client in its own protocol.
             let _ = client.write_all(terminal_failure(req.frontend)).await;
             return Ok(());
         };
+        // F1: reaching attempt > 0 means the previous attempt failed and benched its proxy, and
+        // this `get` acquired a *different* one — that is the rotation. Counting at the failure
+        // instead would over-count the final failure before a 502 (no actual switch follows it).
+        if attempt > 0 {
+            pool.rotations.fetch_add(1, Ordering::Relaxed);
+        }
         let proto = choose_proto(&proxy, req.scheme);
 
         match relay(
@@ -659,7 +799,7 @@ async fn handle_client(
             }
             RelayOutcome::RetryableFailure(e) => {
                 proxy.record_attempt(None, Some(e));
-                pool.put_failed(proxy); // bench it, then try the next proxy
+                pool.put_failed(proxy); // bench it, then try the next proxy (counted on next get)
             }
             RelayOutcome::ClientCommitted(e) => {
                 // The client already saw an ack or bytes — a retry would corrupt it. Record the
