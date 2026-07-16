@@ -538,5 +538,29 @@ mod tests {
         assert_eq!(v["types"][0]["level"], "High");
         assert_eq!(v["types"][1]["type"], "CONNECT:80");
         assert_eq!(v["types"][1]["level"], ""); // no level for non-HTTP
+
+        // Proxy JSON = v1, FROZEN (see decisions.md). This golden test asserts the COMPLETE shape
+        // so region/city (C7) or any future field cannot drift the schema silently — a breaking
+        // change must bump the `--format` variant (e.g. json2), never an in-band field. For a
+        // country-only Country (the bundled DB, and this fixture) region is empty and city is null.
+        assert_eq!(v["geo"]["region"]["code"], "");
+        assert_eq!(v["geo"]["region"]["name"], "");
+        assert_eq!(v["geo"]["city"], serde_json::Value::Null);
+        assert_eq!(v["avg_resp_time"], 0.0);
+        assert_eq!(v["error_rate"], 0.0);
+        let mut top_keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top_keys.sort_unstable();
+        assert_eq!(
+            top_keys,
+            [
+                "avg_resp_time",
+                "error_rate",
+                "geo",
+                "host",
+                "port",
+                "types"
+            ],
+            "top-level Proxy JSON keys are frozen at v1"
+        );
     }
 }

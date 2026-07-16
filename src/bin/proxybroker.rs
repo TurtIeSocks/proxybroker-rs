@@ -357,6 +357,8 @@ enum Format {
     Txt,
     /// One JSON object per line (NDJSON).
     Json,
+    /// A single `[ {...}, {...} ]` JSON array document, emitted incrementally.
+    JsonArray,
     /// `scheme://host:port`, one per line.
     Url,
     /// `host,port,protocols,anon,country,resp_time,error_rate`, with a header row.
@@ -369,16 +371,22 @@ enum Format {
 /// new `Format` variants + arms here.
 struct Emitter {
     format: Format,
+    /// JSON-array separator state: `true` once at least one element has been emitted.
+    started: bool,
 }
 
 impl Emitter {
     fn new(format: Format) -> Self {
-        Emitter { format }
+        Emitter {
+            format,
+            started: false,
+        }
     }
 
     /// Bytes emitted once before the first proxy. `None` for the streaming line formats.
     fn prefix(&self) -> Option<String> {
         match self.format {
+            Format::JsonArray => Some("[".into()),
             Format::Csv => Some("host,port,protocols,anon,country,resp_time,error_rate\n".into()),
             Format::Default | Format::Txt | Format::Json | Format::Url => None,
         }
@@ -392,12 +400,20 @@ impl Emitter {
             Format::Json => format!("{}\n", serde_json::to_string(proxy).unwrap()),
             Format::Url => format!("{}://{}\n", scheme_str(proxy), proxy.addr()),
             Format::Csv => format!("{}\n", csv_row(proxy)),
+            Format::JsonArray => {
+                // Same per-object bytes as `Json`, wrapped: a leading `,` for every element after
+                // the first, so the array streams out well-formed without buffering.
+                let sep = if self.started { "," } else { "" };
+                self.started = true;
+                format!("{sep}{}", serde_json::to_string(proxy).unwrap())
+            }
         }
     }
 
     /// Bytes emitted once after the last proxy. `None` for line formats.
     fn suffix(&self) -> Option<String> {
         match self.format {
+            Format::JsonArray => Some("]\n".into()),
             Format::Default | Format::Txt | Format::Json | Format::Url | Format::Csv => None,
         }
     }
@@ -906,5 +922,47 @@ mod format_tests {
         let p = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
         let row = Emitter::new(Format::Csv).item(&p);
         assert_eq!(row.trim_end(), "1.2.3.4,8080,,,,0,0");
+    }
+
+    #[test]
+    fn json_array_emits_bracketed_comma_separated() {
+        let mut e = Emitter::new(Format::JsonArray);
+        let mut out = e.prefix().unwrap();
+        out.push_str(&e.item(&proxy_fixture()));
+        out.push_str(&e.item(&proxy_fixture()));
+        out.push_str(&e.suffix().unwrap());
+        assert!(out.starts_with('['), "{out}");
+        assert!(out.ends_with("]\n"), "{out}");
+        let v: Vec<serde_json::Value> = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v.len(), 2, "parses as a 2-element array: {out}");
+    }
+
+    #[test]
+    fn json_array_empty_stream_is_empty_array() {
+        let e = Emitter::new(Format::JsonArray);
+        let out = format!("{}{}", e.prefix().unwrap(), e.suffix().unwrap());
+        assert_eq!(out, "[]\n");
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(out.trim_end())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ndjson_still_one_object_per_line() {
+        // C4 must not change the streaming NDJSON default: each element is a standalone object with
+        // no array wrapping and no leading separator.
+        let mut e = Emitter::new(Format::Json);
+        let a = e.item(&proxy_fixture());
+        let b = e.item(&proxy_fixture());
+        assert!(
+            a.trim_end().starts_with('{') && a.trim_end().ends_with('}'),
+            "{a:?}"
+        );
+        assert!(
+            b.starts_with('{'),
+            "NDJSON element must not have a leading separator: {b:?}"
+        );
     }
 }
