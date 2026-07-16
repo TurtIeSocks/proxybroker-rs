@@ -105,6 +105,77 @@ pub fn bundled_registry() -> Vec<ProviderSpec> {
     serde_yaml_ng::from_str(YAML).expect("bundled providers.yaml is valid")
 }
 
+/// Load provider configs from a directory: every `*.yaml` / `*.yml` / `*.json` file, one
+/// provider per file, sorted by name, skipping files whose name starts with `_` (the rename
+/// -to-disable convention). Mirrors `provider_utils.load_provider_configs_from_directory`.
+///
+/// A file that fails to parse is logged and skipped so one bad config does not sink the rest.
+/// Unknown fields (e.g. Python's `name`, `format`, `max_connections`) are ignored, so
+/// proxybroker2 config files load directly.
+///
+/// **Deviation:** proxybroker2 also has `load_python_providers_from_directory`, which
+/// *executes* `.py` files. There is no safe Rust equivalent (we do not run arbitrary code),
+/// so only data files are loaded — which is also the safer default.
+pub fn load_provider_dir(dir: &std::path::Path) -> Vec<ProviderSpec> {
+    if !dir.is_dir() {
+        tracing::warn!(dir = %dir.display(), "provider directory does not exist");
+        return Vec::new();
+    }
+    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let ext_ok = matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("yaml" | "yml" | "json")
+                );
+                let named = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.starts_with('_'));
+                ext_ok && named
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot read provider directory");
+            return Vec::new();
+        }
+    };
+    paths.sort();
+
+    paths
+        .into_iter()
+        .filter_map(|p| match std::fs::read_to_string(&p) {
+            Ok(text) => match serde_yaml_ng::from_str::<ProviderSpec>(&text) {
+                // serde_yaml_ng parses JSON too (JSON is a YAML subset), so one path covers both.
+                Ok(spec) => Some(spec),
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), error = %e, "skipping invalid provider config");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "cannot read provider config");
+                None
+            }
+        })
+        .collect()
+}
+
+/// A YAML config template for a provider, to help users write their own.
+/// `provider_utils.create_provider_config_template`.
+pub fn config_template() -> &'static str {
+    "# proxybroker provider config — one provider per file.\n\
+     # Drop this in a directory and pass it with --provider-dir.\n\
+     # A filename starting with `_` is skipped (rename to disable).\n\
+     url: \"http://example.com/proxy-list.txt\"\n\
+     # Protocols proxies from this source may support (empty = check all):\n\
+     protocols: [HTTP, HTTPS]\n\
+     # Optional 2-group (host, port) regex; omit to use the default IP:port scanner:\n\
+     # pattern: \"(\\\\d+\\\\.\\\\d+\\\\.\\\\d+\\\\.\\\\d+):(\\\\d+)\"\n\
+     timeout: 20\n"
+}
+
 /// Fetch a provider's page and extract candidate proxies. Network I/O; the pure extraction
 /// it wraps is [`ProviderSpec::extract`]. On any fetch error the provider yields nothing —
 /// one dead source must never sink a grab (mirrors `providers.py`, which swallows request
@@ -224,5 +295,52 @@ mod tests {
         assert_eq!(s.protocols, vec![Proto::Http, Proto::Socks5]);
         assert_eq!(s.timeout, 15);
         assert!(s.pattern.is_none());
+    }
+
+    #[test]
+    fn python_config_extra_fields_are_ignored() {
+        // A proxybroker2 config with name/type/format/max_connections must still load.
+        let yaml = "name: My List\ntype: simple\nformat: text\nurl: http://x/list\n\
+                    protocols: [HTTP]\nmax_connections: 4\ntimeout: 30";
+        let s: ProviderSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(s.url, "http://x/list");
+        assert_eq!(s.timeout, 30);
+    }
+
+    #[test]
+    fn config_template_is_a_valid_provider_spec() {
+        let s: ProviderSpec = serde_yaml_ng::from_str(config_template()).unwrap();
+        assert_eq!(s.protocols, vec![Proto::Http, Proto::Https]);
+    }
+
+    #[test]
+    fn load_provider_dir_reads_sorted_skips_underscore_and_bad() {
+        let dir = std::env::temp_dir().join(format!("pb_prov_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.yaml"), "url: http://b/\nprotocols: [SOCKS5]").unwrap();
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"url":"http://a/","protocols":["HTTP"]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("_disabled.yaml"), "url: http://skip/").unwrap();
+        std::fs::write(dir.join("broken.yaml"), "url: [not a string").unwrap();
+        std::fs::write(dir.join("notconfig.txt"), "ignored").unwrap();
+
+        let specs = load_provider_dir(&dir);
+        // sorted by filename: a.json then b.yaml; _disabled, broken, and .txt excluded.
+        assert_eq!(specs.len(), 2, "{specs:?}");
+        assert_eq!(specs[0].url, "http://a/");
+        assert_eq!(specs[0].protocols, vec![Proto::Http]);
+        assert_eq!(specs[1].url, "http://b/");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_provider_dir_missing_dir_is_empty() {
+        let dir = std::env::temp_dir().join("pb_prov_definitely_missing_xyz");
+        assert!(load_provider_dir(&dir).is_empty());
     }
 }

@@ -47,6 +47,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     geo_db: Option<PathBuf>,
 
+    /// Load extra providers from YAML/JSON configs in this directory (appended to the
+    /// bundled set). May be repeated. Pass --providers-only to use ONLY these.
+    #[arg(long, global = true, value_name = "DIR")]
+    provider_dir: Vec<PathBuf>,
+
+    /// Use only the --provider-dir providers, ignoring the bundled registry.
+    #[arg(long, global = true)]
+    providers_only: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -203,6 +212,25 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Broker::builder();
+
+    // Providers: bundled registry plus any --provider-dir configs, or ONLY the configs when
+    // --providers-only is set (mirrors proxybroker2's providers=[] + provider_dirs pattern).
+    if !cli.provider_dir.is_empty() || cli.providers_only {
+        let mut providers = if cli.providers_only {
+            Vec::new()
+        } else {
+            proxybroker::provider::bundled_registry()
+        };
+        for dir in &cli.provider_dir {
+            providers.extend(proxybroker::load_provider_dir(dir));
+        }
+        if providers.is_empty() {
+            return Err(
+                "no providers: --providers-only with no valid --provider-dir configs".into(),
+            );
+        }
+        builder = builder.providers(providers);
+    }
 
     #[cfg(feature = "geo")]
     {
