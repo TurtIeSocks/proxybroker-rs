@@ -5,11 +5,22 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
-use proxybroker::broker::{Broker, GrabQuery};
+use proxybroker::broker::{Broker, FindQuery, GrabQuery};
+use proxybroker::types::{AnonLevel, ParseProtoError, Proto, TypeSpec};
 use proxybroker::Proxy;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+
+/// clap value parsers via the types' own `FromStr` (keeps clap out of the library's
+/// always-compiled `types.rs`).
+fn parse_proto(s: &str) -> Result<Proto, ParseProtoError> {
+    s.parse()
+}
+fn parse_lvl(s: &str) -> Result<AnonLevel, ParseProtoError> {
+    s.parse()
+}
 
 /// Shown in `--version`. The DB-IP attribution is required by CC BY 4.0 whenever the geo
 /// data is bundled — see `LICENSE-DATA`.
@@ -43,6 +54,8 @@ struct Cli {
 enum Command {
     /// Gather proxies from the providers without checking them.
     Grab(GrabArgs),
+    /// Gather proxies and check that they work, classifying anonymity.
+    Find(FindArgs),
 }
 
 #[derive(clap::Args)]
@@ -54,6 +67,57 @@ struct GrabArgs {
     /// Keep only proxies located in these ISO country codes (e.g. US GB DE).
     #[arg(long, num_args = 1.., value_name = "CC")]
     countries: Vec<String>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Default)]
+    format: Format,
+
+    /// Write to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    outfile: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct FindArgs {
+    /// Protocols to check (required). E.g. --types HTTP HTTPS SOCKS5 CONNECT:80.
+    #[arg(long, num_args = 1.., required = true, value_name = "TYPE", value_parser = parse_proto)]
+    types: Vec<Proto>,
+
+    /// Anonymity levels to accept for HTTP (e.g. High Anonymous). Default: any.
+    #[arg(long, num_args = 1.., value_name = "LVL", value_parser = parse_lvl)]
+    lvl: Vec<AnonLevel>,
+
+    /// Stop after this many working proxies. 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+
+    /// Keep only proxies located in these ISO country codes.
+    #[arg(long, num_args = 1.., value_name = "CC")]
+    countries: Vec<String>,
+
+    /// Judge URLs to use instead of the bundled defaults.
+    #[arg(long, num_args = 1.., value_name = "URL")]
+    judges: Vec<String>,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 8)]
+    timeout: u64,
+
+    /// Maximum concurrent checks.
+    #[arg(long, default_value_t = 200)]
+    max_conn: usize,
+
+    /// Attempts per protocol before giving up.
+    #[arg(long, default_value_t = 3)]
+    max_tries: usize,
+
+    /// Use POST instead of GET for the test request.
+    #[arg(long)]
+    post: bool,
+
+    /// Require the anonymity level to match exactly.
+    #[arg(long)]
+    strict: bool,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Default)]
@@ -116,6 +180,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Grab(args) => grab(broker, args).await,
+        Command::Find(args) => find(broker, args).await,
     }
 }
 
@@ -126,13 +191,47 @@ async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::
         // 0-as-unlimited (which would otherwise make a `take(0)` yield nothing).
         limit: (args.limit > 0).then_some(args.limit),
     };
+    write_stream(broker.grab(query), args.format, args.outfile.as_deref()).await
+}
 
-    let mut stream = broker.grab(query);
-    let format = args.format;
+async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Attach the requested anonymity levels to every requested type. `--lvl` applies only to
+    // HTTP; for other protocols the checker ignores levels.
+    let levels = (!args.lvl.is_empty()).then_some(args.lvl);
+    let types: Vec<TypeSpec> = args
+        .types
+        .into_iter()
+        .map(|proto| TypeSpec {
+            proto,
+            levels: levels.clone(),
+        })
+        .collect();
 
+    let query = FindQuery {
+        types,
+        countries: (!args.countries.is_empty()).then_some(args.countries),
+        limit: (args.limit > 0).then_some(args.limit),
+        judges: args.judges,
+        timeout: Duration::from_secs(args.timeout),
+        max_conn: args.max_conn,
+        max_tries: args.max_tries,
+        post: args.post,
+        strict: args.strict,
+    };
+
+    let stream = broker.find(query).await?;
+    write_stream(stream, args.format, args.outfile.as_deref()).await
+}
+
+/// Drain a proxy stream to a file or stdout in the chosen format.
+async fn write_stream(
+    mut stream: proxybroker::ProxyStream,
+    format: Format,
+    outfile: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Writing to a file is async I/O; stdout is a blocking lock. Keep them separate rather
     // than boxing a trait object over two very different sinks.
-    if let Some(path) = &args.outfile {
+    if let Some(path) = outfile {
         let mut file = tokio::fs::File::create(path).await?;
         let mut count = 0u64;
         while let Some(proxy) = stream.next().await {
