@@ -13,10 +13,22 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 
-/// Country of an IP. DB-IP Country Lite is country-resolution only, so region/city — present
-/// in proxybroker2's JSON — are always empty here. The shape is preserved for compatibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Country of an IP. The bundled DB-IP Country-Lite is country-resolution only, so `region`/`city`
+/// — present in proxybroker2's JSON — stay `None` for it. They populate only when the caller opens
+/// a richer MaxMind **City** DB via `--geo-db` (C7); the JSON shape is fixed either way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Country {
+    pub code: String,
+    pub name: String,
+    /// Subdivision (state/province), from a City DB only.
+    pub region: Option<Region>,
+    /// City name, from a City DB only.
+    pub city: Option<String>,
+}
+
+/// A subdivision (ISO 3166-2 state/province), populated only from a City DB.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Region {
     pub code: String,
     pub name: String,
 }
@@ -221,18 +233,22 @@ impl Serialize for Proxy {
         st.serialize_field("host", &self.host.to_string())?;
         st.serialize_field("port", &self.port)?;
 
-        // geo: { country: {code,name}, region:{code,name}, city } — region/city always empty
-        // because DB-IP Country Lite is country-only.
+        // geo: { country: {code,name}, region:{code,name}, city }. region/city fill only from a
+        // user City DB (C7); the bundled Country-Lite leaves them empty/null — the shape is fixed.
         let (code, name) = match &self.geo {
             Some(c) => (c.code.as_str(), c.name.as_str()),
             None => ("", ""),
         };
+        let region = self.geo.as_ref().and_then(|c| c.region.as_ref());
         st.serialize_field(
             "geo",
             &serde_json::json!({
                 "country": { "code": code, "name": name },
-                "region":  { "code": "", "name": "" },
-                "city": serde_json::Value::Null,
+                "region": {
+                    "code": region.map_or("", |r| r.code.as_str()),
+                    "name": region.map_or("", |r| r.name.as_str()),
+                },
+                "city": self.geo.as_ref().and_then(|c| c.city.as_deref()),
             }),
         )?;
 
@@ -268,10 +284,22 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             #[serde(default)]
             name: String,
         }
+        // region/city sit beside `country` under `geo` in the JSON (see Serialize), not inside it.
+        #[derive(serde::Deserialize, Default)]
+        struct RawRegion {
+            #[serde(default)]
+            code: String,
+            #[serde(default)]
+            name: String,
+        }
         #[derive(serde::Deserialize, Default)]
         struct RawGeo {
             #[serde(default)]
             country: RawCountry,
+            #[serde(default)]
+            region: RawRegion,
+            #[serde(default)]
+            city: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RawType {
@@ -299,9 +327,21 @@ impl<'de> serde::Deserialize<'de> for Proxy {
         let geo = if code.is_empty() {
             None
         } else {
+            // Round-trip region/city too (a City DB populates them): empty region → None,
+            // matching how Serialize renders an absent region as {code:"",name:""}.
+            let region = if raw.geo.region.code.is_empty() && raw.geo.region.name.is_empty() {
+                None
+            } else {
+                Some(Region {
+                    code: raw.geo.region.code,
+                    name: raw.geo.region.name,
+                })
+            };
             Some(Country {
                 code,
                 name: raw.geo.country.name,
+                region,
+                city: raw.geo.city.filter(|s| !s.is_empty()),
             })
         };
         let mut types = BTreeMap::new();
@@ -392,6 +432,7 @@ mod tests {
         x.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         x.add_type(Proto::Http, Some(AnonLevel::High));
         x.add_type(Proto::Connect80, None);
@@ -408,6 +449,26 @@ mod tests {
         x.add_type(Proto::Socks5, None);
         let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
         assert_eq!(back.geo, None);
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn geo_region_city_round_trip() {
+        // A City DB populates region/city; the save/load round-trip must preserve them (they are
+        // never re-resolved on --load, so dropping them would be silent, irrecoverable data loss).
+        let mut x = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        x.geo = Some(Country {
+            code: "SE".into(),
+            name: "Sweden".into(),
+            region: Some(Region {
+                code: "E".into(),
+                name: "Östergötland".into(),
+            }),
+            city: Some("Linköping".into()),
+        });
+        x.add_type(Proto::Http, Some(AnonLevel::High));
+        let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+        assert_eq!(back.geo, x.geo);
         assert_eq!(back, x);
     }
 
@@ -431,6 +492,7 @@ mod tests {
         a.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         a.add_type(Proto::Http, Some(AnonLevel::High));
         let mut b = Proxy::new("5.6.7.8".parse().unwrap(), 3128, BTreeSet::new());
@@ -524,6 +586,7 @@ mod tests {
         x.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         x.add_type(Proto::Http, Some(AnonLevel::High));
         x.add_type(Proto::Connect80, None);
@@ -538,5 +601,64 @@ mod tests {
         assert_eq!(v["types"][0]["level"], "High");
         assert_eq!(v["types"][1]["type"], "CONNECT:80");
         assert_eq!(v["types"][1]["level"], ""); // no level for non-HTTP
+
+        // Proxy JSON = v1, FROZEN (see decisions.md). This golden test asserts the COMPLETE shape
+        // so region/city (C7) or any future field cannot drift the schema silently — a breaking
+        // change must bump the `--format` variant (e.g. json2), never an in-band field. For a
+        // country-only Country (the bundled DB, and this fixture) region is empty and city is null.
+        assert_eq!(v["geo"]["region"]["code"], "");
+        assert_eq!(v["geo"]["region"]["name"], "");
+        assert_eq!(v["geo"]["city"], serde_json::Value::Null);
+        assert_eq!(v["avg_resp_time"], 0.0);
+        assert_eq!(v["error_rate"], 0.0);
+        let mut top_keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top_keys.sort_unstable();
+        assert_eq!(
+            top_keys,
+            [
+                "avg_resp_time",
+                "error_rate",
+                "geo",
+                "host",
+                "port",
+                "types"
+            ],
+            "top-level Proxy JSON keys are frozen at v1"
+        );
+
+        // A top-level-only check is addition-blind: a new key nested inside geo / geo.country /
+        // geo.region / a types[] element (serde_json indexes a missing key to Null, so only
+        // *removals* trip a path assertion) would drift the schema silently. Freeze the nested
+        // key sets too so any added field must consciously bump the format variant.
+        fn sorted_keys(val: &serde_json::Value) -> Vec<&str> {
+            let mut k: Vec<&str> = val
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            k.sort_unstable();
+            k
+        }
+        assert_eq!(
+            sorted_keys(&v["geo"]),
+            ["city", "country", "region"],
+            "geo shape frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["geo"]["country"]),
+            ["code", "name"],
+            "geo.country frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["geo"]["region"]),
+            ["code", "name"],
+            "geo.region frozen"
+        );
+        assert_eq!(
+            sorted_keys(&v["types"][0]),
+            ["level", "type"],
+            "types[] element frozen"
+        );
     }
 }

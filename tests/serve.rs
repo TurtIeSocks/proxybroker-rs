@@ -115,6 +115,7 @@ fn proxy_in(ip: &str, cc: &str) -> Proxy {
     p.geo = Some(proxybroker::Country {
         code: cc.into(),
         name: String::new(),
+        ..Default::default()
     });
     p
 }

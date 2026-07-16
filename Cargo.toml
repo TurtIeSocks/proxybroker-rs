@@ -16,7 +16,10 @@ categories = ["network-programming", "command-line-utilities"]
 # data/* covers the geo mmdb (runtime, via include_bytes!) AND providers.yaml (runtime, via
 # include_str!). Missing providers.yaml here makes a published crate fail to compile — caught
 # by `cargo publish --dry-run`, which is why release CI runs it.
-include = ["src/**/*", "examples/**/*", "data/*", "LICENSE", "LICENSE-DATA", "NOTICE", "README.md"]
+# Root-file entries are anchored with a leading "/": the bare gitignore-style glob "README.md"
+# matches in ANY directory, which would pull tests/data/README.md (the City-fixture provenance)
+# into the package. Anchoring keeps the published crate free of anything under tests/.
+include = ["src/**/*", "examples/**/*", "data/*", "/LICENSE", "/LICENSE-DATA", "/NOTICE", "/README.md"]
 
 [features]
 default = ["cli", "server", "geo", "geo-bundled"]

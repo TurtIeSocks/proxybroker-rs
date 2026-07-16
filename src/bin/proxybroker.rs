@@ -207,6 +207,12 @@ struct GrabArgs {
     #[arg(long, value_enum, default_value_t = Format::Default)]
     format: Format,
 
+    /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// unknown tokens pass through literally.
+    #[arg(long, value_name = "TEMPLATE")]
+    output_format: Option<String>,
+
     /// Write to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
     outfile: Option<PathBuf>,
@@ -262,9 +268,20 @@ struct FindArgs {
     #[arg(long)]
     show_stats: bool,
 
+    /// Format for the --show-stats summary (stderr): text (default) or json. Inert without
+    /// --show-stats.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Text)]
+    stats_format: StatsFormat,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Default)]
     format: Format,
+
+    /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// unknown tokens pass through literally.
+    #[arg(long, value_name = "TEMPLATE")]
+    output_format: Option<String>,
 
     /// Write to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
@@ -335,9 +352,20 @@ struct CheckArgs {
     #[arg(long)]
     show_stats: bool,
 
+    /// Format for the --show-stats summary (stderr): text (default) or json. Inert without
+    /// --show-stats.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Text)]
+    stats_format: StatsFormat,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Default)]
     format: Format,
+
+    /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// unknown tokens pass through literally.
+    #[arg(long, value_name = "TEMPLATE")]
+    output_format: Option<String>,
 
     /// Write to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
@@ -349,23 +377,172 @@ struct CheckArgs {
     save: Option<PathBuf>,
 }
 
+/// Format for the `--show-stats` summary (which always goes to stderr, orthogonal to `--format`).
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum StatsFormat {
+    /// The human-readable summary (unchanged).
+    #[default]
+    Text,
+    /// A single JSON object.
+    Json,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
     /// `host:port`, one per line.
     Default,
     /// `host:port`, one per line (alias of default for grabbed proxies).
     Txt,
-    /// One JSON object per line.
+    /// One JSON object per line (NDJSON).
     Json,
+    /// A single `[ {...}, {...} ]` JSON array document, emitted incrementally.
+    JsonArray,
+    /// `scheme://host:port`, one per line.
+    Url,
+    /// `host,port,protocols,anon,country,resp_time,error_rate`, with a header row.
+    Csv,
 }
 
-impl Format {
-    fn render(self, proxy: &Proxy) -> String {
-        match self {
-            Format::Default | Format::Txt => proxy.addr(),
-            Format::Json => serde_json::to_string(proxy).unwrap(),
+/// Stateful output formatter: a one-time `prefix` (CSV header, JSON-array `[`), a per-proxy `item`
+/// (which owns its own newline / array separator), and a one-time `suffix` (JSON-array `]`). One
+/// source of format truth shared by both `write_stream` sink loops. Later waves' formats plug in as
+/// new `Format` variants + arms here.
+struct Emitter<'a> {
+    format: Format,
+    /// C6: when `Some`, `--output-format` template overrides `format` (always line output).
+    template: Option<&'a str>,
+    /// JSON-array separator state: `true` once at least one element has been emitted.
+    started: bool,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(format: Format, template: Option<&'a str>) -> Self {
+        Emitter {
+            format,
+            template,
+            started: false,
         }
     }
+
+    /// Bytes emitted once before the first proxy. `None` for the streaming line formats, and for a
+    /// template (which is always plain line output — it ignores `json-array` wrapping).
+    fn prefix(&self) -> Option<String> {
+        if self.template.is_some() {
+            return None;
+        }
+        match self.format {
+            Format::JsonArray => Some("[".into()),
+            Format::Csv => Some("host,port,protocols,anon,country,resp_time,error_rate\n".into()),
+            Format::Default | Format::Txt | Format::Json | Format::Url => None,
+        }
+    }
+
+    /// One proxy rendered as a self-contained chunk (including its trailing newline for line
+    /// formats). `&mut self` so structural formats (JSON array) can track separator state.
+    fn item(&mut self, proxy: &Proxy) -> String {
+        if let Some(tmpl) = self.template {
+            return format!("{}\n", render_template(tmpl, proxy));
+        }
+        match self.format {
+            Format::Default | Format::Txt => format!("{}\n", proxy.addr()),
+            Format::Json => format!("{}\n", serde_json::to_string(proxy).unwrap()),
+            Format::Url => format!("{}://{}\n", scheme_str(proxy), proxy.addr()),
+            Format::Csv => format!("{}\n", csv_row(proxy)),
+            Format::JsonArray => {
+                // Same per-object bytes as `Json`, wrapped: a leading `,` for every element after
+                // the first, so the array streams out well-formed without buffering.
+                let sep = if self.started { "," } else { "" };
+                self.started = true;
+                format!("{sep}{}", serde_json::to_string(proxy).unwrap())
+            }
+        }
+    }
+
+    /// Bytes emitted once after the last proxy. `None` for line formats and templates.
+    fn suffix(&self) -> Option<String> {
+        if self.template.is_some() {
+            return None;
+        }
+        match self.format {
+            Format::JsonArray => Some("]\n".into()),
+            Format::Default | Format::Txt | Format::Json | Format::Url | Format::Csv => None,
+        }
+    }
+}
+
+/// `https` if the proxy can tunnel TLS, else `http` — the URL scheme for `--format url`. A grabbed
+/// (unchecked) proxy has no confirmed types, so it falls back to `http`. `Scheme` has no
+/// `Display`, so the two-arm choice is inlined here rather than widened into the library.
+/// The proxy's own URL scheme for `--format url` and `{{scheme}}` — i.e. how a client dials the
+/// proxy, which is what a consumer (`curl --proxy`, `requests`) needs. SOCKS proxies are `socks5`/
+/// `socks4`; the whole HTTP family (`HTTP`, `HTTPS`, `CONNECT:*`) is reached over plain HTTP, so it
+/// is `http`. The `HTTPS`/`CONNECT` capability describes *target* traffic the proxy can tunnel, not
+/// a TLS endpoint — emitting `https://` there would tell tooling the proxy itself speaks TLS (it
+/// does not) and mis-dispatch the connection.
+fn scheme_str(p: &Proxy) -> &'static str {
+    let protos = p.types();
+    if protos.contains_key(&Proto::Socks5) {
+        "socks5"
+    } else if protos.contains_key(&Proto::Socks4) {
+        "socks4"
+    } else {
+        "http"
+    }
+}
+
+/// Confirmed protocols as `|`-joined wire names (never contains a comma). Shared by CSV + template.
+fn proto_list(p: &Proxy) -> String {
+    p.types()
+        .keys()
+        .map(|proto| proto.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The HTTP anonymity level as a wire string, or `""` if unchecked / not HTTP. Shared by CSV +
+/// template.
+fn anon_str(p: &Proxy) -> &'static str {
+    p.types()
+        .get(&Proto::Http)
+        .and_then(|l| *l)
+        .map(AnonLevel::as_str)
+        .unwrap_or("")
+}
+
+/// The ISO country code, or `""` when geo is absent. Shared by CSV + template.
+fn country_str(p: &Proxy) -> &str {
+    p.geo.as_ref().map(|c| c.code.as_str()).unwrap_or("")
+}
+
+/// Render a proxy through a `--output-format` template (C6). A **closed** token set replaced
+/// sequentially — tokens are distinct non-overlapping literals, so `str::replace` per token is
+/// correct without a parser. Unknown `{{...}}` tokens are left literally (predictable, config-free).
+fn render_template(tmpl: &str, p: &Proxy) -> String {
+    tmpl.replace("{{proxy}}", &p.addr())
+        .replace("{{host}}", &p.host.to_string())
+        .replace("{{port}}", &p.port.to_string())
+        .replace("{{scheme}}", scheme_str(p))
+        .replace("{{protocols}}", &proto_list(p))
+        .replace("{{anon}}", anon_str(p))
+        .replace("{{country}}", country_str(p))
+        .replace("{{duration}}", &p.avg_resp_time().to_string())
+        .replace("{{error_rate}}", &p.error_rate().to_string())
+}
+
+/// One CSV row for `--format csv`. Every field is comma-free by construction (protocols `|`-joined,
+/// ISO country code only, numeric stats), so no quoting layer is needed — a deviation guarded by
+/// the `csv_header_and_row` test (it fails if a field ever gains a comma).
+fn csv_row(p: &Proxy) -> String {
+    format!(
+        "{},{},{},{},{},{},{}",
+        p.host,
+        p.port,
+        proto_list(p),
+        anon_str(p),
+        country_str(p),
+        p.avg_resp_time(),
+        p.error_rate()
+    )
 }
 
 #[tokio::main]
@@ -512,7 +689,14 @@ async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::
         limit: (args.limit > 0).then_some(args.limit),
     };
     let mut stream = broker.grab(query);
-    write_stream(&mut stream, args.format, args.outfile.as_deref(), None).await
+    write_stream(
+        &mut stream,
+        args.format,
+        args.output_format.as_deref(),
+        args.outfile.as_deref(),
+        None,
+    )
+    .await
 }
 
 /// Attach the requested anonymity levels to every requested type. `--lvl` applies only to
@@ -548,6 +732,7 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
     write_stream(
         &mut stream,
         args.format,
+        args.output_format.as_deref(),
         args.outfile.as_deref(),
         args.save.as_deref(),
     )
@@ -559,7 +744,10 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         // the proxy output on stdout. `stats()` is complete now: the stream is fully drained,
         // so all checks have finished and recorded.
         if let Some(s) = stream.stats() {
-            eprint!("\n{s}");
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
         }
     }
     Ok(())
@@ -572,14 +760,28 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
     // no network. `--types` is optional here (enforced by clap), and unused.
     if let Some(path) = &args.load {
         let loaded = proxybroker::read_ndjson(std::io::BufReader::new(std::fs::File::open(path)?))?;
+        // Honor --show-stats/--stats-format here too. This path has no broker/stream stats, so
+        // compute a fresh summary over the loaded slice before it is moved into the stream. The
+        // lossy timing fields aren't persisted (avg_resp_time/errors read 0), but total/working
+        // and the protocol/anonymity/country breakdowns are meaningful for a saved pool.
+        let stats = args
+            .show_stats
+            .then(|| proxybroker::Stats::from_proxies(&loaded));
         let mut stream = futures_util::stream::iter(loaded);
         write_stream(
             &mut stream,
             args.format,
+            args.output_format.as_deref(),
             args.outfile.as_deref(),
             args.save.as_deref(),
         )
         .await?;
+        if let Some(s) = stats {
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
+        }
         return Ok(());
     }
 
@@ -616,6 +818,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
     write_stream(
         &mut stream,
         args.format,
+        args.output_format.as_deref(),
         args.outfile.as_deref(),
         args.save.as_deref(),
     )
@@ -623,7 +826,10 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
 
     if args.show_stats {
         if let Some(s) = stream.stats() {
-            eprint!("\n{s}");
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
         }
     }
     Ok(())
@@ -635,6 +841,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
 async fn write_stream<S>(
     stream: &mut S,
     format: Format,
+    template: Option<&str>,
     outfile: Option<&std::path::Path>,
     save: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -656,24 +863,37 @@ where
     };
 
     // Writing to a file is async I/O; stdout is a blocking lock. Keep them separate rather
-    // than boxing a trait object over two very different sinks.
+    // than boxing a trait object over two very different sinks; the *format* logic lives only in
+    // the shared `Emitter`, so the two branches differ only in their I/O mechanics.
+    let mut emitter = Emitter::new(format, template);
     if let Some(path) = outfile {
         let mut file = tokio::fs::File::create(path).await?;
+        if let Some(p) = emitter.prefix() {
+            file.write_all(p.as_bytes()).await?;
+        }
         let mut count = 0u64;
         while let Some(proxy) = stream.next().await {
-            file.write_all(format.render(&proxy).as_bytes()).await?;
-            file.write_all(b"\n").await?;
+            file.write_all(emitter.item(&proxy).as_bytes()).await?;
             save_line(&proxy)?;
             count += 1;
+        }
+        if let Some(s) = emitter.suffix() {
+            file.write_all(s.as_bytes()).await?;
         }
         file.flush().await?;
         eprintln!("wrote {count} proxies to {}", path.display());
     } else {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
+        if let Some(p) = emitter.prefix() {
+            write!(lock, "{p}")?;
+        }
         while let Some(proxy) = stream.next().await {
-            writeln!(lock, "{}", format.render(&proxy))?;
+            write!(lock, "{}", emitter.item(&proxy))?;
             save_line(&proxy)?;
+        }
+        if let Some(s) = emitter.suffix() {
+            write!(lock, "{s}")?;
         }
     }
     Ok(())
@@ -741,5 +961,163 @@ mod tests {
         ]);
         assert_eq!(comma, vec!["US".to_string(), "DE".to_string()]);
         assert_eq!(comma, space);
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use proxybroker::{AnonLevel, Country, Proto, Proxy};
+    use std::collections::BTreeSet;
+
+    /// A checked proxy with geo + one HTTP type at High + one recorded runtime.
+    fn proxy_fixture() -> Proxy {
+        let mut p = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        p.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+            ..Default::default()
+        });
+        p.add_type(Proto::Http, Some(AnonLevel::High));
+        p.record_attempt(Some(0.42), None);
+        p
+    }
+
+    #[test]
+    fn emitter_default_is_addr_per_line() {
+        let mut e = Emitter::new(Format::Default, None);
+        assert!(e.prefix().is_none());
+        assert_eq!(e.item(&proxy_fixture()), "1.2.3.4:8080\n");
+        assert!(e.suffix().is_none());
+    }
+
+    #[test]
+    fn emitter_json_is_ndjson() {
+        let mut e = Emitter::new(Format::Json, None);
+        assert!(e.prefix().is_none() && e.suffix().is_none());
+        let line = e.item(&proxy_fixture());
+        assert!(line.ends_with('\n'), "{line:?}");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one object per line: {line:?}"
+        );
+        assert!(line.trim_end().starts_with('{'), "{line:?}");
+    }
+
+    #[test]
+    fn url_format_prefixes_scheme() {
+        // HTTP-only proxy → http.
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&proxy_fixture()),
+            "http://1.2.3.4:8080\n"
+        );
+        // An HTTPS-capable (CONNECT-to-443) HTTP proxy is still dialed over plain HTTP → http.
+        let mut https = Proxy::new("9.9.9.9".parse().unwrap(), 8080, BTreeSet::new());
+        https.add_type(Proto::Https, None);
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&https),
+            "http://9.9.9.9:8080\n"
+        );
+        // A SOCKS5 proxy speaks the SOCKS wire protocol → socks5, so the URL is directly usable.
+        let mut p = Proxy::new("5.6.7.8".parse().unwrap(), 1080, BTreeSet::new());
+        p.add_type(Proto::Socks5, None);
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&p),
+            "socks5://5.6.7.8:1080\n"
+        );
+        // SOCKS4 likewise.
+        let mut p4 = Proxy::new("5.6.7.8".parse().unwrap(), 1080, BTreeSet::new());
+        p4.add_type(Proto::Socks4, None);
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&p4),
+            "socks4://5.6.7.8:1080\n"
+        );
+    }
+
+    #[test]
+    fn csv_header_and_row() {
+        let mut e = Emitter::new(Format::Csv, None);
+        assert_eq!(
+            e.prefix().unwrap(),
+            "host,port,protocols,anon,country,resp_time,error_rate\n"
+        );
+        let row = e.item(&proxy_fixture());
+        let row = row.trim_end();
+        let fields: Vec<&str> = row.split(',').collect();
+        // Exactly 7 fields ⇒ no field contained a comma (the no-quoting guard).
+        assert_eq!(fields.len(), 7, "{row}");
+        assert_eq!(&fields[..5], ["1.2.3.4", "8080", "HTTP", "High", "US"]);
+    }
+
+    #[test]
+    fn csv_unchecked_proxy_has_empty_type_columns() {
+        // A grabbed proxy: no confirmed types, no geo → the type/geo columns are empty.
+        let p = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        let row = Emitter::new(Format::Csv, None).item(&p);
+        assert_eq!(row.trim_end(), "1.2.3.4,8080,,,,0,0");
+    }
+
+    #[test]
+    fn json_array_emits_bracketed_comma_separated() {
+        let mut e = Emitter::new(Format::JsonArray, None);
+        let mut out = e.prefix().unwrap();
+        out.push_str(&e.item(&proxy_fixture()));
+        out.push_str(&e.item(&proxy_fixture()));
+        out.push_str(&e.suffix().unwrap());
+        assert!(out.starts_with('['), "{out}");
+        assert!(out.ends_with("]\n"), "{out}");
+        let v: Vec<serde_json::Value> = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v.len(), 2, "parses as a 2-element array: {out}");
+    }
+
+    #[test]
+    fn json_array_empty_stream_is_empty_array() {
+        let e = Emitter::new(Format::JsonArray, None);
+        let out = format!("{}{}", e.prefix().unwrap(), e.suffix().unwrap());
+        assert_eq!(out, "[]\n");
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(out.trim_end())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ndjson_still_one_object_per_line() {
+        // C4 must not change the streaming NDJSON default: each element is a standalone object with
+        // no array wrapping and no leading separator.
+        let mut e = Emitter::new(Format::Json, None);
+        let a = e.item(&proxy_fixture());
+        let b = e.item(&proxy_fixture());
+        assert!(
+            a.trim_end().starts_with('{') && a.trim_end().ends_with('}'),
+            "{a:?}"
+        );
+        assert!(
+            b.starts_with('{'),
+            "NDJSON element must not have a leading separator: {b:?}"
+        );
+    }
+
+    #[test]
+    fn template_renders_known_fields() {
+        assert_eq!(
+            render_template("{{proxy}}/{{country}}/{{duration}}", &proxy_fixture()),
+            "1.2.3.4:8080/US/0.42"
+        );
+    }
+
+    #[test]
+    fn template_leaves_unknown_tokens_literal() {
+        assert_eq!(render_template("{{nope}}", &proxy_fixture()), "{{nope}}");
+    }
+
+    #[test]
+    fn output_format_overrides_format() {
+        // A template forces line output even when the format is json-array.
+        let mut e = Emitter::new(Format::JsonArray, Some("{{host}}"));
+        assert!(e.prefix().is_none() && e.suffix().is_none());
+        assert_eq!(e.item(&proxy_fixture()), "1.2.3.4\n");
     }
 }
