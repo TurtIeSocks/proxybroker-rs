@@ -760,6 +760,13 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
     // no network. `--types` is optional here (enforced by clap), and unused.
     if let Some(path) = &args.load {
         let loaded = proxybroker::read_ndjson(std::io::BufReader::new(std::fs::File::open(path)?))?;
+        // Honor --show-stats/--stats-format here too. This path has no broker/stream stats, so
+        // compute a fresh summary over the loaded slice before it is moved into the stream. The
+        // lossy timing fields aren't persisted (avg_resp_time/errors read 0), but total/working
+        // and the protocol/anonymity/country breakdowns are meaningful for a saved pool.
+        let stats = args
+            .show_stats
+            .then(|| proxybroker::Stats::from_proxies(&loaded));
         let mut stream = futures_util::stream::iter(loaded);
         write_stream(
             &mut stream,
@@ -769,6 +776,12 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
             args.save.as_deref(),
         )
         .await?;
+        if let Some(s) = stats {
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
+        }
         return Ok(());
     }
 
