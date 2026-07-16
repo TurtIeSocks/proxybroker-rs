@@ -514,6 +514,43 @@ async fn serve_get_auth(
 }
 
 #[tokio::test]
+async fn http_response_carries_x_proxy_info() {
+    // B7: the plain-HTTP response gains an X-Proxy-Info header with the serving upstream's addr,
+    // inserted after the status line and before the body, which stays intact.
+    let (up, _u) = mock_upstream("RELAYED-BODY").await;
+    let expected = format!("X-Proxy-Info: {}:{}", up.ip(), up.port());
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let text = serve_get(pool).await;
+    let head_end = text.find("\r\n\r\n").expect("response has a head");
+    assert!(
+        text[..head_end].contains(&expected),
+        "header not in head: {text:?}"
+    );
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "status line preserved: {text:?}"
+    );
+    assert!(text.contains("RELAYED-BODY"), "body intact: {text:?}");
+}
+
+#[tokio::test]
+async fn injection_preserves_body_boundaries() {
+    // A body containing an embedded blank line must not be rewritten — only the response head is.
+    let (up, _u) = mock_upstream("AAA\r\n\r\nBBB").await;
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let text = serve_get(pool).await;
+    assert_eq!(
+        text.matches("X-Proxy-Info").count(),
+        1,
+        "exactly one injected header: {text:?}"
+    );
+    assert!(
+        text.ends_with("AAA\r\n\r\nBBB"),
+        "body bytes byte-identical: {text:?}"
+    );
+}
+
+#[tokio::test]
 async fn missing_credentials_get_407() {
     // No Proxy-Authorization → 407 + challenge, and the upstream body never reaches the client
     // (no pool proxy consumed).

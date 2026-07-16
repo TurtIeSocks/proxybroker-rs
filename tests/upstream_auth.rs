@@ -191,3 +191,46 @@ async fn no_creds_omits_proxy_authorization() {
     let fwd = forwarded_request(None).await;
     assert!(!fwd.contains("Proxy-Authorization"), "{fwd:?}");
 }
+
+#[tokio::test]
+async fn connect_ack_carries_x_proxy_info() {
+    // B7: a CONNECT client gets X-Proxy-Info on the `200 Connection established` head, pre-tunnel.
+    // A SOCKS5 upstream (with auth, so it offers 0x02) serves the Https scheme and completes the
+    // tunnel; the relay then writes the ACK to the client.
+    let (up, _rx) = mock_socks5_server().await;
+    let mut proxy = Proxy::new(up.ip(), up.port(), BTreeSet::from([Proto::Socks5]));
+    proxy.add_type(Proto::Socks5, None);
+    let proxy = proxy.with_auth(Credentials {
+        username: "u".into(),
+        password: "p".into(),
+    });
+    let pool = Pool::from_proxies(vec![proxy], PoolConfig::default());
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        1024,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"CONNECT 1.2.3.4:443 HTTP/1.1\r\nHost: 1.2.3.4:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+        .await
+        .expect("ack should not time out")
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(head.contains("200 Connection established"), "{head:?}");
+    assert!(
+        head.contains(&format!("X-Proxy-Info: {}:{}", up.ip(), up.port())),
+        "{head:?}"
+    );
+}

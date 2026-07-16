@@ -751,11 +751,13 @@ async fn relay(
         Frontend::HttpConnect => {
             // Acknowledging the CONNECT tunnel is the commit point: after this the client believes
             // it is talking to the target, so a later failure must not re-ack through another proxy.
-            if client
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await
-                .is_err()
-            {
+            // B7: carry X-Proxy-Info on the ACK head — the one place a CONNECT client can see it
+            // (the tunnel body is opaque; Python's in-stream rewrite is a no-op on real TLS).
+            let ack = format!(
+                "HTTP/1.1 200 Connection established\r\nX-Proxy-Info: {}:{}\r\n\r\n",
+                proxy.host, proxy.port
+            );
+            if client.write_all(ack.as_bytes()).await.is_err() {
                 // The client write failed → the client is gone, but the upstream tunnel was fine;
                 // abort without blaming the proxy.
                 return RelayOutcome::ClientGone;
@@ -781,25 +783,38 @@ async fn relay(
             if upstream.write_all(&to_send).await.is_err() {
                 return RetryableFailure(ProxyError::Reset);
             }
-            // B11: peek the upstream status BEFORE any client write. A disallowed status is a
-            // pre-commit retryable failure; an allowed one is replayed to the client (the peeked
-            // bytes must not be lost) and becomes the commit point.
+            // Read the upstream response status line BEFORE splicing, to (B11) gate on
+            // --http-allowed-codes and (B7) inject X-Proxy-Info after the status line. Both replay
+            // the (rewritten) line to the client, which becomes the commit point.
             //
-            // Skip the peek for a body-bearing request (POST/PUT/…): the client's body is still
-            // unread in its socket and is only pumped by the copy_bidirectional below, so peeking
-            // first would deadlock a conformant origin that waits for the whole body before
-            // answering. Such requests are non-idempotent anyway (the body is consumed on the first
-            // upstream, so a retry could not replay it) — splice them straight through.
-            if let Some(allowed) = allowed_codes {
-                if !request_has_body(&req.raw) {
-                    match peek_http_status(&mut upstream, allowed, timeout).await {
-                        Ok(head) => {
-                            if client.write_all(&head).await.is_err() {
-                                return RelayOutcome::ClientGone;
+            // Skip this for a body-bearing request (POST/PUT/…): the client's body is still unread
+            // in its socket and is only pumped by the copy_bidirectional below, so reading the
+            // response first would deadlock an origin that waits for the whole body before
+            // answering. Those requests are non-idempotent anyway (the body is consumed on the
+            // first upstream, so a retry could not replay it) — splice straight through, no inject.
+            if !request_has_body(&req.raw) {
+                match read_status_line(&mut upstream, timeout).await {
+                    Ok(line) => {
+                        // B11: a disallowed status is a pre-commit retryable failure — nothing has
+                        // reached the client yet, so the block page never does.
+                        if let Some(allowed) = allowed_codes {
+                            let code = parse_http_status(&line);
+                            if !allowed.contains(&code) {
+                                return RetryableFailure(ProxyError::DisallowedStatus(code));
                             }
                         }
-                        Err(e) => return RetryableFailure(e),
+                        // B7: X-Proxy-Info after the status line; the rest of the response splices.
+                        let head = inject_header(
+                            &line,
+                            format!("X-Proxy-Info: {}:{}\r\n", proxy.host, proxy.port).as_bytes(),
+                        );
+                        if client.write_all(&head).await.is_err() {
+                            return RelayOutcome::ClientGone;
+                        }
                     }
+                    // Could not read the status line (upstream closed / timed out) — pre-commit, so
+                    // the next proxy can be tried.
+                    Err(e) => return RetryableFailure(e),
                 }
             }
         }
@@ -814,13 +829,13 @@ async fn relay(
     }
 }
 
-/// Read an HTTP response's status line from `upstream` (bounded), returning the raw bytes read so
-/// they can be replayed to the client. Errors if the status is not in `allowed`, if the upstream
-/// closes, or on a read timeout — all pre-commit, so the caller can retry another proxy. Reads
-/// byte-by-byte so a status line split across TCP segments still parses (B11).
-async fn peek_http_status(
+/// Read an HTTP response's status line from `upstream` (bounded), returning the raw bytes read
+/// (including the trailing CRLF) so the caller can gate on the status (B11) and/or rewrite + replay
+/// them to the client (B7). Errors if the upstream closes or the read times out — both pre-commit,
+/// so the caller can retry another proxy. Reads byte-by-byte so a status line split across TCP
+/// segments still parses.
+async fn read_status_line(
     upstream: &mut Stream,
-    allowed: &[u16],
     deadline: Duration,
 ) -> Result<Vec<u8>, crate::error::ProxyError> {
     use crate::error::ProxyError;
@@ -844,15 +859,9 @@ async fn peek_http_status(
             }
         }
     };
-    let head = tokio::time::timeout(deadline, read)
+    tokio::time::timeout(deadline, read)
         .await
-        .map_err(|_| ProxyError::Timeout)??;
-    let code = parse_http_status(&head);
-    if allowed.contains(&code) {
-        Ok(head)
-    } else {
-        Err(ProxyError::DisallowedStatus(code))
-    }
+        .map_err(|_| ProxyError::Timeout)?
 }
 
 /// The status code from an HTTP status line (`HTTP/1.1 200 OK` → `200`); `0` on anything
