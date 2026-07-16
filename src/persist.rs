@@ -56,10 +56,14 @@ mod sqlite {
         pub fn open(path: impl AsRef<std::path::Path>) -> Result<SqliteStore, Error> {
             let conn = Connection::open(path).map_err(db)?;
             // The D3 re-checker opens a SECOND connection to this same DB alongside the D2 upsert
-            // observer. Wait out a locked DB instead of erroring SQLITE_BUSY on a contended write —
-            // the scheduler discards upsert errors, so a dropped write would silently lose a
-            // re-check outcome.
+            // observer. WAL lets a writer and readers coexist and, crucially, avoids the
+            // rollback-journal writer deadlock that returns SQLITE_BUSY *immediately* (un-retryable
+            // by busy_timeout); the timeout then makes a contended writer wait its turn rather than
+            // error. Without this a dropped write silently loses a re-check outcome (the scheduler
+            // discards upsert errors).
             conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(db)?;
+            conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(db)?;
             migrate(&conn)?;
             Ok(SqliteStore {
