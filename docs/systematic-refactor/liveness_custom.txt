@@ -1,0 +1,26 @@
+200              https  50kproxies.com
+200              https  aliveproxy.com
+200              https  blogspot.com
+200              https  checkerproxy.net
+200              http   free-proxy.cz
+200              https  gatherproxy.com
+200              https  list.proxylistplus.com
+200              https  maxiproxies.com
+200              https  my-proxy.com
+200              https  nntime.com
+200              https  proxy-list.org
+200              https  proxydb.net
+200              https  proxynova.com
+200              https  spys.ru
+200              http   tools.rosinstrument.com
+200              https  webanetlabs.net
+200              https  www.cybersyndrome.net
+200              https  xseo.in
+ERR:URLError     -      foxtools.ru
+DOMAIN-GONE      -      proxyb.net
+DOMAIN-GONE      -      proxylist.me
+DOMAIN-GONE      -      proxz.com
+HTTP403          https  www.ip-adress.com
+HTTP502          https  www.proxy-list.download
+
+[('OK', 18), ('DOMAIN-GONE', 3), ('ERR:URLError', 1), ('HTTP502', 1), ('HTTP403', 1)]
