@@ -15,12 +15,16 @@ extensions, differentiators), sequenced into **waves**. Ordering optimizes for:
 Effort is honest single-maintainer effort: **S** ≈ an afternoon, **M** ≈ 1–3 days, **L** ≈ a
 week+. Every feature must stay offline-testable (constraint C5) and one-commit-per-item.
 
-Per-wave specs live beside this file: `wave-1.md` … `wave-8.md`.
+Per-wave specs live beside this file: `wave-1-inputs-and-foundation.md` …
+`wave-8-distribution-and-ecosystem.md`.
 
 ---
 
-## Wave 1 — Inputs & foundation
+## Wave 1 — Inputs & foundation ✅ *shipped*
 *The biggest capability gap, plus the refactors everything downstream needs.*
+
+Shipped on `feat/wave-1-inputs`: Step 0 refactor (`3709226`, extract `build_checker` +
+`check_stream` from `find`), A1 (`5396689`), C1 (`0c69d69`), C2 (`07b1473`), E2 (`a5bce0c`).
 
 | # | Feature | Effort | Notes |
 |---|---|---|---|
