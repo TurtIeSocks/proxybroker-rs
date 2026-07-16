@@ -112,6 +112,38 @@ async fn find_streams_working_checked_proxies() {
 }
 
 #[tokio::test]
+async fn stats_grow_monotonically_during_find() {
+    // The F2 progress bar relies on this contract: stats() is pollable between next() calls, and
+    // total (checked so far) never goes backwards.
+    let (judge, _j) = echo_server(JUDGE_PAGE).await;
+    let (p1, _a) = echo_server(HIGH_PAGE).await;
+    let (p2, _b) = echo_server(HIGH_PAGE).await;
+    let (prov, _pr) = provider_listing(&[p1, p2]).await;
+    let (resolver, _ext) = stubbed_resolver().await;
+    let broker = Broker::builder()
+        .providers(vec![ProviderSpec::new(&prov, &[Proto::Http])])
+        .resolver(resolver)
+        .build();
+
+    let mut stream = broker
+        .find(base_query(judge, None))
+        .await
+        .expect("find should start");
+    let mut last_total = 0;
+    while stream.next().await.is_some() {
+        let total = stream.stats().expect("find exposes stats").total;
+        assert!(
+            total >= last_total,
+            "total regressed: {total} < {last_total}"
+        );
+        last_total = total;
+    }
+    let end = stream.stats().unwrap();
+    assert!(end.total >= 2, "both proxies checked: {}", end.total);
+    assert_eq!(end.working, 2);
+}
+
+#[tokio::test]
 async fn find_respects_the_limit() {
     let (judge, _j) = echo_server(JUDGE_PAGE).await;
     let (p1, _a) = echo_server(HIGH_PAGE).await;

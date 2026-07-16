@@ -342,6 +342,11 @@ struct FindArgs {
     /// --load`). Independent of --format/--outfile.
     #[arg(long, value_name = "PATH")]
     save: Option<PathBuf>,
+
+    /// Show a live progress bar (checked / working / avg) on stderr during find (F2; renders only
+    /// when built with the `progress` feature).
+    #[arg(long)]
+    progress: bool,
 }
 
 #[derive(clap::Args)]
@@ -797,7 +802,8 @@ async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::
         args.format,
         args.output_format.as_deref(),
         args.outfile.as_deref(),
-        None,
+        None, // grab has no --save
+        None, // ...and no --progress
     )
     .await
 }
@@ -839,6 +845,9 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
     query.trust_check = args.trust_check;
     query.require_trusted = args.require_trusted;
 
+    // F2: a live bar during find. make_progress is a no-op unless the `progress` feature is on.
+    let progress = make_progress(args.progress);
+
     let mut stream = broker.find(query).await?;
     write_stream(
         &mut stream,
@@ -846,6 +855,7 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         args.output_format.as_deref(),
         args.outfile.as_deref(),
         args.save.as_deref(),
+        progress.as_ref(),
     )
     .await?;
 
@@ -885,6 +895,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
             args.output_format.as_deref(),
             args.outfile.as_deref(),
             args.save.as_deref(),
+            None,
         )
         .await?;
         if let Some(s) = stats {
@@ -939,6 +950,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         args.output_format.as_deref(),
         args.outfile.as_deref(),
         args.save.as_deref(),
+        None,
     )
     .await?;
 
@@ -956,15 +968,76 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
 /// Drain a proxy stream to a file or stdout in the chosen format. Takes `&mut` so the caller
 /// keeps the stream afterwards (e.g. to read `stats()`). When `save` is set, each streamed proxy
 /// is also appended to that file as NDJSON (the C2 warm-start artifact), independent of `format`.
+/// A one-line summary for the `--progress` bar (F2). Pure + testable.
+#[cfg(feature = "progress")]
+fn render_progress(s: &proxybroker::Stats) -> String {
+    format!(
+        "checked {} · working {} · avg {:.2}s",
+        s.total, s.working, s.avg_resp_time
+    )
+}
+
+/// A live progress bar (F2), or a no-op when the `progress` feature is off. Always drawn to stderr
+/// so it never mixes with proxy output on stdout — same discipline as `--show-stats`.
+struct Progress {
+    #[cfg(feature = "progress")]
+    bar: indicatif::ProgressBar,
+}
+
+impl Progress {
+    fn inc(&self) {
+        #[cfg(feature = "progress")]
+        self.bar.inc(1);
+    }
+    fn tick(&self, _stats: &proxybroker::Stats) {
+        #[cfg(feature = "progress")]
+        self.bar.set_message(render_progress(_stats));
+    }
+    fn finish(&self) {
+        #[cfg(feature = "progress")]
+        self.bar.finish_and_clear();
+    }
+}
+
+/// Build a spinner-style progress bar when `on` (F2). Spinner (not a percentage bar) because the
+/// total is unknown for a streaming, possibly-unlimited `find`.
+#[cfg(feature = "progress")]
+fn make_progress(on: bool) -> Option<Progress> {
+    on.then(|| {
+        let bar = indicatif::ProgressBar::new_spinner();
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        Progress { bar }
+    })
+}
+#[cfg(not(feature = "progress"))]
+fn make_progress(_on: bool) -> Option<Progress> {
+    None
+}
+
+/// A stream that can report checked-so-far stats for the progress bar (F2). `ProxyStream` (from
+/// `find`/`check`) does; a `--load` iterator has none.
+trait DrainStats {
+    fn drain_stats(&self) -> Option<proxybroker::Stats> {
+        None
+    }
+}
+impl DrainStats for proxybroker::ProxyStream {
+    fn drain_stats(&self) -> Option<proxybroker::Stats> {
+        self.stats()
+    }
+}
+impl<I: Iterator<Item = Proxy>> DrainStats for futures_util::stream::Iter<I> {}
+
 async fn write_stream<S>(
     stream: &mut S,
     format: Format,
     template: Option<&str>,
     outfile: Option<&std::path::Path>,
     save: Option<&std::path::Path>,
+    progress: Option<&Progress>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    S: futures_util::Stream<Item = Proxy> + Unpin,
+    S: futures_util::Stream<Item = Proxy> + Unpin + DrainStats,
 {
     // The save sink is the exact NDJSON bytes read_ndjson expects. Open once, before draining.
     // ponytail: blocking std::fs write inside the async loop — one small line per proxy at CLI
@@ -990,10 +1063,36 @@ where
             file.write_all(p.as_bytes()).await?;
         }
         let mut count = 0u64;
-        while let Some(proxy) = stream.next().await {
-            file.write_all(emitter.item(&proxy).as_bytes()).await?;
-            save_line(&proxy)?;
-            count += 1;
+        match progress {
+            None => {
+                while let Some(proxy) = stream.next().await {
+                    file.write_all(emitter.item(&proxy).as_bytes()).await?;
+                    save_line(&proxy)?;
+                    count += 1;
+                }
+            }
+            Some(bar) => {
+                // select! drops the (dropped-if-not-selected) next() future before the tick arm
+                // runs, releasing the &mut borrow so stream.drain_stats() (&self) is legal (F2).
+                let mut tick = tokio::time::interval(Duration::from_millis(120));
+                loop {
+                    tokio::select! {
+                        maybe = stream.next() => match maybe {
+                            Some(proxy) => {
+                                file.write_all(emitter.item(&proxy).as_bytes()).await?;
+                                save_line(&proxy)?;
+                                count += 1;
+                                bar.inc();
+                            }
+                            None => break,
+                        },
+                        _ = tick.tick() => {
+                            if let Some(s) = stream.drain_stats() { bar.tick(&s); }
+                        }
+                    }
+                }
+                bar.finish();
+            }
         }
         if let Some(s) = emitter.suffix() {
             file.write_all(s.as_bytes()).await?;
@@ -1006,9 +1105,32 @@ where
         if let Some(p) = emitter.prefix() {
             write!(lock, "{p}")?;
         }
-        while let Some(proxy) = stream.next().await {
-            write!(lock, "{}", emitter.item(&proxy))?;
-            save_line(&proxy)?;
+        match progress {
+            None => {
+                while let Some(proxy) = stream.next().await {
+                    write!(lock, "{}", emitter.item(&proxy))?;
+                    save_line(&proxy)?;
+                }
+            }
+            Some(bar) => {
+                let mut tick = tokio::time::interval(Duration::from_millis(120));
+                loop {
+                    tokio::select! {
+                        maybe = stream.next() => match maybe {
+                            Some(proxy) => {
+                                write!(lock, "{}", emitter.item(&proxy))?;
+                                save_line(&proxy)?;
+                                bar.inc();
+                            }
+                            None => break,
+                        },
+                        _ = tick.tick() => {
+                            if let Some(s) = stream.drain_stats() { bar.tick(&s); }
+                        }
+                    }
+                }
+                bar.finish();
+            }
         }
         if let Some(s) = emitter.suffix() {
             write!(lock, "{s}")?;
@@ -1033,6 +1155,21 @@ fn init_tracing(level: &str, json: bool) {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "progress")]
+    #[test]
+    fn render_progress_formats_counts() {
+        let s = proxybroker::Stats {
+            total: 128,
+            working: 34,
+            avg_resp_time: 0.72,
+            ..Default::default()
+        };
+        let out = render_progress(&s);
+        assert!(out.contains("checked 128"), "{out}");
+        assert!(out.contains("working 34"), "{out}");
+        assert!(out.contains("0.72s"), "{out}");
+    }
 
     #[test]
     fn serve_query_threads_lvl_and_strict() {
