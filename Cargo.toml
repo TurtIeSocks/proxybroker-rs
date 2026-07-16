@@ -43,6 +43,8 @@ store-sqlite = ["persist", "dep:rusqlite"]
 watch = ["server", "dep:notify"]
 # Expose the live pool over MCP stdio (E4, `proxybroker mcp`). rmcp is pinned exactly — it churns.
 mcp = ["server", "cli", "dep:rmcp"]
+# A drop-in hyper-util connector (E1) routing each connection through a rotating pooled proxy.
+connector = ["server", "dep:tower-service", "hyper-util/client-legacy"]
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.
@@ -90,6 +92,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 notify = { version = "8", optional = true }
 # Pinned exactly (=): rmcp's macro + transport surface moves across releases (roadmap C-flag).
 rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"], optional = true }
+tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

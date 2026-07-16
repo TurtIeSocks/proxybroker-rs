@@ -44,6 +44,8 @@ pub mod resolver;
 pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "connector")]
+pub mod connector;
 #[cfg(all(feature = "mcp", feature = "server"))]
 pub mod mcp;
 pub mod stats;
@@ -54,6 +56,8 @@ pub mod watch;
 
 pub use broker::{Broker, FindQuery, FindQueryBuilder, GrabQuery, ProxyStream};
 pub use checker::{Checker, CheckerConfig, RetryPolicy, TrustReport, TrustSignal};
+#[cfg(feature = "connector")]
+pub use connector::{RotateConfig, RotatingProxyConnector};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;
