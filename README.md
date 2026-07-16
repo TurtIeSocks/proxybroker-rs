@@ -1,5 +1,10 @@
 # proxybroker
 
+[![crates.io](https://img.shields.io/crates/v/proxybroker.svg)](https://crates.io/crates/proxybroker)
+[![docs.rs](https://img.shields.io/docsrs/proxybroker)](https://docs.rs/proxybroker)
+[![downloads](https://img.shields.io/crates/d/proxybroker.svg)](https://crates.io/crates/proxybroker)
+[![license](https://img.shields.io/crates/l/proxybroker.svg)](LICENSE)
+
 Find, check, and serve public HTTP(S) and SOCKS4/5 proxies. A Rust library and CLI.
 
 A rewrite of [proxybroker2](https://github.com/bluet/proxybroker2) (Python/asyncio) in
@@ -8,9 +13,15 @@ Rust/tokio, which is itself the maintained successor to
 derivative work and carries the same licence. See [NOTICE](NOTICE) for attribution and a
 statement of changes.
 
-> **Status: core complete, not yet published to crates.io.** All three commands —
-> `grab`, `find`, `serve` — work end-to-end. See `docs/systematic-refactor/` for the port's
-> design record.
+## Install
+
+```sh
+cargo add proxybroker          # library
+cargo install proxybroker      # CLI
+```
+
+All three commands — `grab`, `find`, `serve` — work end-to-end. See
+`docs/systematic-refactor/` for the port's design record.
 
 ## Usage
 
@@ -57,13 +68,6 @@ There was no Rust equivalent with a library API. Checked before starting (2026-0
 
 `proxy-rs` is the real precedent, and it publishes no library target on any version. This
 crate is library-first, with the CLI as a thin shell over it.
-
-## Install
-
-```sh
-cargo add proxybroker                 # library
-cargo install proxybroker             # CLI
-```
 
 ## Features
 
