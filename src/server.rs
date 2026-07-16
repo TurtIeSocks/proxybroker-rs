@@ -510,8 +510,15 @@ pub async fn serve(
             basic: format!("Basic {}", crate::utils::base64_encode(up.as_bytes())),
         })
     });
-    // The `proxycontrol` history map, shared across all connections (B6).
-    let history = Arc::new(History::new());
+    // Per-connection context, cloned cheaply (all Arc/Copy) for each accepted client.
+    let ctx = ConnCtx {
+        pool,
+        resolver,
+        timeout,
+        max_tries,
+        expected_auth: expected,
+        history: Arc::new(History::new()), // the proxycontrol map, shared across connections (B6)
+    };
 
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -520,7 +527,7 @@ pub async fn serve(
         // source cannot hang startup forever.
         tokio::select! {
             _ = accept_cancel.cancelled() => return,
-            _ = pool.wait_ready(min_queue) => {}
+            _ = ctx.pool.wait_ready(min_queue) => {}
         }
         loop {
             let (client, peer) = tokio::select! {
@@ -530,22 +537,9 @@ pub async fn serve(
                     Err(_) => continue,
                 },
             };
-            let pool = pool.clone();
-            let resolver = resolver.clone();
-            let expected = expected.clone();
-            let history = history.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                let _ = handle_client(
-                    client,
-                    peer.ip(),
-                    pool,
-                    resolver,
-                    timeout,
-                    max_tries,
-                    expected,
-                    history,
-                )
-                .await;
+                let _ = handle_client(client, peer.ip(), ctx).await;
             });
         }
     });
@@ -589,13 +583,16 @@ struct ClientRequest {
 async fn handle_client(
     mut client: TcpStream,
     peer_ip: IpAddr,
-    pool: Arc<Pool>,
-    resolver: Arc<Resolver>,
-    timeout: Duration,
-    max_tries: usize,
-    expected_auth: Option<Arc<AuthExpect>>,
-    history: Arc<History>,
+    ctx: ConnCtx,
 ) -> std::io::Result<()> {
+    let ConnCtx {
+        pool,
+        resolver,
+        timeout,
+        max_tries,
+        expected_auth,
+        history,
+    } = ctx;
     let Some(req) = parse_client_request(&mut client, timeout, expected_auth.as_deref()).await
     else {
         return Ok(());
@@ -706,6 +703,18 @@ fn client_key(config: &PoolConfig, peer_ip: IpAddr, req: &ClientRequest) -> Clie
         }
     }
     ClientKey::Ip(peer_ip)
+}
+
+/// Per-connection context handed to `handle_client` — bundles the shared server state (all cheap
+/// to clone: `Arc`s + `Copy`) so the handler keeps a small, stable argument list.
+#[derive(Clone)]
+struct ConnCtx {
+    pool: Arc<Pool>,
+    resolver: Arc<Resolver>,
+    timeout: Duration,
+    max_tries: usize,
+    expected_auth: Option<Arc<AuthExpect>>,
+    history: Arc<History>,
 }
 
 /// The server's expected client credentials (B9/B12), precomputed once at startup: the raw

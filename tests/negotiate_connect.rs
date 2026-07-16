@@ -47,9 +47,15 @@ fn target() -> Target {
 async fn connect_succeeds_on_200() {
     let (addr, _srv) = mock_proxy("HTTP/1.1 200 Connection established").await;
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let s = negotiate(Proto::Connect80, tcp, &target(), Duration::from_secs(2))
-        .await
-        .expect("CONNECT 200 should succeed");
+    let s = negotiate(
+        Proto::Connect80,
+        tcp,
+        &target(),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .expect("CONNECT 200 should succeed");
     assert!(matches!(s, Stream::Plain(_)));
 }
 
@@ -57,9 +63,15 @@ async fn connect_succeeds_on_200() {
 async fn connect_fails_on_403() {
     let (addr, _srv) = mock_proxy("HTTP/1.1 403 Forbidden").await;
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let err = negotiate(Proto::Connect80, tcp, &target(), Duration::from_secs(2))
-        .await
-        .unwrap_err();
+    let err = negotiate(
+        Proto::Connect80,
+        tcp,
+        &target(),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err, proxybroker::ProxyError::BadStatus);
 }
 
@@ -68,7 +80,7 @@ async fn http_negotiation_is_a_noop() {
     // HTTP does not negotiate; it must return the plain stream without touching the wire.
     let (addr, _srv) = mock_proxy("HTTP/1.1 200 OK").await;
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let s = negotiate(Proto::Http, tcp, &target(), Duration::from_secs(2))
+    let s = negotiate(Proto::Http, tcp, &target(), Duration::from_secs(2), None)
         .await
         .unwrap();
     assert!(matches!(s, Stream::Plain(_)));
