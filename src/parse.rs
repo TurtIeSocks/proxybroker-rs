@@ -18,10 +18,9 @@ use std::sync::LazyLock;
 /// the `regex` crate accepts it. The `[01]?\d\d?` alternative is what preserves leading
 /// zeros — matching Python's behaviour rather than "fixing" it here; validity is decided
 /// later by `canonicalize_ip`, exactly as in the original.
-const IPV4: &str =
-    r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)";
+const IPV4: &str = r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)";
 
-static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(IPV4).unwrap());
+pub(crate) static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(IPV4).unwrap());
 
 /// A 2–5 digit run — Python's `\d{2,5}` port group. `\d` is Unicode in both `re` and the
 /// `regex` crate, so the two agree.
@@ -37,7 +36,9 @@ pub fn find_addrs_line(text: &str) -> Vec<(String, String)> {
     // does match `\r`; splitting only on `\n` (not stripping `\r`) reproduces that — a
     // trailing `\r` just becomes part of the between-IP-and-port `.*?`.
     for line in text.split('\n') {
-        let Some(ip) = IPV4_RE.find(line) else { continue };
+        let Some(ip) = IPV4_RE.find(line) else {
+            continue;
+        };
         // First 2–5 digit run strictly after the IP.
         if let Some(port) = PORT_RE.find(&line[ip.end()..]) {
             out.push((ip.as_str().to_owned(), port.as_str().to_owned()));

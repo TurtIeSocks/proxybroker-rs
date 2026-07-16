@@ -143,7 +143,11 @@ impl fmt::Display for AnonLevel {
 impl std::str::FromStr for AnonLevel {
     type Err = ParseProtoError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        for l in [AnonLevel::Transparent, AnonLevel::Anonymous, AnonLevel::High] {
+        for l in [
+            AnonLevel::Transparent,
+            AnonLevel::Anonymous,
+            AnonLevel::High,
+        ] {
             if l.as_str().eq_ignore_ascii_case(s) {
                 return Ok(l);
             }
@@ -194,7 +198,10 @@ pub struct TypeSpec {
 
 impl TypeSpec {
     pub fn any(proto: Proto) -> Self {
-        Self { proto, levels: None }
+        Self {
+            proto,
+            levels: None,
+        }
     }
 
     /// Does a measured outcome satisfy this request?
@@ -233,7 +240,14 @@ mod tests {
         let got: Vec<_> = all.iter().map(|p| p.as_str()).collect();
         assert_eq!(
             got,
-            ["HTTP", "HTTPS", "SOCKS4", "SOCKS5", "CONNECT:80", "CONNECT:25"],
+            [
+                "HTTP",
+                "HTTPS",
+                "SOCKS4",
+                "SOCKS5",
+                "CONNECT:80",
+                "CONNECT:25"
+            ],
             "CONNECT:80 must precede CONNECT:25 ('0' < '5')"
         );
     }
@@ -290,7 +304,7 @@ mod tests {
     /// `Vec<Proto>` cannot be a string, and there is no comma to forget.
     #[test]
     fn missing_comma_bug_is_unrepresentable() {
-        let one = vec![Proto::Socks4];
+        let one = [Proto::Socks4];
         assert_eq!(one.len(), 1);
         assert!(one.contains(&Proto::Socks4));
     }

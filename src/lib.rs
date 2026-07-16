@@ -11,6 +11,7 @@
 pub mod error;
 pub mod parse;
 pub mod types;
+pub mod utils;
 
 pub use error::{Error, ProxyError};
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
