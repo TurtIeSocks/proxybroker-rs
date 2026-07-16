@@ -73,8 +73,36 @@ enum Command {
     Serve(ServeArgs),
 }
 
+/// CLI mirror of [`proxybroker::server::Strategy`] (keeps clap's `ValueEnum` out of the library).
 #[cfg(feature = "server")]
-#[derive(clap::Args)]
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum SelectStrategy {
+    /// Lowest error rate then fastest response.
+    #[default]
+    Best,
+    /// Rotate through eligible proxies in order.
+    RoundRobin,
+    /// Uniform random pick.
+    Random,
+    /// Pin each client to one upstream (by IP, or --sticky-header).
+    Sticky,
+}
+
+#[cfg(feature = "server")]
+impl SelectStrategy {
+    fn to_server(self) -> proxybroker::server::Strategy {
+        use proxybroker::server::Strategy;
+        match self {
+            SelectStrategy::Best => Strategy::Best,
+            SelectStrategy::RoundRobin => Strategy::RoundRobin,
+            SelectStrategy::Random => Strategy::Random,
+            SelectStrategy::Sticky => Strategy::Sticky,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(clap::Args, Default)]
 struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8888")]
@@ -89,12 +117,37 @@ struct ServeArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "types")]
     load: Option<PathBuf>,
 
+    /// Anonymity levels to accept for HTTP (e.g. High Anonymous). Default: any.
+    #[arg(long, num_args = 1.., value_name = "LVL", value_parser = parse_lvl)]
+    lvl: Vec<AnonLevel>,
+
+    /// DNS blocklist zones; reject proxies listed in any (e.g. zen.spamhaus.org).
+    #[arg(long, num_args = 1.., value_name = "ZONE")]
+    dnsbl: Vec<String>,
+
+    /// Use POST instead of GET for the pool-fill test request.
+    #[arg(long)]
+    post: bool,
+
+    /// Require the anonymity level to match exactly.
+    #[arg(long)]
+    strict: bool,
+
+    /// How to pick an upstream per request.
+    #[arg(long, value_enum, default_value_t = SelectStrategy::Best)]
+    strategy: SelectStrategy,
+
+    /// With --strategy sticky, key the session on this request header instead of the client IP
+    /// (HTTP requests only).
+    #[arg(long, value_name = "HEADER")]
+    sticky_header: Option<String>,
+
     /// Keep the pool topped up to this many working proxies.
     #[arg(long, default_value_t = 100)]
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Per-request timeout in seconds.
@@ -109,6 +162,27 @@ struct ServeArgs {
     #[arg(long, default_value_t = 8.0)]
     max_resp_time: f64,
 
+    /// Seconds a proxy is benched after a failure before it is re-probed.
+    #[arg(long, default_value_t = 30)]
+    fail_timeout: u64,
+
+    /// Prefer proxies that support CONNECT:80 when otherwise equally ranked.
+    #[arg(long)]
+    prefer_connect: bool,
+
+    /// Retry through another proxy when the upstream HTTP status is outside this set (e.g. 200 204
+    /// 301 302), to dodge block pages. Empty = accept any status. HTTP requests only.
+    #[arg(long, num_args = 1.., value_name = "CODE")]
+    http_allowed_codes: Vec<u16>,
+
+    /// Wait until the pool holds at least this many proxies before accepting clients.
+    #[arg(long, default_value_t = 0)]
+    min_queue: usize,
+
+    /// TCP listen backlog (queued pending connections).
+    #[arg(long, default_value_t = 1024)]
+    backlog: u32,
+
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
@@ -121,7 +195,7 @@ struct GrabArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes (e.g. US GB DE).
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Output format.
@@ -148,7 +222,7 @@ struct FindArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Judge URLs to use instead of the bundled defaults.
@@ -221,7 +295,7 @@ struct CheckArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Judge URLs to use instead of the bundled defaults.
@@ -359,6 +433,16 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         max_tries: args.max_tries,
         max_error_rate: args.max_error_rate,
         max_resp_time: args.max_resp_time,
+        // Uppercased allow-list so the pool screens admissions (esp. the --load path, which never
+        // ran find's country filter). None when no countries requested.
+        countries: (!args.countries.is_empty())
+            .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
+        strategy: args.strategy.to_server(),
+        sticky_header: args.sticky_header.clone(),
+        fail_timeout: Duration::from_secs(args.fail_timeout),
+        prefer_connect: args.prefer_connect,
+        http_allowed_codes: (!args.http_allowed_codes.is_empty())
+            .then(|| args.http_allowed_codes.clone()),
         ..Default::default()
     };
 
@@ -369,22 +453,21 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         eprintln!("loaded {} proxies from {}", loaded.len(), path.display());
         Pool::from_proxies(loaded, pool_config)
     } else {
-        let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
-        // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
-        // would grab forever), matching api.py's `if limit <= 0: raise ValueError` — so
-        // `.limit(max(1))` here can never resolve to the builder's unlimited (None).
-        let mut fq = FindQuery::builder()
-            .types(types)
-            .limit(args.limit.max(1))
-            .timeout(Duration::from_secs(args.timeout));
-        if !args.countries.is_empty() {
-            fq = fq.countries(args.countries);
-        }
-        let stream = broker.find(fq.build()).await?;
+        // Find proxies to fill the pool, filtered by the serve flags (types/lvl/strict/post/
+        // dnsbl/countries). The flag→query mapping lives in the pure `serve_query`.
+        let stream = broker.find(serve_query(&args)).await?;
         Pool::spawn(stream, pool_config)
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
-    let handle = serve(addr, pool, resolver, Duration::from_secs(args.timeout)).await?;
+    let handle = serve(
+        addr,
+        pool,
+        resolver,
+        Duration::from_secs(args.timeout),
+        args.min_queue,
+        args.backlog,
+    )
+    .await?;
     eprintln!(
         "proxybroker serving on {} — Ctrl-C to stop",
         handle.local_addr()
@@ -394,6 +477,25 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     handle.shutdown();
     eprintln!("shutting down");
     Ok(())
+}
+
+/// Build the pool-fill `FindQuery` from the serve flags. Pure (no I/O, no broker) so the
+/// flag→query mapping is unit-testable offline — the filtering itself runs upstream in `find`.
+/// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
+/// matching api.py's `if limit <= 0: raise ValueError`.
+#[cfg(feature = "server")]
+fn serve_query(args: &ServeArgs) -> FindQuery {
+    let mut b = FindQuery::builder()
+        .types(types_from(args.types.clone(), args.lvl.clone()))
+        .limit(args.limit.max(1))
+        .dnsbl(args.dnsbl.clone())
+        .timeout(Duration::from_secs(args.timeout))
+        .post(args.post)
+        .strict(args.strict);
+    if !args.countries.is_empty() {
+        b = b.countries(args.countries.clone());
+    }
+    b.build()
 }
 
 async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -579,4 +681,59 @@ fn init_tracing(level: &str) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_query_threads_lvl_and_strict() {
+        // The four passthrough flags must reach the FindQuery that fills the pool; before B3 they
+        // were dropped, so anonymity-filtered serving was impossible.
+        let args = ServeArgs {
+            types: vec![Proto::Http],
+            lvl: vec![AnonLevel::High],
+            strict: true,
+            post: true,
+            dnsbl: vec!["zen.spamhaus.org".into()],
+            ..Default::default()
+        };
+        let q = serve_query(&args);
+        assert_eq!(q.types[0].levels, Some(vec![AnonLevel::High]));
+        assert!(q.strict);
+        assert!(q.post);
+        assert_eq!(q.dnsbl, vec!["zen.spamhaus.org".to_string()]);
+    }
+
+    fn serve_countries(argv: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Serve(a) => a.countries,
+            _ => panic!("expected serve"),
+        }
+    }
+
+    #[test]
+    fn only_cc_alias_splits_on_comma() {
+        // --only-cc US,DE (comma) and --countries US DE (space) must be equivalent spellings.
+        let comma = serve_countries(&[
+            "proxybroker",
+            "serve",
+            "--types",
+            "HTTP",
+            "--only-cc",
+            "US,DE",
+        ]);
+        let space = serve_countries(&[
+            "proxybroker",
+            "serve",
+            "--types",
+            "HTTP",
+            "--countries",
+            "US",
+            "DE",
+        ]);
+        assert_eq!(comma, vec!["US".to_string(), "DE".to_string()]);
+        assert_eq!(comma, space);
+    }
 }

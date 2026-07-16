@@ -55,6 +55,6 @@ pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{read_ndjson, write_ndjson, Country, Proxy};
 pub use resolver::Resolver;
 #[cfg(feature = "server")]
-pub use server::{serve, Pool, PoolConfig, ServerHandle};
+pub use server::{serve, ClientKey, Pool, PoolConfig, ServerHandle, Strategy};
 pub use stats::Stats;
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};

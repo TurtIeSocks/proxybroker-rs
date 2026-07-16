@@ -2,10 +2,11 @@
 //!
 //! - [`ProxyError`] — a single proxy failed. This is a **histogram bucket key**: in Python
 //!   it is the `errmsg` class attribute read reflectively at `proxy.py:333`
-//!   (`stat["errors"][err.errmsg] += 1`). It is `Copy + Eq + Hash` and carries no payload,
-//!   because a `Counter` key that allocates is a `Counter` key you cannot use cheaply. The
-//!   `as_str` strings are preserved **byte-for-byte** from `errors.py` — the stats output
-//!   is a user-visible contract.
+//!   (`stat["errors"][err.errmsg] += 1`). It is `Copy + Eq + Hash` and non-allocating (the one
+//!   data-carrying variant, `DisallowedStatus(u16)`, is a plain `Copy` integer), because a
+//!   `Counter` key that allocates is a `Counter` key you cannot use cheaply. The `as_str` strings
+//!   are preserved **byte-for-byte** from `errors.py` — the stats output is a user-visible
+//!   contract (`DisallowedStatus` is a local-server addition with no Python analogue).
 //! - [`Error`] — something the caller must handle: no network, no judges, bad config.
 //!
 //! See `docs/systematic-refactor/decisions.md` §Errors.
@@ -40,6 +41,9 @@ pub enum ProxyError {
     BadResponse,
     /// Error while relaying in the local server. `errors.py:48 ErrorOnStream`.
     ErrorOnStream,
+    /// The upstream returned an HTTP status outside the served pool's `--http-allowed-codes`
+    /// set (B11). A local-server-only, retryable failure — no Python analogue.
+    DisallowedStatus(u16),
     /// Host did not resolve. `errors.py:12 ResolveError` (which has no `errmsg` in Python —
     /// the string is new). Deliberately never counted: at `api.py:443` the resolve fails
     /// before a `Proxy` exists, so there is no `stat` dict to increment. Exists as a return
@@ -59,6 +63,7 @@ impl ProxyError {
             ProxyError::BadStatus => "bad_status",
             ProxyError::BadResponse => "bad_response",
             ProxyError::ErrorOnStream => "error_on_stream",
+            ProxyError::DisallowedStatus(_) => "disallowed_status",
             ProxyError::Resolve => "resolve_failed",
         }
     }

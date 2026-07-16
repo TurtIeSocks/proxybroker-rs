@@ -538,8 +538,9 @@ async fn check_stream<S>(
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
-/// `_geo_passed`: keep the proxy if its country code is in the requested set.
-fn country_ok(proxy: &Proxy, countries: Option<&BTreeSet<String>>) -> bool {
+/// `_geo_passed`: keep the proxy if its country code is in the requested set. `pub(crate)` so the
+/// server's pool admission (B4) applies the identical predicate to a warm/BYO pool.
+pub(crate) fn country_ok(proxy: &Proxy, countries: Option<&BTreeSet<String>>) -> bool {
     match countries {
         None => true,
         Some(set) => proxy
