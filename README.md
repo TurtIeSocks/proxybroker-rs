@@ -8,7 +8,35 @@ Rust/tokio, which is itself the maintained successor to
 derivative work and carries the same licence. See [NOTICE](NOTICE) for attribution and a
 statement of changes.
 
-> **Status: in development.** Not yet published to crates.io.
+> **Status: core complete, not yet published to crates.io.** All three commands —
+> `grab`, `find`, `serve` — work end-to-end. See `docs/systematic-refactor/` for the port's
+> design record.
+
+## Usage
+
+```sh
+proxybroker grab --limit 10                      # scrape providers, no checking
+proxybroker find --types HTTP HTTPS --limit 10   # scrape + check + classify anonymity
+proxybroker find --types SOCKS5 --format json    # machine-readable output
+proxybroker serve --types HTTP --host 127.0.0.1:8888   # local rotating proxy server
+```
+
+As a library:
+
+```rust
+use proxybroker::{Broker, FindQuery, Proto, TypeSpec};
+use futures_util::StreamExt;
+
+let broker = Broker::builder().build();
+let mut stream = broker.find(FindQuery {
+    types: vec![TypeSpec::any(Proto::Http)],
+    limit: Some(10),
+    ..Default::default()
+}).await?;
+while let Some(proxy) = stream.next().await {
+    println!("{}", proxy.addr());
+}
+```
 
 ## Why this exists
 

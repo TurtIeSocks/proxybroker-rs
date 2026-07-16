@@ -5,8 +5,26 @@
 //! A Rust rewrite of [proxybroker2](https://github.com/bluet/proxybroker2). See `NOTICE`
 //! for attribution and a statement of changes.
 //!
-//! **Status: in development.** The module tree is being built out against
-//! `docs/systematic-refactor/map.md`.
+//! The three core capabilities are complete: [`Broker::grab`](broker::Broker::grab) scrapes
+//! providers, [`Broker::find`](broker::Broker::find) checks them and classifies anonymity,
+//! and [`server::serve`] runs a local rotating proxy server (behind the `server` feature).
+//!
+//! ```no_run
+//! # async fn f() -> Result<(), Box<dyn std::error::Error>> {
+//! use proxybroker::{Broker, FindQuery, Proto, TypeSpec};
+//! use futures_util::StreamExt;
+//!
+//! let broker = Broker::builder().build();
+//! let mut stream = broker.find(FindQuery {
+//!     types: vec![TypeSpec::any(Proto::Http)],
+//!     limit: Some(10),
+//!     ..Default::default()
+//! }).await?;
+//! while let Some(proxy) = stream.next().await {
+//!     println!("{}", proxy.addr());
+//! }
+//! # Ok(()) }
+//! ```
 
 pub mod broker;
 pub mod checker;
