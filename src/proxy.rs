@@ -211,9 +211,17 @@ impl Proxy {
         &self.trust
     }
 
-    /// Record the trust verdict from a working attempt (A6).
-    pub fn set_trust(&mut self, r: TrustReport) {
-        self.trust = r;
+    /// Fold a working attempt's trust verdict into the stored one (A6): signals **union** across
+    /// protocols (deduped), mirroring [`Proxy::record_caps`]. A plain overwrite would let a clean
+    /// later protocol — e.g. a CONNECT:25 tunnel, which is never assessed and always "trusted", and
+    /// is checked last — erase an earlier `InjectedHeader`, silently admitting a multi-protocol
+    /// honeypot past `--require-trusted`.
+    pub fn record_trust(&mut self, r: TrustReport) {
+        for s in r.signals {
+            if !self.trust.signals.contains(&s) {
+                self.trust.signals.push(s);
+            }
+        }
     }
 
     /// Error rate in `0.0..=1.0`, rounded to 2 dp. `0.0` before any request. `proxy.py:error_rate`.
@@ -525,6 +533,24 @@ mod tests {
         assert!(!x.capabilities().connect25);
         x.add_type(Proto::Connect25, None);
         assert!(x.capabilities().connect25);
+    }
+
+    #[test]
+    fn record_trust_unions_across_protocols() {
+        use crate::checker::TrustSignal;
+        let mut x = p();
+        x.record_trust(TrustReport {
+            signals: vec![TrustSignal::InjectedHeader],
+        });
+        // A later clean protocol (e.g. CONNECT:25, always trusted, checked last) must NOT erase it.
+        x.record_trust(TrustReport::default());
+        assert!(!x.trust().trusted());
+        assert_eq!(x.trust().signals, vec![TrustSignal::InjectedHeader]);
+        // Deduped: re-recording the same signal does not accumulate.
+        x.record_trust(TrustReport {
+            signals: vec![TrustSignal::InjectedHeader],
+        });
+        assert_eq!(x.trust().signals.len(), 1);
     }
 
     #[test]

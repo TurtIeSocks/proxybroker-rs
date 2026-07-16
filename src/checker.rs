@@ -335,7 +335,7 @@ impl Checker {
                     proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
                     proxy.add_type(proto, obs.level);
                     proxy.record_caps(obs.caps);
-                    proxy.set_trust(obs.trust);
+                    proxy.record_trust(obs.trust);
                     return true;
                 }
                 Ok(Attempt::Invalid) => {
