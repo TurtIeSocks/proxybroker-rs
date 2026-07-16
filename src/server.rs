@@ -38,6 +38,11 @@ pub struct PoolConfig {
     pub max_resp_time: f64,
     /// Grace: a proxy is not evicted until it has handled this many requests.
     pub min_req: u32,
+    /// Admission allow-list of **uppercased** ISO country codes. `None` = admit any country.
+    /// Applied when a proxy enters the pool (import or `from_proxies`), so a warm/BYO pool that
+    /// never went through `find`'s country filter is screened too. A proxy with no geo is rejected
+    /// when a filter is set (it cannot match a country).
+    pub countries: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Default for PoolConfig {
@@ -47,6 +52,7 @@ impl Default for PoolConfig {
             max_error_rate: 0.5,
             max_resp_time: 8.0,
             min_req: 5,
+            countries: None,
         }
     }
 }
@@ -63,6 +69,10 @@ impl Pool {
     /// A pool over an already-known set of proxies (bring-your-own, or for tests). No importer;
     /// the pool is considered exhausted immediately, so `get` returns `None` once it drains.
     pub fn from_proxies(proxies: Vec<Proxy>, config: PoolConfig) -> Arc<Pool> {
+        let proxies = proxies
+            .into_iter()
+            .filter(|p| crate::broker::country_ok(p, config.countries.as_ref()))
+            .collect();
         Pool {
             state: Mutex::new(proxies),
             notify: Notify::new(),
@@ -86,6 +96,11 @@ impl Pool {
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(proxy) = stream.next().await {
+                    // Screen imports too, so --load / a live find that skipped country filtering
+                    // still honors the pool's allow-list.
+                    if !crate::broker::country_ok(&proxy, pool.config.countries.as_ref()) {
+                        continue;
+                    }
                     pool.state.lock().unwrap().push(proxy);
                     pool.notify.notify_waiters();
                 }

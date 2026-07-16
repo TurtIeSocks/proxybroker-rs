@@ -7,7 +7,7 @@
 use proxybroker::proxy::Proxy;
 use proxybroker::resolver::Resolver;
 use proxybroker::server::{serve, Pool, PoolConfig};
-use proxybroker::types::Proto;
+use proxybroker::types::{Proto, Scheme};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +71,65 @@ async fn server_relays_http_request_through_a_pool_proxy() {
         .unwrap();
     let text = String::from_utf8_lossy(&resp);
     assert!(text.contains("RELAYED-BODY"), "got: {text}");
+}
+
+/// A pooled proxy located in `cc`, HTTP-capable so it is scheme-eligible. No listener needed —
+/// these tests exercise pool admission, not relaying.
+fn proxy_in(ip: &str, cc: &str) -> Proxy {
+    let mut p = Proxy::new(ip.parse().unwrap(), 8080, BTreeSet::from([Proto::Http]));
+    p.add_type(Proto::Http, None);
+    p.geo = Some(proxybroker::Country {
+        code: cc.into(),
+        name: String::new(),
+    });
+    p
+}
+
+#[tokio::test]
+async fn pool_admits_only_allowed_countries() {
+    // The admission filter screens a warm/BYO pool (from_proxies) that never went through find's
+    // country filter — the whole point of B4's pool-level predicate.
+    let pool = Pool::from_proxies(
+        vec![proxy_in("1.1.1.1", "US"), proxy_in("2.2.2.2", "FR")],
+        PoolConfig {
+            countries: Some(BTreeSet::from(["US".to_string()])),
+            ..PoolConfig::default()
+        },
+    );
+    let first = pool.get(Scheme::Http).await;
+    assert_eq!(
+        first.and_then(|p| p.geo.map(|g| g.code)),
+        Some("US".to_string())
+    );
+    assert!(
+        pool.get(Scheme::Http).await.is_none(),
+        "the FR proxy must be rejected on admission"
+    );
+}
+
+#[tokio::test]
+async fn pool_no_filter_admits_all() {
+    // countries: None is the no-op path — both proxies are admitted.
+    let pool = Pool::from_proxies(
+        vec![proxy_in("1.1.1.1", "US"), proxy_in("2.2.2.2", "FR")],
+        PoolConfig::default(),
+    );
+    assert!(pool.get(Scheme::Http).await.is_some());
+    assert!(pool.get(Scheme::Http).await.is_some());
+    assert!(pool.get(Scheme::Http).await.is_none());
+}
+
+#[tokio::test]
+async fn pool_country_match_is_case_insensitive() {
+    // Proxy geo code lowercase, filter uppercase — country_ok uppercases both sides.
+    let pool = Pool::from_proxies(
+        vec![proxy_in("1.1.1.1", "us")],
+        PoolConfig {
+            countries: Some(BTreeSet::from(["US".to_string()])),
+            ..PoolConfig::default()
+        },
+    );
+    assert!(pool.get(Scheme::Http).await.is_some());
 }
 
 #[tokio::test]

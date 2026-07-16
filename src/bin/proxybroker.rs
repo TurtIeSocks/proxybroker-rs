@@ -110,7 +110,7 @@ struct ServeArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Per-request timeout in seconds.
@@ -137,7 +137,7 @@ struct GrabArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes (e.g. US GB DE).
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Output format.
@@ -164,7 +164,7 @@ struct FindArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Judge URLs to use instead of the bundled defaults.
@@ -237,7 +237,7 @@ struct CheckArgs {
     limit: usize,
 
     /// Keep only proxies located in these ISO country codes.
-    #[arg(long, num_args = 1.., value_name = "CC")]
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
     countries: Vec<String>,
 
     /// Judge URLs to use instead of the bundled defaults.
@@ -375,6 +375,10 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         max_tries: args.max_tries,
         max_error_rate: args.max_error_rate,
         max_resp_time: args.max_resp_time,
+        // Uppercased allow-list so the pool screens admissions (esp. the --load path, which never
+        // ran find's country filter). None when no countries requested.
+        countries: (!args.countries.is_empty())
+            .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
         ..Default::default()
     };
 
@@ -628,5 +632,36 @@ mod tests {
         assert!(q.strict);
         assert!(q.post);
         assert_eq!(q.dnsbl, vec!["zen.spamhaus.org".to_string()]);
+    }
+
+    fn serve_countries(argv: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Serve(a) => a.countries,
+            _ => panic!("expected serve"),
+        }
+    }
+
+    #[test]
+    fn only_cc_alias_splits_on_comma() {
+        // --only-cc US,DE (comma) and --countries US DE (space) must be equivalent spellings.
+        let comma = serve_countries(&[
+            "proxybroker",
+            "serve",
+            "--types",
+            "HTTP",
+            "--only-cc",
+            "US,DE",
+        ]);
+        let space = serve_countries(&[
+            "proxybroker",
+            "serve",
+            "--types",
+            "HTTP",
+            "--countries",
+            "US",
+            "DE",
+        ]);
+        assert_eq!(comma, vec!["US".to_string(), "DE".to_string()]);
+        assert_eq!(comma, space);
     }
 }
