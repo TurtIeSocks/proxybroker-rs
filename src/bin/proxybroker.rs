@@ -296,7 +296,9 @@ struct FindArgs {
     #[arg(long)]
     require_connect25: bool,
 
-    /// Run honeypot detection on each proxy and record the verdict (canary + injected-header scan).
+    /// Run honeypot detection on each proxy and record the verdict. The injected-header scan needs
+    /// a judge that echoes raw request headers (Name: value); the bundled judges do not, so pair it
+    /// with a raw-header-echo judge via --judges for real detection.
     #[arg(long)]
     trust_check: bool,
 

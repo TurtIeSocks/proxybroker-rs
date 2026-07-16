@@ -593,6 +593,17 @@ impl TrustReport {
     ///
     /// The scan splits on `": "` (colon-space), so a URL value like `https://…` on its own line is
     /// not mistaken for a header. It is a heuristic: opt-in, with documented false-positive guards.
+    ///
+    /// **Scope / limitations** (opt-in heuristic, honest about what it does *not* catch):
+    /// - The injected-header scan only works against judges that echo the **raw request headers**
+    ///   as `Name: value` lines. The bundled defaults do not: httpbin emits JSON (`"Name": "…"`,
+    ///   whose quoted key fails the name check) and azenv-style judges emit `HTTP_NAME = value`
+    ///   (no `": "`). So with the default judge pool this scan is inert (safe — no false positives,
+    ///   but no detection). For real injection detection, pass a raw-header-echo judge via
+    ///   `--judges`.
+    /// - On the standard check path `canary` is the validity marker, which validation already
+    ///   requires to be present — so `CanaryMismatch` cannot fire there. The signal exists for the
+    ///   pure-function contract (callers assessing content that did not pass validity).
     pub fn assess(sent_header_names: &[&str], canary: &str, content: &str) -> TrustReport {
         let mut signals = Vec::new();
         if !content.contains(canary) {
