@@ -166,6 +166,10 @@ struct ServeArgs {
     #[arg(long, default_value_t = 30)]
     fail_timeout: u64,
 
+    /// Prefer proxies that support CONNECT:80 when otherwise equally ranked.
+    #[arg(long)]
+    prefer_connect: bool,
+
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
@@ -423,6 +427,7 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         strategy: args.strategy.to_server(),
         sticky_header: args.sticky_header.clone(),
         fail_timeout: Duration::from_secs(args.fail_timeout),
+        prefer_connect: args.prefer_connect,
         ..Default::default()
     };
 

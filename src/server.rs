@@ -79,6 +79,9 @@ pub struct PoolConfig {
     /// How long a proxy is benched (skipped unless it is the only option) after a failure, before
     /// it is re-probed. Default 30s (`server.py` parity).
     pub fail_timeout: Duration,
+    /// B10: prefer `CONNECT:80`-capable proxies. A tie-break for `Best`/`Sticky` (health still
+    /// dominates), a primary filter for `RoundRobin`/`Random`. Default `false`.
+    pub prefer_connect: bool,
 }
 
 impl Default for PoolConfig {
@@ -93,6 +96,7 @@ impl Default for PoolConfig {
             sticky_header: None,
             max_sessions: 10_000,
             fail_timeout: Duration::from_secs(30),
+            prefer_connect: false,
         }
     }
 }
@@ -216,6 +220,7 @@ impl Pool {
             sticky,
             round_robin_cursor: self.round_robin.load(Ordering::SeqCst),
             now: tokio::time::Instant::now(),
+            prefer_connect: self.config.prefer_connect,
         };
         let chosen = {
             let mut pool = self.state.lock().unwrap();
@@ -288,6 +293,9 @@ struct SelectCtx {
     /// Reference time for the bench check (B5): a proxy is ready iff `blocked_until` is `None`
     /// or `<= now`.
     now: tokio::time::Instant,
+    /// B10: bias selection toward `CONNECT:80`-capable proxies — a tie-break for `Best`/`Sticky`
+    /// (health dominates), a primary filter for `RoundRobin`/`Random`.
+    prefer_connect: bool,
 }
 
 /// Index of the proxy to serve, per `ctx.strategy`, among the scheme-eligible proxies. Two tiers
@@ -313,9 +321,17 @@ fn best_for(pool: &[Pooled], ctx: &SelectCtx) -> Option<usize> {
         return None;
     }
     match ctx.strategy {
-        Strategy::Best => best_by_priority(pool, &tier),
-        Strategy::RoundRobin => Some(tier[ctx.round_robin_cursor % tier.len()]),
-        Strategy::Random => Some(tier[next_rand(tier.len())]),
+        Strategy::Best => best_by_priority(pool, &tier, ctx.prefer_connect),
+        // Rotation/random treat prefer-connect as a primary filter: rotate only among CONNECT-
+        // capable proxies if any exist, else fall back to the whole tier.
+        Strategy::RoundRobin => {
+            let pick = connect_biased(pool, &tier, ctx.prefer_connect);
+            Some(pick[ctx.round_robin_cursor % pick.len()])
+        }
+        Strategy::Random => {
+            let pick = connect_biased(pool, &tier, ctx.prefer_connect);
+            Some(pick[next_rand(pick.len())])
+        }
         Strategy::Sticky => {
             // Reuse the pinned proxy if it is still in this tier; otherwise fall back to Best (a
             // fresh client, or the pin was evicted — self-healing, the caller re-pins).
@@ -327,18 +343,47 @@ fn best_for(pool: &[Pooled], ctx: &SelectCtx) -> Option<usize> {
                     return Some(i);
                 }
             }
-            best_by_priority(pool, &tier)
+            best_by_priority(pool, &tier, ctx.prefer_connect)
         }
     }
 }
 
+/// Does the proxy at `i` expose `CONNECT:80`?
+fn has_connect(pool: &[Pooled], i: usize) -> bool {
+    pool[i].proxy.types().contains_key(&Proto::Connect80)
+}
+
+/// Narrow `tier` to only `CONNECT:80`-capable proxies when `prefer` is set and any exist; else
+/// return `tier` unchanged (the bias is a preference, not a hard requirement). Used by the
+/// rotate/random strategies, where prefer-connect is a primary filter (B10).
+fn connect_biased(pool: &[Pooled], tier: &[usize], prefer: bool) -> Vec<usize> {
+    if !prefer {
+        return tier.to_vec();
+    }
+    let connect: Vec<usize> = tier
+        .iter()
+        .copied()
+        .filter(|&i| has_connect(pool, i))
+        .collect();
+    if connect.is_empty() {
+        tier.to_vec()
+    } else {
+        connect
+    }
+}
+
 /// Lowest `(error_rate, avg_resp_time)` among `eligible`, `total_cmp`-ordered so tied `f64`s
-/// never panic (the `server.py` heapq bug). This is `Strategy::Best`.
-fn best_by_priority(pool: &[Pooled], eligible: &[usize]) -> Option<usize> {
+/// never panic (the `server.py` heapq bug). This is `Strategy::Best`. When `prefer_connect` is
+/// set, `CONNECT:80` support breaks ties **after** health (health dominates, per B10) — so a
+/// faster non-CONNECT proxy still wins.
+fn best_by_priority(pool: &[Pooled], eligible: &[usize], prefer_connect: bool) -> Option<usize> {
     eligible.iter().copied().min_by(|&a, &b| {
         let (ae, at) = pool[a].proxy.priority();
         let (be, bt) = pool[b].proxy.priority();
-        ae.total_cmp(&be).then(at.total_cmp(&bt))
+        // 0 sorts before 1: a CONNECT-capable proxy wins only when health is otherwise tied.
+        let ac = u8::from(prefer_connect && !has_connect(pool, a));
+        let bc = u8::from(prefer_connect && !has_connect(pool, b));
+        ae.total_cmp(&be).then(at.total_cmp(&bt)).then(ac.cmp(&bc))
     })
 }
 
@@ -687,6 +732,7 @@ mod tests {
             sticky: None,
             round_robin_cursor: 0,
             now: tokio::time::Instant::now(),
+            prefer_connect: false,
         }
     }
 
@@ -794,6 +840,42 @@ mod tests {
         // No pin → Best.
         c.sticky = None;
         assert_eq!(best_for(&pool, &c), Some(0));
+    }
+
+    #[test]
+    fn prefer_connect_biases_toward_connect80() {
+        // Two HTTP proxies with identical priority; prefer_connect breaks the tie toward the one
+        // that also supports CONNECT:80.
+        let a = proxy_at(0.1, Proto::Http, "1.1.1.1");
+        let mut b = proxy_at(0.1, Proto::Http, "2.2.2.2");
+        b.proxy.add_type(Proto::Connect80, None);
+        let pool = vec![a, b];
+        let mut c = ctx(Scheme::Http);
+        c.prefer_connect = true;
+        assert_eq!(best_for(&pool, &c), Some(1), "CONNECT-capable wins the tie");
+        c.prefer_connect = false;
+        assert_eq!(
+            best_for(&pool, &c),
+            Some(0),
+            "no bias → tie resolves to first"
+        );
+    }
+
+    #[test]
+    fn prefer_connect_does_not_override_health() {
+        // A faster non-CONNECT proxy beats a slower CONNECT one — prefer_connect is only a
+        // tie-break for Best; health dominates (the resolved open question).
+        let fast = proxy_at(0.1, Proto::Http, "1.1.1.1");
+        let mut slow = proxy_at(0.9, Proto::Http, "2.2.2.2");
+        slow.proxy.add_type(Proto::Connect80, None);
+        let pool = vec![fast, slow];
+        let mut c = ctx(Scheme::Http);
+        c.prefer_connect = true;
+        assert_eq!(
+            best_for(&pool, &c),
+            Some(0),
+            "health dominates the CONNECT bias"
+        );
     }
 
     #[test]
