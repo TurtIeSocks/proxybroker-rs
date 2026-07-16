@@ -81,3 +81,23 @@ lto = "thin"
 [[example]]
 name = "serve"
 required-features = ["server"]
+
+[[example]]
+name = "serve_authenticated"
+required-features = ["server"]
+
+[[example]]
+name = "serve_tuned"
+required-features = ["server"]
+
+[[example]]
+name = "byo_pool"
+required-features = ["server"]
+
+[[example]]
+name = "proxycontrol"
+required-features = ["server"]
+
+[[example]]
+name = "socks5_frontend"
+required-features = ["server"]
