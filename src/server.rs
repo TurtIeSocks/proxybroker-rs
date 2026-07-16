@@ -458,15 +458,21 @@ async fn handle_client(
         let proto = choose_proto(&proxy, req.scheme);
 
         match relay(&mut client, &proxy, proto, &target, &req, timeout).await {
-            Ok(()) => {
+            RelayOutcome::Ok => {
                 proxy.record_attempt(Some(0.0), None);
                 pool.put_ok(proxy);
                 return Ok(());
             }
-            Err(e) => {
+            RelayOutcome::RetryableFailure(e) => {
                 proxy.record_attempt(None, Some(e));
-                pool.put_failed(proxy); // bench it for fail_timeout before it is tried again
-                                        // try the next proxy
+                pool.put_failed(proxy); // bench it, then try the next proxy
+            }
+            RelayOutcome::ClientCommitted(e) => {
+                // The client already saw an ack or bytes — a retry would corrupt it. Record the
+                // failure, bench the proxy, and stop.
+                proxy.record_attempt(None, Some(e));
+                pool.put_failed(proxy);
+                return Ok(());
             }
         }
     }
@@ -511,7 +517,20 @@ fn choose_proto(proxy: &Proxy, scheme: Scheme) -> Proto {
     }
 }
 
-/// Relay one client request through `proxy` using `proto`.
+/// Where a relay attempt ended — the discriminant B2's retry loop needs. Classification is
+/// **positional** (decided by how far the relay got), so it is exhaustive by construction: a new
+/// [`ProxyError`] variant cannot accidentally become retryable-past-a-commit.
+enum RelayOutcome {
+    /// The request completed successfully.
+    Ok,
+    /// Failed before any byte reached the client — safe to try the next proxy.
+    RetryableFailure(crate::error::ProxyError),
+    /// The client already received an ack or spliced bytes — retrying would corrupt it, so abort.
+    ClientCommitted(crate::error::ProxyError),
+}
+
+/// Relay one client request through `proxy` using `proto`, reporting where it ended so the caller
+/// only retries a failure the client has not yet seen (B2's commit boundary).
 async fn relay(
     client: &mut TcpStream,
     proxy: &Proxy,
@@ -519,37 +538,51 @@ async fn relay(
     target: &Target,
     req: &ClientRequest,
     timeout: Duration,
-) -> Result<(), crate::error::ProxyError> {
+) -> RelayOutcome {
     use crate::error::ProxyError;
+    use RelayOutcome::{ClientCommitted, RetryableFailure};
 
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect((proxy.host, proxy.port)))
-        .await
-        .map_err(|_| ProxyError::Timeout)?
-        .map_err(|_| ProxyError::ConnFailed)?;
-    let mut upstream = negotiate(proto, tcp, target, timeout).await?;
+    // Connect + negotiate: nothing has reached the client, so every failure here is retryable.
+    let tcp =
+        match tokio::time::timeout(timeout, TcpStream::connect((proxy.host, proxy.port))).await {
+            Err(_) => return RetryableFailure(ProxyError::Timeout),
+            Ok(Err(_)) => return RetryableFailure(ProxyError::ConnFailed),
+            Ok(Ok(t)) => t,
+        };
+    let mut upstream = match negotiate(proto, tcp, target, timeout).await {
+        Err(e) => return RetryableFailure(e),
+        Ok(u) => u,
+    };
 
     match req.scheme {
         Scheme::Https => {
-            // The client sent CONNECT; the tunnel is up, so acknowledge and splice.
-            client
+            // Acknowledging the CONNECT tunnel is the commit point: after this the client believes
+            // it is talking to the target, so a later failure must not re-ack through another proxy.
+            if client
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .await
-                .map_err(|_| ProxyError::Reset)?;
+                .is_err()
+            {
+                // The client write failed → the client is already gone; not worth another proxy.
+                return ClientCommitted(ProxyError::Reset);
+            }
         }
         Scheme::Http => {
-            // Forward the buffered request to the upstream proxy first.
-            upstream
-                .write_all(&req.raw)
-                .await
-                .map_err(|_| ProxyError::Reset)?;
+            // The buffered request goes upstream first — the client has still received nothing, so
+            // a write failure here is retryable.
+            if upstream.write_all(&req.raw).await.is_err() {
+                return RetryableFailure(ProxyError::Reset);
+            }
         }
     }
 
+    // Splicing has begun. For HTTPS the ack is out; for HTTP the response now flows to the client.
+    // Either way a failure may already have been seen by the client, so it is not retryable.
     let mut stream: &mut Stream = &mut upstream;
-    tokio::io::copy_bidirectional(client, &mut stream)
-        .await
-        .map_err(|_| ProxyError::ErrorOnStream)?;
-    Ok(())
+    match tokio::io::copy_bidirectional(client, &mut stream).await {
+        Ok(_) => RelayOutcome::Ok,
+        Err(_) => ClientCommitted(ProxyError::ErrorOnStream),
+    }
 }
 
 /// Read and parse the client's first request line + Host, enough to route it.

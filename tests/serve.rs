@@ -138,6 +138,83 @@ async fn pool_country_match_is_case_insensitive() {
     assert!(pool.get(Scheme::Http, &any_key()).await.is_some());
 }
 
+/// An addr whose listener has been dropped — connecting to it fails (connection refused).
+async fn closed_addr() -> std::net::SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap() // `l` dropped at return → port closed
+}
+
+#[tokio::test]
+async fn retries_next_proxy_when_first_connect_fails() {
+    // A pre-commit failure (connect refused) is transparently retried on the next proxy; the
+    // client sees the second proxy's body, never an error.
+    let dead = closed_addr().await;
+    let (good, _g) = mock_upstream("RETRIED-OK").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(dead), http_proxy_at(good)],
+        PoolConfig::default(),
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp))
+        .await
+        .expect("read should not time out")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&resp).contains("RETRIED-OK"),
+        "a connect failure must retry the next proxy transparently"
+    );
+}
+
+#[tokio::test]
+async fn emits_502_after_max_tries_all_fail() {
+    // Every attempt is a pre-commit failure and none commits → exactly one 502.
+    let pool = Pool::from_proxies(
+        vec![
+            http_proxy_at(closed_addr().await),
+            http_proxy_at(closed_addr().await),
+        ],
+        PoolConfig {
+            max_tries: 2,
+            ..PoolConfig::default()
+        },
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(2)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp))
+        .await
+        .expect("read should not time out")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&resp).contains("502"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_proxy_is_benched_then_re_probed() {
     // A proxy that fails is benched for fail_timeout and skipped while a healthy one exists;
