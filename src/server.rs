@@ -18,7 +18,7 @@ use crate::proxy::Proxy;
 use crate::resolver::Resolver;
 use crate::types::{Proto, Scheme};
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -315,6 +315,39 @@ impl Pool {
         let before = state.len();
         state.retain(|p| !(p.proxy.host == host && p.proxy.port == port));
         before != state.len()
+    }
+
+    /// Add a checked proxy to a running pool, deduped on `(host, port)` (no-op if already present).
+    /// Used by the D3 re-check loop and the E3 file watcher to mutate a live pool.
+    pub fn add(&self, proxy: Proxy) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .iter()
+            .any(|p| p.proxy.host == proxy.host && p.proxy.port == proxy.port)
+        {
+            return;
+        }
+        state.push(Pooled {
+            proxy,
+            blocked_until: None,
+        });
+        self.notify.notify_waiters();
+    }
+
+    /// Remove any pooled proxy at this address; returns whether one was removed. (Alias of
+    /// [`Pool::remove`] under the D3/E3 vocabulary.)
+    pub fn remove_addr(&self, host: IpAddr, port: u16) -> bool {
+        self.remove(host, port)
+    }
+
+    /// Snapshot the current `(host, port)` set, for re-check scheduling (D3) and reconciliation (E3).
+    pub fn addrs(&self) -> BTreeSet<(IpAddr, u16)> {
+        self.state
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| (p.proxy.host, p.proxy.port))
+            .collect()
     }
 
     /// Wait until at least `n` proxies are pooled, or the source is exhausted — so a too-small

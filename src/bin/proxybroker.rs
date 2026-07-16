@@ -206,6 +206,27 @@ struct ServeArgs {
     /// history and folds each fresh check back in (D2; requires the `store-sqlite` build feature).
     #[arg(long, value_name = "PATH")]
     state: Option<PathBuf>,
+
+    /// Adaptively re-check pooled proxies on a cadence proportional to their stability, keeping the
+    /// pool fresh without re-running find (D3; requires --state and the store-sqlite feature).
+    #[arg(long)]
+    recheck: bool,
+
+    /// Global re-check ceiling, checks/sec (the IP-block guard).
+    #[arg(long, default_value_t = 5.0)]
+    recheck_rate: f64,
+
+    /// Shortest re-check cadence, seconds (a flaky proxy).
+    #[arg(long, default_value_t = 60)]
+    recheck_min: u64,
+
+    /// Longest re-check cadence, seconds (a rock-solid proxy).
+    #[arg(long, default_value_t = 3600)]
+    recheck_max: u64,
+
+    /// Score half-life for an unseen proxy, seconds.
+    #[arg(long, default_value_t = 21600)]
+    decay_halflife: u64,
 }
 
 #[derive(clap::Args)]
@@ -765,6 +786,40 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
             Some(h)
         }
         None => None,
+    };
+    // D3: adaptive re-check loop. Cloned before `serve` takes the pool; the handle lives until
+    // shutdown (its Drop cancels the loop). Needs --state (a durable score to re-check into).
+    #[cfg(feature = "store-sqlite")]
+    let _rechecker = if args.recheck {
+        match args.state.as_deref() {
+            Some(path) => {
+                let store: Arc<dyn proxybroker::Store> =
+                    Arc::new(proxybroker::SqliteStore::open(path)?);
+                let checker = broker.build_checker(&serve_query(&args)).await?;
+                let cfg = proxybroker::RecheckConfig {
+                    min_interval: Duration::from_secs(args.recheck_min),
+                    max_interval: Duration::from_secs(args.recheck_max),
+                    rate_per_sec: args.recheck_rate,
+                    decay_halflife: Duration::from_secs(args.decay_halflife),
+                };
+                eprintln!(
+                    "adaptive re-checking enabled (rate {}/s)",
+                    args.recheck_rate
+                );
+                Some(proxybroker::spawn_rechecker(
+                    pool.clone(),
+                    checker,
+                    store,
+                    cfg,
+                ))
+            }
+            None => {
+                eprintln!("--recheck requires --state; re-checking disabled");
+                None
+            }
+        }
+    } else {
+        None
     };
     let handle = serve(
         addr,

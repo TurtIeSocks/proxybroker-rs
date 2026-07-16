@@ -434,7 +434,7 @@ impl Broker {
     /// The resolver + external-IP discovery + [`Checker`] setup shared by `find` and `check`.
     /// Proxy candidates are already IP literals, so the resolver is only for external-IP
     /// discovery and judge-host resolution.
-    async fn build_checker(&self, query: &FindQuery) -> Result<Arc<Checker>, Error> {
+    pub async fn build_checker(&self, query: &FindQuery) -> Result<Arc<Checker>, Error> {
         let resolver = match &self.resolver {
             Some(r) => r.clone(),
             None => Arc::new(Resolver::new(query.timeout)?),
