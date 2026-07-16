@@ -882,9 +882,7 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
 
 /// Build the pool-fill `FindQuery` from the serve flags. Pure (no I/O, no broker) so the
 /// flag→query mapping is unit-testable offline — the filtering itself runs upstream in `find`.
-/// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
-/// matching api.py's `if limit <= 0: raise ValueError`.
-#[cfg(feature = "server")]
+/// Pool-fill args for `proxybroker mcp` — the subset of `ServeArgs` an MCP pool needs.
 #[cfg(feature = "mcp")]
 #[derive(clap::Args)]
 struct McpArgs {
@@ -903,14 +901,8 @@ struct McpArgs {
     /// Per-request timeout in seconds.
     #[arg(long, default_value_t = 8)]
     timeout: u64,
-
-    /// Drop a proxy once its error rate exceeds this (0.0–1.0).
-    #[arg(long, default_value_t = 0.5)]
-    max_error_rate: f64,
-
-    /// Drop a proxy once its average response time (seconds) exceeds this.
-    #[arg(long, default_value_t = 8.0)]
-    max_resp_time: f64,
+    // No --max-error-rate / --max-resp-time: those PoolConfig thresholds only gate re-admission via
+    // put_ok/put_failed (server relay / connector), which the MCP handlers never call — inert here.
 }
 
 /// Fill a pool via `find` (exactly like `serve`) then serve the three MCP tools over stdio. The
@@ -920,8 +912,6 @@ async fn mcp_cmd(broker: Broker, args: McpArgs) -> Result<(), Box<dyn std::error
     use proxybroker::server::{Pool, PoolConfig};
 
     let pool_config = PoolConfig {
-        max_error_rate: args.max_error_rate,
-        max_resp_time: args.max_resp_time,
         countries: (!args.countries.is_empty())
             .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
         ..Default::default()
@@ -943,6 +933,9 @@ async fn mcp_cmd(broker: Broker, args: McpArgs) -> Result<(), Box<dyn std::error
     proxybroker::mcp::serve_stdio(pool).await
 }
 
+/// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
+/// matching api.py's `if limit <= 0: raise ValueError`.
+#[cfg(feature = "server")]
 fn serve_query(args: &ServeArgs) -> FindQuery {
     let mut b = FindQuery::builder()
         .types(types_from(args.types.clone(), args.lvl.clone()))
