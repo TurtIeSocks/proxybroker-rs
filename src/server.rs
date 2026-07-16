@@ -818,6 +818,30 @@ fn inject_header(raw: &[u8], header_line: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Remove every `name:` header line (case-insensitive) from a buffered HTTP head, preserving the
+/// request/status line (never dropped) and the terminating blank line. Used to strip the client's
+/// hop-by-hop `Proxy-Authorization` before forwarding upstream (B9 secret hygiene).
+fn strip_header(raw: &[u8], name: &str) -> Vec<u8> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    let mut out = Vec::with_capacity(raw.len());
+    let mut rest = raw;
+    let mut first = true; // the first line is the request line — never a header
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        let advance = pos + 2;
+        let is_target = !first
+            && String::from_utf8_lossy(&rest[..pos])
+                .to_ascii_lowercase()
+                .starts_with(&prefix);
+        if !is_target {
+            out.extend_from_slice(&rest[..advance]);
+        }
+        rest = &rest[advance..];
+        first = false;
+    }
+    out.extend_from_slice(rest); // trailing bytes after the last CRLF (usually empty)
+    out
+}
+
 /// Value of the first `name:` header (case-insensitive) in a buffered HTTP request, trimmed.
 fn header_value(raw: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
@@ -919,11 +943,16 @@ async fn relay(
         }
         Frontend::HttpForward => {
             // The buffered request goes upstream first — the client has still received nothing, so
-            // a write failure here is retryable. When the proxy has credentials (B8), inject a
-            // Proxy-Authorization header after the request line.
-            let to_send: std::borrow::Cow<[u8]> = match proxy.auth() {
-                Some(c) => std::borrow::Cow::Owned(inject_header(
-                    &req.raw,
+            // a write failure here is retryable.
+            //
+            // Secret hygiene: drop the client's Proxy-Authorization before forwarding. It carries
+            // the LOCAL server's access secret (B9), is hop-by-hop (RFC 7235 §4.4), and must not be
+            // handed to the untrusted upstream proxy — an authenticating proxy strips it. THEN add
+            // the upstream's own credentials (B8), if any.
+            let sanitized = strip_header(&req.raw, "Proxy-Authorization");
+            let to_send: Vec<u8> = match proxy.auth() {
+                Some(c) => inject_header(
+                    &sanitized,
                     format!(
                         "Proxy-Authorization: Basic {}\r\n",
                         crate::utils::base64_encode(
@@ -931,8 +960,8 @@ async fn relay(
                         )
                     )
                     .as_bytes(),
-                )),
-                None => std::borrow::Cow::Borrowed(&req.raw),
+                ),
+                None => sanitized,
             };
             if upstream.write_all(&to_send).await.is_err() {
                 return RetryableFailure(ProxyError::Reset);
@@ -1443,6 +1472,20 @@ mod tests {
         );
         assert_eq!(parse_http_status(b"garbage"), 0); // unparseable → 0 (in no allow-list)
         assert_eq!(parse_http_status(b"HTTP/1.1 \r\n"), 0);
+    }
+
+    #[test]
+    fn strip_header_removes_only_the_named_header() {
+        let raw =
+            b"GET / HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic zzz\r\nAccept: */*\r\n\r\n";
+        let s = String::from_utf8(strip_header(raw, "Proxy-Authorization")).unwrap();
+        assert!(!s.contains("Proxy-Authorization"), "{s:?}");
+        assert!(s.contains("Host: x") && s.contains("Accept: */*"), "{s:?}");
+        assert!(
+            s.starts_with("GET / HTTP/1.1\r\n"),
+            "request line kept: {s:?}"
+        );
+        assert!(s.ends_with("\r\n\r\n"), "blank line kept: {s:?}");
     }
 
     #[test]

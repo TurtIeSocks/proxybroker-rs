@@ -193,6 +193,51 @@ async fn no_creds_omits_proxy_authorization() {
 }
 
 #[tokio::test]
+async fn client_proxy_authorization_not_leaked_upstream() {
+    // Review finding (HIGH): under --auth, the client's Proxy-Authorization is the LOCAL server's
+    // access secret and is hop-by-hop — it must be stripped before forwarding to the untrusted
+    // (scraped, no-creds) upstream proxy, or that operator could steal it and defeat the gate.
+    let (up, rx) = mock_capture().await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_with_auth(up, None).await], // scraped upstream, no creds
+        PoolConfig::default(),
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        1024,
+        Some("user:pass".into()), // server requires client auth
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    // Must carry the header to pass the B9 gate (Basic base64("user:pass")).
+    client
+        .write_all(
+            b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let _ = client.read(&mut [0u8; 64]).await;
+    let fwd = tokio::time::timeout(Duration::from_secs(3), rx)
+        .await
+        .expect("upstream should report the forwarded request")
+        .unwrap();
+    assert!(
+        !fwd.contains("Proxy-Authorization"),
+        "the client's access secret must not reach the upstream: {fwd:?}"
+    );
+    assert!(
+        fwd.starts_with("GET http://1.2.3.4/"),
+        "request line survives: {fwd:?}"
+    );
+}
+
+#[tokio::test]
 async fn connect_ack_carries_x_proxy_info() {
     // B7: a CONNECT client gets X-Proxy-Info on the `200 Connection established` head, pre-tunnel.
     // A SOCKS5 upstream (with auth, so it offers 0x02) serves the Https scheme and completes the
