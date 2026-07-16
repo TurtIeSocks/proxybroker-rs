@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to stable on purpose. This crate is published to crates.io, and a library
+# that needs nightly is a library most people cannot use. The host's default
+# toolchain here happens to be nightly; this file makes the build reproducible
+# regardless of what `rustup default` says.
+channel = "stable"
+components = ["rustfmt", "clippy"]
