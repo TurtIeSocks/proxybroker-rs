@@ -32,6 +32,8 @@ metrics = ["server"]
 # Live progress bar during `find` (F2). Pulls in indicatif; off by default so the default binary
 # stays lean.
 progress = ["cli", "dep:indicatif"]
+# Durable cross-run state in a SQLite DB (D2). Off by default so pure-library users stay zero-dep.
+persist = ["dep:rusqlite"]
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.
@@ -74,6 +76,8 @@ maxminddb = { version = "0.29", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 indicatif = { version = "0.18", optional = true }
+# `bundled` compiles SQLite from source: no system libsqlite3, static link (matches the musl goal).
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

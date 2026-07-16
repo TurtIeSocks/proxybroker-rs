@@ -35,6 +35,8 @@ pub mod geo;
 pub mod judge;
 pub mod negotiator;
 pub mod parse;
+#[cfg(feature = "persist")]
+pub mod persist;
 pub mod provider;
 pub mod proxy;
 pub mod resolver;
@@ -51,6 +53,8 @@ pub use error::{Error, ProxyError};
 pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
 pub use parse::parse_proxy_lines;
+#[cfg(feature = "persist")]
+pub use persist::{Store, SCHEMA_VERSION};
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{read_ndjson, write_ndjson, Capabilities, Country, Credentials, Proxy};
 pub use resolver::Resolver;

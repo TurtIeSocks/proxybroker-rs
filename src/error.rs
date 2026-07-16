@@ -106,6 +106,11 @@ pub enum Error {
     /// Underlying I/O failure (binding the server socket, reading a config file).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A persistence-layer failure (opening/migrating/reading the `--state` SQLite DB, D2). Carries
+    /// the underlying message as a `String` so the error type never references `rusqlite`.
+    #[error("persistence error: {0}")]
+    Persist(String),
 }
 
 #[cfg(test)]

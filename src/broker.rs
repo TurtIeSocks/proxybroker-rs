@@ -260,6 +260,11 @@ impl FindQueryBuilder {
 }
 
 /// Finds proxies from a set of providers.
+/// A callback invoked once for every checked proxy (working or not), right after it is recorded
+/// into the shared stats. The `persist` layer (D2) installs one that upserts the proxy into the
+/// state DB; kept as a plain `dyn Fn` so the broker never references the `persist` feature.
+pub type CheckObserver = Arc<dyn Fn(&Proxy) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Broker {
     providers: Arc<Vec<ProviderSpec>>,
@@ -269,6 +274,17 @@ pub struct Broker {
     resolver: Option<Arc<Resolver>>,
     #[cfg(feature = "geo")]
     geo: Option<Arc<GeoDb>>,
+    /// Observer fired per checked proxy (D2 persistence hook). `None` = no-op.
+    on_checked: Option<CheckObserver>,
+}
+
+impl Broker {
+    /// Attach a per-checked-proxy observer (builder-style, consuming). Used by the CLI to install
+    /// the D2 store's upsert when `--state` is set.
+    pub fn with_observer(mut self, obs: Option<CheckObserver>) -> Self {
+        self.on_checked = obs;
+        self
+    }
 }
 
 impl Broker {
@@ -387,6 +403,7 @@ impl Broker {
         let countries = uppercase_set(query.countries.clone());
         let (max_conn, limit) = (query.max_conn, query.limit);
         let caps = CapsFilter::from_query(&query);
+        let on_checked = self.on_checked.clone();
         tokio::spawn(async move {
             // Attach geo + apply the country filter before checking, mirroring find's source.
             let source = proxies.filter_map(move |mut proxy| {
@@ -400,6 +417,7 @@ impl Broker {
                 max_conn,
                 limit,
                 caps,
+                on_checked,
                 tx,
                 task_cancel,
                 task_stats,
@@ -453,6 +471,7 @@ impl Broker {
         stats: Arc<std::sync::Mutex<StatsCollector>>,
     ) {
         let countries = uppercase_set(query.countries.clone());
+        let on_checked = self.on_checked.clone();
         let client = self.client.clone();
         let specs: Vec<ProviderSpec> = self.providers.as_ref().clone();
         let fetches = futures_util::stream::iter(specs)
@@ -486,6 +505,7 @@ impl Broker {
             query.max_conn,
             query.limit,
             CapsFilter::from_query(&query),
+            on_checked,
             tx,
             cancel,
             stats,
@@ -544,6 +564,7 @@ async fn check_stream<S>(
     max_conn: usize,
     limit: Option<usize>,
     caps: CapsFilter,
+    on_checked: Option<CheckObserver>,
     tx: mpsc::Sender<Proxy>,
     cancel: CancellationToken,
     stats: Arc<std::sync::Mutex<StatsCollector>>,
@@ -569,6 +590,7 @@ async fn check_stream<S>(
         let sent = sent.clone();
         let cancel = cancel.clone();
         let stats = stats.clone();
+        let on_checked = on_checked.clone();
         tracker.spawn(async move {
             let _permit = permit;
             tokio::select! {
@@ -577,6 +599,11 @@ async fn check_stream<S>(
                     // Record EVERY checked proxy (working or not) before it is sent or dropped,
                     // so the stats reflect the whole checked set (review F4).
                     stats.lock().unwrap().record(&proxy);
+                    // D2: fold the finished proxy's outcome into durable state (upsert), beside
+                    // the stats record — every checked proxy, working or not.
+                    if let Some(obs) = &on_checked {
+                        obs(&proxy);
+                    }
                     // A working proxy is still dropped if it fails the capability filter (A4);
                     // it stays counted in stats (it *is* working), it just isn't emitted.
                     if working && caps.passes(&proxy) {
@@ -716,6 +743,7 @@ impl BrokerBuilder {
             resolver: self.resolver,
             #[cfg(feature = "geo")]
             geo,
+            on_checked: None,
         }
     }
 }

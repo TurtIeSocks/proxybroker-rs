@@ -201,6 +201,11 @@ struct ServeArgs {
     #[cfg(feature = "metrics")]
     #[arg(long, value_name = "ADDR")]
     metrics: Option<std::net::SocketAddr>,
+
+    /// Remember proxies across runs in a SQLite DB at this path — warm-starts the pool from stored
+    /// history and folds each fresh check back in (D2; requires the `persist` build feature).
+    #[arg(long, value_name = "PATH")]
+    state: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -347,6 +352,11 @@ struct FindArgs {
     /// when built with the `progress` feature).
     #[arg(long)]
     progress: bool,
+
+    /// Remember proxies across runs in a SQLite DB at this path — each checked proxy is folded into
+    /// its durable history (D2; requires the `persist` build feature).
+    #[arg(long, value_name = "PATH")]
+    state: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -708,6 +718,8 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     use std::sync::Arc;
 
     let addr: std::net::SocketAddr = args.host.parse()?;
+    // D2: install the upsert observer + read warm-start history from --state.
+    let (broker, history) = open_state(broker, args.state.as_deref())?;
     let pool_config = PoolConfig {
         max_tries: args.max_tries,
         max_error_rate: args.max_error_rate,
@@ -730,12 +742,17 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     let pool = if let Some(path) = &args.load {
         let loaded = proxybroker::read_ndjson(std::io::BufReader::new(std::fs::File::open(path)?))?;
         eprintln!("loaded {} proxies from {}", loaded.len(), path.display());
-        Pool::from_proxies(loaded, pool_config)
+        // D2: union the file with DB history; history wins on (host,port) since it carries score.
+        Pool::from_proxies(union_dedup(history, loaded), pool_config)
     } else {
         // Find proxies to fill the pool, filtered by the serve flags (types/lvl/strict/post/
-        // dnsbl/countries). The flag→query mapping lives in the pure `serve_query`.
+        // dnsbl/countries). The flag→query mapping lives in the pure `serve_query`. D2: seed the
+        // pool with stored history first, then top up from the live find.
         let stream = broker.find(serve_query(&args)).await?;
-        Pool::spawn(stream, pool_config)
+        Pool::spawn(
+            futures_util::stream::iter(history).chain(stream),
+            pool_config,
+        )
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
     // F1: an optional Prometheus endpoint alongside the proxy server. Cloned before `serve` takes
@@ -821,7 +838,58 @@ fn types_from(protos: Vec<Proto>, lvl: Vec<AnonLevel>) -> Vec<TypeSpec> {
         .collect()
 }
 
+/// Open the `--state` store (D2): return the broker with an upsert observer installed (every checked
+/// proxy is folded into its durable row) plus the warm-start history read from the DB. A no-op
+/// returning empty history when `--state` is unset or the `persist` feature is off.
+#[cfg(feature = "persist")]
+fn open_state(
+    broker: Broker,
+    path: Option<&std::path::Path>,
+) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
+    match path {
+        Some(p) => {
+            let store = std::sync::Arc::new(proxybroker::Store::open(p)?);
+            let history = store.load()?;
+            let obs: proxybroker::broker::CheckObserver = std::sync::Arc::new(move |px: &Proxy| {
+                if let Err(e) = store.upsert(px) {
+                    tracing::warn!(error = %e, "state upsert failed");
+                }
+            });
+            Ok((broker.with_observer(Some(obs)), history))
+        }
+        None => Ok((broker, Vec::new())),
+    }
+}
+#[cfg(not(feature = "persist"))]
+fn open_state(
+    broker: Broker,
+    path: Option<&std::path::Path>,
+) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
+    if path.is_some() {
+        eprintln!("--state requires the `persist` build feature; ignoring");
+    }
+    Ok((broker, Vec::new()))
+}
+
+/// Union two proxy sets deduped on `(host, port)`, `primary` winning a conflict (D2: DB history wins
+/// over a `--load` snapshot because it carries reputation).
+#[cfg(feature = "server")]
+fn union_dedup(primary: Vec<Proxy>, secondary: Vec<Proxy>) -> Vec<Proxy> {
+    let seen: std::collections::HashSet<_> = primary.iter().map(|p| (p.host, p.port)).collect();
+    primary
+        .into_iter()
+        .chain(
+            secondary
+                .into_iter()
+                .filter(|p| !seen.contains(&(p.host, p.port))),
+        )
+        .collect()
+}
+
 async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // D2: install the persistence upsert observer when --state is set (history unused by find,
+    // which generates fresh candidates).
+    let (broker, _history) = open_state(broker, args.state.as_deref())?;
     let mut builder = FindQuery::builder()
         .types(types_from(args.types, args.lvl))
         .limit(args.limit)
