@@ -659,6 +659,23 @@ fn client_key(config: &PoolConfig, peer_ip: IpAddr, req: &ClientRequest) -> Clie
     ClientKey::Ip(peer_ip)
 }
 
+/// Insert `header_line` (which must end with CRLF) right after the request/status line — i.e. after
+/// the first CRLF — in a buffered HTTP head. Returns `raw` unchanged if there is no CRLF. Shared by
+/// B8 (inject `Proxy-Authorization` upstream) and B7 (inject `X-Proxy-Info` downstream).
+fn inject_header(raw: &[u8], header_line: &[u8]) -> Vec<u8> {
+    match raw.windows(2).position(|w| w == b"\r\n") {
+        Some(pos) => {
+            let cut = pos + 2;
+            let mut out = Vec::with_capacity(raw.len() + header_line.len());
+            out.extend_from_slice(&raw[..cut]);
+            out.extend_from_slice(header_line);
+            out.extend_from_slice(&raw[cut..]);
+            out
+        }
+        None => raw.to_vec(),
+    }
+}
+
 /// Value of the first `name:` header (case-insensitive) in a buffered HTTP request, trimmed.
 fn header_value(raw: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
@@ -722,7 +739,9 @@ async fn relay(
             Ok(Err(_)) => return RetryableFailure(ProxyError::ConnFailed),
             Ok(Ok(t)) => t,
         };
-    let mut upstream = match negotiate(proto, tcp, target, timeout).await {
+    // Pass the proxy's upstream credentials (B8) into the negotiation (SOCKS5 RFC 1929 / CONNECT
+    // Proxy-Authorization). `None` for scraped proxies.
+    let mut upstream = match negotiate(proto, tcp, target, timeout, proxy.auth()).await {
         Err(e) => return RetryableFailure(e),
         Ok(u) => u,
     };
@@ -744,8 +763,22 @@ async fn relay(
         }
         Frontend::HttpForward => {
             // The buffered request goes upstream first — the client has still received nothing, so
-            // a write failure here is retryable.
-            if upstream.write_all(&req.raw).await.is_err() {
+            // a write failure here is retryable. When the proxy has credentials (B8), inject a
+            // Proxy-Authorization header after the request line.
+            let to_send: std::borrow::Cow<[u8]> = match proxy.auth() {
+                Some(c) => std::borrow::Cow::Owned(inject_header(
+                    &req.raw,
+                    format!(
+                        "Proxy-Authorization: Basic {}\r\n",
+                        crate::utils::base64_encode(
+                            format!("{}:{}", c.username, c.password).as_bytes()
+                        )
+                    )
+                    .as_bytes(),
+                )),
+                None => std::borrow::Cow::Borrowed(&req.raw),
+            };
+            if upstream.write_all(&to_send).await.is_err() {
                 return RetryableFailure(ProxyError::Reset);
             }
             // B11: peek the upstream status BEFORE any client write. A disallowed status is a

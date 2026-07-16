@@ -21,13 +21,29 @@ pub struct Country {
     pub name: String,
 }
 
+/// Username/password for an authenticated upstream proxy (B8). Carried on [`Proxy`], applied by
+/// the negotiator (SOCKS5 RFC 1929) and the server (HTTP `Proxy-Authorization`). Never serialized
+/// (kept out of `--format json`), and its [`std::fmt::Debug`] is redacted so a `Proxy` debug print
+/// cannot leak the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials").finish_non_exhaustive()
+    }
+}
+
 /// A proxy: where it is, what it can do, and how well it has done it.
 ///
 /// `PartialEq` (not `Eq` — the `runtimes: Vec<f64>` field blocks it) lets a save/load round-trip
 /// be asserted. The round-trip is **lossy on stats by design**: `Serialize` emits the computed
 /// `avg_resp_time`/`error_rate` for humans, but `Deserialize` restores only the persistent
 /// identity (host, port, geo, confirmed types) with `requests`/`errors`/`runtimes` empty — a
-/// loaded proxy's timing history restarts.
+/// loaded proxy's timing history restarts. `auth` is never serialized (secrets stay out of JSON).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proxy {
     pub host: IpAddr,
@@ -44,6 +60,9 @@ pub struct Proxy {
     errors: HashMap<ProxyError, u32>,
     /// Successful round-trip times, seconds. Timeouts are excluded. `_runtimes`.
     runtimes: Vec<f64>,
+    /// Upstream proxy credentials (B8), for a paid/authenticated proxy. `None` for scraped
+    /// candidates; set only via BYO/URL loading. Never serialized.
+    auth: Option<Credentials>,
 }
 
 /// `HTTP`-family protocols — a proxy supporting any of these can serve plain HTTP.
@@ -71,7 +90,20 @@ impl Proxy {
             requests: 0,
             errors: HashMap::new(),
             runtimes: Vec::new(),
+            auth: None,
         }
+    }
+
+    /// Attach upstream credentials (builder-style). `scheme://user:pass@host:port` loading sets
+    /// these; scraped proxies never carry them.
+    pub fn with_auth(mut self, creds: Credentials) -> Self {
+        self.auth = Some(creds);
+        self
+    }
+
+    /// The upstream credentials, if any (B8).
+    pub fn auth(&self) -> Option<&Credentials> {
+        self.auth.as_ref()
     }
 
     /// `host:port`, IPv6 bracketed per RFC 3986 (`proxy.py:_format_host_port`). No trailing
@@ -292,6 +324,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             requests: 0,
             errors: HashMap::new(),
             runtimes: Vec::new(),
+            auth: None, // secrets are never serialized, so never deserialized either
         })
     }
 }
