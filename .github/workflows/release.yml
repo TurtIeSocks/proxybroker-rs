@@ -1,17 +1,18 @@
 name: Release
 
-# Publish to crates.io when a version tag is pushed.
+# On a pushed version tag: publish the crate to crates.io AND attach prebuilt CLI binaries
+# to a GitHub Release.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.1.2 && git push origin v0.1.2
 #
-# The tag MUST be `v<version>` and match the version in Cargo.toml, or the job fails before
-# publishing. Requires a CARGO_REGISTRY_TOKEN repository secret.
+# The tag MUST be `v<version>` and match the version in Cargo.toml, or nothing ships. Requires
+# a CARGO_REGISTRY_TOKEN repository secret for the crates.io step.
 on:
   push:
     tags:
       - "v*"
 
-# Never run two publishes for the same tag at once.
+# Never run two releases for the same tag at once.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -20,14 +21,14 @@ permissions:
   contents: read
 
 jobs:
-  publish:
+  # Gate everything on a single check: the tag matches the crate version, and the (offline)
+  # test suite passes. Both `publish` and `binaries` depend on this, so neither ships for a
+  # mistagged or broken commit.
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # rust-toolchain.toml pins stable; this installs it explicitly for speed.
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify the tag matches the crate version
@@ -41,9 +42,19 @@ jobs:
           fi
 
       # The full test suite is designed to run offline (local mock servers only), so it is
-      # safe in CI and catches regressions before anything is published.
+      # safe in CI and catches regressions before anything ships.
       - name: Test
         run: cargo test --all-features --locked
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       # `cargo publish` re-runs this verify-build itself; running it first fails fast with a
       # clearer log if packaging is broken (e.g. a runtime file missing from `include`).
@@ -54,3 +65,58 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+  binaries:
+    needs: verify
+    permissions:
+      contents: write # create the GitHub Release and upload assets
+    strategy:
+      fail-fast: false
+      # Native runner per target — no cross-compilation. The crate pulls aws-lc-rs (via
+      # reqwest's rustls) and ring, both of which build cleanly with the host's native C
+      # toolchain but are painful to cross-compile. macOS covers both archs on their native
+      # runners (macos-13 = Intel, macos-14 = Apple Silicon); Linux uses the free arm64
+      # runner for aarch64.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc-sys needs NASM to assemble its optimized routines on Windows/MSVC.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Builds the `proxybroker` binary for the target, archives it (tar.gz on unix, zip on
+      # Windows) WITH the licences — the binary embeds the DB-IP geo database (CC BY 4.0), so
+      # its attribution (LICENSE-DATA) and NOTICE must travel with every distributed copy —
+      # writes a SHA-256 checksum, and uploads everything to the tag's GitHub Release
+      # (creating the release if it does not exist yet).
+      - name: Build and upload CLI binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: proxybroker
+          target: ${{ matrix.target }}
+          archive: proxybroker-$tag-$target
+          include: LICENSE,LICENSE-DATA,NOTICE,README.md
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
