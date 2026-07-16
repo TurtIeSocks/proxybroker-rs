@@ -15,6 +15,7 @@ pub mod geo;
 pub mod parse;
 pub mod provider;
 pub mod proxy;
+pub mod resolver;
 pub mod types;
 pub mod utils;
 
@@ -24,4 +25,5 @@ pub use error::{Error, ProxyError};
 pub use geo::GeoDb;
 pub use provider::{Candidate, ProviderSpec};
 pub use proxy::{Country, Proxy};
+pub use resolver::Resolver;
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
