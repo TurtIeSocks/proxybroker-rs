@@ -6,13 +6,19 @@
 
 use proxybroker::proxy::Proxy;
 use proxybroker::resolver::Resolver;
-use proxybroker::server::{serve, Pool, PoolConfig};
+use proxybroker::server::{serve, ClientKey, Pool, PoolConfig, Strategy};
 use proxybroker::types::{Proto, Scheme};
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// A throwaway client key for non-sticky `get` calls (the strategy ignores it).
+fn any_key() -> ClientKey {
+    ClientKey::Ip("0.0.0.0".parse::<IpAddr>().unwrap())
+}
 
 /// A mock upstream proxy that returns a fixed HTTP response to whatever it receives.
 async fn mock_upstream(body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -96,13 +102,13 @@ async fn pool_admits_only_allowed_countries() {
             ..PoolConfig::default()
         },
     );
-    let first = pool.get(Scheme::Http).await;
+    let first = pool.get(Scheme::Http, &any_key()).await;
     assert_eq!(
         first.and_then(|p| p.geo.map(|g| g.code)),
         Some("US".to_string())
     );
     assert!(
-        pool.get(Scheme::Http).await.is_none(),
+        pool.get(Scheme::Http, &any_key()).await.is_none(),
         "the FR proxy must be rejected on admission"
     );
 }
@@ -114,9 +120,9 @@ async fn pool_no_filter_admits_all() {
         vec![proxy_in("1.1.1.1", "US"), proxy_in("2.2.2.2", "FR")],
         PoolConfig::default(),
     );
-    assert!(pool.get(Scheme::Http).await.is_some());
-    assert!(pool.get(Scheme::Http).await.is_some());
-    assert!(pool.get(Scheme::Http).await.is_none());
+    assert!(pool.get(Scheme::Http, &any_key()).await.is_some());
+    assert!(pool.get(Scheme::Http, &any_key()).await.is_some());
+    assert!(pool.get(Scheme::Http, &any_key()).await.is_none());
 }
 
 #[tokio::test]
@@ -129,7 +135,82 @@ async fn pool_country_match_is_case_insensitive() {
             ..PoolConfig::default()
         },
     );
-    assert!(pool.get(Scheme::Http).await.is_some());
+    assert!(pool.get(Scheme::Http, &any_key()).await.is_some());
+}
+
+#[tokio::test]
+async fn sticky_returns_same_proxy_for_same_client() {
+    // Pool-level proof of the session map: the same client key, across a get/put/get cycle, is
+    // pinned to the same upstream address.
+    let pool = Pool::from_proxies(
+        vec![proxy_in("1.1.1.1", "US"), proxy_in("2.2.2.2", "US")],
+        PoolConfig {
+            strategy: Strategy::Sticky,
+            ..PoolConfig::default()
+        },
+    );
+    let a = ClientKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
+    let first = pool.get(Scheme::Http, &a).await.unwrap();
+    let pinned = first.addr();
+    pool.put(first); // healthy return — back into the pool
+    let second = pool.get(Scheme::Http, &a).await.unwrap();
+    assert_eq!(
+        second.addr(),
+        pinned,
+        "same client must re-get the pinned proxy"
+    );
+}
+
+#[tokio::test]
+async fn sticky_pins_client_across_connections() {
+    // End-to-end: two sequential connections from the same client IP (127.0.0.1), Sticky keyed on
+    // IP, must relay through the SAME upstream — exercising peer capture + client_key + keyed get.
+    let (u1, _a) = mock_upstream("UP-ONE").await;
+    let (u2, _b) = mock_upstream("UP-TWO").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(u1), http_proxy_at(u2)],
+        PoolConfig {
+            strategy: Strategy::Sticky,
+            ..PoolConfig::default()
+        },
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+
+    async fn one_request(addr: std::net::SocketAddr) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut resp))
+            .await
+            .expect("read should not time out")
+            .unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    let first = one_request(handle.local_addr()).await;
+    let second = one_request(handle.local_addr()).await;
+    let body = |r: &str| {
+        if r.contains("UP-ONE") {
+            "UP-ONE"
+        } else {
+            "UP-TWO"
+        }
+    };
+    assert_eq!(
+        body(&first),
+        body(&second),
+        "same client IP must stick to one upstream ({first:?} vs {second:?})"
+    );
 }
 
 #[tokio::test]

@@ -73,6 +73,34 @@ enum Command {
     Serve(ServeArgs),
 }
 
+/// CLI mirror of [`proxybroker::server::Strategy`] (keeps clap's `ValueEnum` out of the library).
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum SelectStrategy {
+    /// Lowest error rate then fastest response.
+    #[default]
+    Best,
+    /// Rotate through eligible proxies in order.
+    RoundRobin,
+    /// Uniform random pick.
+    Random,
+    /// Pin each client to one upstream (by IP, or --sticky-header).
+    Sticky,
+}
+
+#[cfg(feature = "server")]
+impl SelectStrategy {
+    fn to_server(self) -> proxybroker::server::Strategy {
+        use proxybroker::server::Strategy;
+        match self {
+            SelectStrategy::Best => Strategy::Best,
+            SelectStrategy::RoundRobin => Strategy::RoundRobin,
+            SelectStrategy::Random => Strategy::Random,
+            SelectStrategy::Sticky => Strategy::Sticky,
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 #[derive(clap::Args, Default)]
 struct ServeArgs {
@@ -104,6 +132,15 @@ struct ServeArgs {
     /// Require the anonymity level to match exactly.
     #[arg(long)]
     strict: bool,
+
+    /// How to pick an upstream per request.
+    #[arg(long, value_enum, default_value_t = SelectStrategy::Best)]
+    strategy: SelectStrategy,
+
+    /// With --strategy sticky, key the session on this request header instead of the client IP
+    /// (HTTP requests only).
+    #[arg(long, value_name = "HEADER")]
+    sticky_header: Option<String>,
 
     /// Keep the pool topped up to this many working proxies.
     #[arg(long, default_value_t = 100)]
@@ -379,6 +416,8 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         // ran find's country filter). None when no countries requested.
         countries: (!args.countries.is_empty())
             .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
+        strategy: args.strategy.to_server(),
+        sticky_header: args.sticky_header.clone(),
         ..Default::default()
     };
 
