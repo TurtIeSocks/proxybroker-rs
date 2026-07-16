@@ -2,10 +2,11 @@
 //!
 //! - [`ProxyError`] — a single proxy failed. This is a **histogram bucket key**: in Python
 //!   it is the `errmsg` class attribute read reflectively at `proxy.py:333`
-//!   (`stat["errors"][err.errmsg] += 1`). It is `Copy + Eq + Hash` and carries no payload,
-//!   because a `Counter` key that allocates is a `Counter` key you cannot use cheaply. The
-//!   `as_str` strings are preserved **byte-for-byte** from `errors.py` — the stats output
-//!   is a user-visible contract.
+//!   (`stat["errors"][err.errmsg] += 1`). It is `Copy + Eq + Hash` and non-allocating (the one
+//!   data-carrying variant, `DisallowedStatus(u16)`, is a plain `Copy` integer), because a
+//!   `Counter` key that allocates is a `Counter` key you cannot use cheaply. The `as_str` strings
+//!   are preserved **byte-for-byte** from `errors.py` — the stats output is a user-visible
+//!   contract (`DisallowedStatus` is a local-server addition with no Python analogue).
 //! - [`Error`] — something the caller must handle: no network, no judges, bad config.
 //!
 //! See `docs/systematic-refactor/decisions.md` §Errors.

@@ -307,6 +307,82 @@ async fn allowed_status_is_forwarded_verbatim() {
     assert!(body.contains("REDIR-BODY"), "body lost: {body:?}");
 }
 
+/// A conformant origin that only answers after it has received the request body containing
+/// `marker` — models a real POST target that waits for the full body before responding.
+async fn mock_needs_body(
+    marker: &'static str,
+    resp_body: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut data = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return; // client gave up before sending the body — do not respond
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(marker.len()).any(|w| w == marker.as_bytes()) {
+                        break; // body arrived
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (addr, h)
+}
+
+#[tokio::test]
+async fn http_allowed_codes_does_not_stall_a_body_request() {
+    // Regression (review finding #1): with --http-allowed-codes set, a POST must not deadlock. The
+    // origin waits for the body before responding; the status peek must be skipped for body
+    // requests so copy_bidirectional forwards the body concurrently.
+    let (origin, _o) = mock_needs_body("hello", "POST-OK").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(origin)],
+        PoolConfig {
+            http_allowed_codes: Some(vec![200]),
+            ..PoolConfig::default()
+        },
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        1024,
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(
+            b"POST http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+    assert!(
+        String::from_utf8_lossy(&resp).contains("POST-OK"),
+        "a POST body must reach the origin even with --http-allowed-codes: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
 #[tokio::test]
 async fn none_allowed_codes_accepts_any() {
     // With no allow-list the splice is blind (today's behaviour): a 500 is forwarded unchanged.

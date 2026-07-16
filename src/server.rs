@@ -586,6 +586,13 @@ async fn handle_client(
                 pool.put_failed(proxy);
                 return Ok(());
             }
+            RelayOutcome::ClientGone => {
+                // The client vanished at the commit point; the proxy was fine. Return it healthy
+                // (no error charged, no bench) and stop — a retry cannot reach the client.
+                proxy.record_attempt(Some(0.0), None);
+                pool.put_ok(proxy);
+                return Ok(());
+            }
         }
     }
     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -637,8 +644,13 @@ enum RelayOutcome {
     Ok,
     /// Failed before any byte reached the client — safe to try the next proxy.
     RetryableFailure(crate::error::ProxyError),
-    /// The client already received an ack or spliced bytes — retrying would corrupt it, so abort.
+    /// The client already received an ack or spliced bytes and a splice error followed — the
+    /// upstream is implicated, so abort (a retry would corrupt the client) and penalize the proxy.
     ClientCommitted(crate::error::ProxyError),
+    /// The client went away at the commit point while the upstream was proven good (negotiate/peek
+    /// succeeded). Abort — a retry cannot reach the departed client — but do NOT penalize the
+    /// (blameless) proxy.
+    ClientGone,
 }
 
 /// Relay one client request through `proxy` using `proto`, reporting where it ended so the caller
@@ -678,8 +690,9 @@ async fn relay(
                 .await
                 .is_err()
             {
-                // The client write failed → the client is already gone; not worth another proxy.
-                return ClientCommitted(ProxyError::Reset);
+                // The client write failed → the client is gone, but the upstream tunnel was fine;
+                // abort without blaming the proxy.
+                return RelayOutcome::ClientGone;
             }
         }
         Scheme::Http => {
@@ -691,14 +704,22 @@ async fn relay(
             // B11: peek the upstream status BEFORE any client write. A disallowed status is a
             // pre-commit retryable failure; an allowed one is replayed to the client (the peeked
             // bytes must not be lost) and becomes the commit point.
+            //
+            // Skip the peek for a body-bearing request (POST/PUT/…): the client's body is still
+            // unread in its socket and is only pumped by the copy_bidirectional below, so peeking
+            // first would deadlock a conformant origin that waits for the whole body before
+            // answering. Such requests are non-idempotent anyway (the body is consumed on the first
+            // upstream, so a retry could not replay it) — splice them straight through.
             if let Some(allowed) = allowed_codes {
-                match peek_http_status(&mut upstream, allowed, timeout).await {
-                    Ok(head) => {
-                        if client.write_all(&head).await.is_err() {
-                            return ClientCommitted(ProxyError::Reset);
+                if !request_has_body(&req.raw) {
+                    match peek_http_status(&mut upstream, allowed, timeout).await {
+                        Ok(head) => {
+                            if client.write_all(&head).await.is_err() {
+                                return RelayOutcome::ClientGone;
+                            }
                         }
+                        Err(e) => return RetryableFailure(e),
                     }
-                    Err(e) => return RetryableFailure(e),
                 }
             }
         }
@@ -735,9 +756,10 @@ async fn peek_http_status(
                 return Err(ProxyError::EmptyRecv);
             }
             head.push(byte[0]);
-            // The status line ends at the first CRLF; cap the scan so a header-less stream cannot
-            // buffer without bound.
-            if head.ends_with(b"\r\n") || head.len() >= 256 {
+            // The status line ends at the first LF (a CRLF also ends with LF, so this subsumes it
+            // and tolerates a non-conformant bare-LF terminator); cap the scan so a header-less
+            // stream cannot buffer without bound.
+            if head.ends_with(b"\n") || head.len() >= 256 {
                 return Ok(head);
             }
         }
@@ -761,6 +783,21 @@ fn parse_http_status(head: &[u8]) -> u16 {
         .and_then(|s| s.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .unwrap_or(0)
+}
+
+/// Whether the buffered request declares a body (chunked, or a non-zero `Content-Length`). The
+/// B11 status peek must be skipped for these — the origin will not answer until the body arrives,
+/// but the body is still unread in the client socket (only `copy_bidirectional` pumps it), so
+/// peeking first would deadlock.
+fn request_has_body(raw: &[u8]) -> bool {
+    if header_value(raw, "Transfer-Encoding").is_some() {
+        return true;
+    }
+    match header_value(raw, "Content-Length") {
+        // Unparseable length → assume a body (be safe: skip the peek rather than risk a hang).
+        Some(v) => v.trim().parse::<u64>().map_or(true, |n| n > 0),
+        None => false,
+    }
 }
 
 /// Read and parse the client's first request line + Host, enough to route it.
