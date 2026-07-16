@@ -26,7 +26,11 @@ fn get_proxy_returns_best_and_report_dead_removes_it() {
     // get_proxy hands out the best (fastest) and puts it back, so the pool is unchanged.
     let info = handle_get_proxy(&pool, Scheme::Http, None).expect("a proxy");
     assert_eq!(info.proxy, "1.1.1.1:80", "fastest is best");
-    assert_eq!(handle_pool_status(&pool).total, 2, "get_proxy is non-consuming");
+    assert_eq!(
+        handle_pool_status(&pool).total,
+        2,
+        "get_proxy is non-consuming"
+    );
 
     // report_dead removes it, so the next get_proxy returns the slower one.
     assert!(handle_report_dead(&pool, "1.1.1.1:80"), "removed");

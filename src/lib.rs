@@ -29,10 +29,14 @@
 
 pub mod broker;
 pub mod checker;
+#[cfg(feature = "connector")]
+pub mod connector;
 pub mod error;
 #[cfg(feature = "geo")]
 pub mod geo;
 pub mod judge;
+#[cfg(all(feature = "mcp", feature = "server"))]
+pub mod mcp;
 pub mod negotiator;
 pub mod parse;
 #[cfg(feature = "persist")]
@@ -44,10 +48,6 @@ pub mod resolver;
 pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;
-#[cfg(feature = "connector")]
-pub mod connector;
-#[cfg(all(feature = "mcp", feature = "server"))]
-pub mod mcp;
 pub mod stats;
 pub mod types;
 pub mod utils;

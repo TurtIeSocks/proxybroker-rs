@@ -67,7 +67,11 @@ pub fn handle_get_proxy(pool: &Pool, scheme: Scheme, country: Option<&str>) -> O
     let proxy = pool.try_get(scheme, country)?;
     let info = ProxyInfo {
         proxy: proxy.addr(),
-        types: proxy.types().keys().map(|p| p.as_str().to_string()).collect(),
+        types: proxy
+            .types()
+            .keys()
+            .map(|p| p.as_str().to_string())
+            .collect(),
         avg_resp_time: proxy.avg_resp_time(),
         error_rate: proxy.error_rate(),
     };

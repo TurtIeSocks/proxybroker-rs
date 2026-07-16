@@ -1752,7 +1752,10 @@ mod tests {
     #[test]
     fn try_get_filters_by_country() {
         let pool = Pool::from_proxies(
-            vec![http_at("1.1.1.1", Some("US")), http_at("2.2.2.2", Some("GB"))],
+            vec![
+                http_at("1.1.1.1", Some("US")),
+                http_at("2.2.2.2", Some("GB")),
+            ],
             PoolConfig::default(),
         );
         let got = pool.try_get(Scheme::Http, Some("us")).expect("a US proxy"); // case-insensitive
@@ -1770,7 +1773,10 @@ mod tests {
             PoolConfig::default(),
         );
         assert_eq!(pool.proxies().len(), 2, "snapshot sees both");
-        assert!(pool.try_get(Scheme::Http, None).is_some(), "still checkoutable");
+        assert!(
+            pool.try_get(Scheme::Http, None).is_some(),
+            "still checkoutable"
+        );
         assert_eq!(pool.proxies().len(), 1, "checkout removed one");
     }
 }

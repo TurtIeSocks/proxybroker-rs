@@ -936,7 +936,10 @@ async fn mcp_cmd(broker: Broker, args: McpArgs) -> Result<(), Box<dyn std::error
     let stream = broker.find(b.build()).await?;
     let pool = Pool::spawn(stream, pool_config);
     // stderr only — stdout is the MCP JSON-RPC channel.
-    eprintln!("mcp: filling pool (limit {}); serving get_proxy/pool_status/report_dead over stdio", args.limit);
+    eprintln!(
+        "mcp: filling pool (limit {}); serving get_proxy/pool_status/report_dead over stdio",
+        args.limit
+    );
     proxybroker::mcp::serve_stdio(pool).await
 }
 

@@ -187,11 +187,11 @@ async fn dial(
     target: &Target,
     timeout: Duration,
 ) -> Result<Stream, ProxyError> {
-    let tcp = match tokio::time::timeout(timeout, TcpStream::connect((proxy.host, proxy.port))).await
-    {
-        Err(_) => return Err(ProxyError::Timeout),
-        Ok(Err(_)) => return Err(ProxyError::ConnFailed),
-        Ok(Ok(t)) => t,
-    };
+    let tcp =
+        match tokio::time::timeout(timeout, TcpStream::connect((proxy.host, proxy.port))).await {
+            Err(_) => return Err(ProxyError::Timeout),
+            Ok(Err(_)) => return Err(ProxyError::ConnFailed),
+            Ok(Ok(t)) => t,
+        };
     negotiate(proto, tcp, target, timeout, proxy.auth()).await
 }
