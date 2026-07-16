@@ -7,8 +7,9 @@
 //! lives in the checker/negotiator and is passed in. See `docs/systematic-refactor/map.md`
 //! (socket ownership) and `decisions.md`.
 
+use crate::checker::TrustReport;
 use crate::error::ProxyError;
-use crate::types::{AnonLevel, Proto, Scheme};
+use crate::types::{AnonLevel, Caps, Proto, Scheme};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -75,6 +76,21 @@ pub struct Proxy {
     /// Upstream proxy credentials (B8), for a paid/authenticated proxy. `None` for scraped
     /// candidates; set only via BYO/URL loading. Never serialized.
     auth: Option<Credentials>,
+    /// Capability profile (A4), OR-accumulated across confirmed protocols. Not serialized (stays
+    /// out of the parity JSON); exposed via [`Proxy::caps`]/[`Proxy::capabilities`] + CLI filters.
+    caps: Caps,
+    /// Honeypot/trust verdict (A6). Empty (trusted) unless `--trust-check` ran. Not serialized.
+    trust: TrustReport,
+}
+
+/// A proxy's full capability profile (A4): the recorded [`Caps`] plus CONNECT:25 support derived
+/// from the confirmed types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub cookie_echo: bool,
+    pub referer_echo: bool,
+    /// A confirmed SMTP (CONNECT:25) tunnel.
+    pub connect25: bool,
 }
 
 /// `HTTP`-family protocols — a proxy supporting any of these can serve plain HTTP.
@@ -91,6 +107,23 @@ fn round2(x: f64) -> f64 {
     format!("{x:.2}").parse().unwrap()
 }
 
+/// The `q`-quantile (`q` in `0.0..=1.0`) of `data` by linear interpolation between closest ranks
+/// (numpy "linear" / type-7), rounded to 2 dp. Empty → `0.0`. Does not require sorted input.
+///
+/// Linear (not nearest-rank) so `p50` is the true median: `percentile(&[1.0, 2.0], 0.5) == 1.5`.
+pub fn percentile(data: &[f64], q: f64) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = data.to_vec();
+    sorted.sort_by(f64::total_cmp); // the crate's tie-safe ordering (cf. `priority`)
+    let rank = q * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    round2(sorted[lo] + frac * (sorted[hi] - sorted[lo]))
+}
+
 impl Proxy {
     pub fn new(host: IpAddr, port: u16, expected_types: BTreeSet<Proto>) -> Self {
         Proxy {
@@ -103,6 +136,8 @@ impl Proxy {
             errors: HashMap::new(),
             runtimes: Vec::new(),
             auth: None,
+            caps: Caps::default(),
+            trust: TrustReport::default(),
         }
     }
 
@@ -149,6 +184,46 @@ impl Proxy {
         !self.types.is_empty()
     }
 
+    /// The recorded capability profile (A4), OR-accumulated across confirmed protocols.
+    pub fn caps(&self) -> Caps {
+        self.caps
+    }
+
+    /// Fold one working attempt's observed capabilities into the stored profile (OR): a proxy
+    /// keeps every capability it ever demonstrated, across protocols.
+    pub fn record_caps(&mut self, c: Caps) {
+        self.caps.cookie_echo |= c.cookie_echo;
+        self.caps.referer_echo |= c.referer_echo;
+    }
+
+    /// The full capability profile: the recorded [`Caps`] plus CONNECT:25 support, derived from
+    /// the confirmed types (a granted SMTP tunnel is already a confirmed `Connect25`).
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            cookie_echo: self.caps.cookie_echo,
+            referer_echo: self.caps.referer_echo,
+            connect25: self.types.contains_key(&Proto::Connect25),
+        }
+    }
+
+    /// The honeypot/trust verdict (A6). Empty (trusted) unless `--trust-check` assessed this proxy.
+    pub fn trust(&self) -> &TrustReport {
+        &self.trust
+    }
+
+    /// Fold a working attempt's trust verdict into the stored one (A6): signals **union** across
+    /// protocols (deduped), mirroring [`Proxy::record_caps`]. A plain overwrite would let a clean
+    /// later protocol — e.g. a CONNECT:25 tunnel, which is never assessed and always "trusted", and
+    /// is checked last — erase an earlier `InjectedHeader`, silently admitting a multi-protocol
+    /// honeypot past `--require-trusted`.
+    pub fn record_trust(&mut self, r: TrustReport) {
+        for s in r.signals {
+            if !self.trust.signals.contains(&s) {
+                self.trust.signals.push(s);
+            }
+        }
+    }
+
     /// Error rate in `0.0..=1.0`, rounded to 2 dp. `0.0` before any request. `proxy.py:error_rate`.
     pub fn error_rate(&self) -> f64 {
         if self.requests == 0 {
@@ -164,6 +239,11 @@ impl Proxy {
             return 0.0;
         }
         round2(self.runtimes.iter().sum::<f64>() / self.runtimes.len() as f64)
+    }
+
+    /// The `q`-quantile of this proxy's successful round-trip times, seconds, 2 dp. `0.0` if none.
+    pub fn percentile(&self, q: f64) -> f64 {
+        percentile(&self.runtimes, q)
     }
 
     /// Pool-ordering key `(error_rate, avg_resp_time)`, lower is better. `proxy.py:priority`.
@@ -365,6 +445,8 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             errors: HashMap::new(),
             runtimes: Vec::new(),
             auth: None, // secrets are never serialized, so never deserialized either
+            caps: Caps::default(), // capabilities are not serialized; re-measured on a fresh check
+            trust: TrustReport::default(), // trust is not serialized; re-assessed on a fresh check
         })
     }
 }
@@ -422,6 +504,85 @@ mod tests {
         assert_eq!(x.error_rate(), 0.0);
         assert_eq!(x.avg_resp_time(), 0.0);
         assert!(!x.is_working());
+    }
+
+    #[test]
+    fn record_caps_or_accumulates() {
+        let mut x = p();
+        x.record_caps(Caps {
+            cookie_echo: true,
+            referer_echo: false,
+        });
+        x.record_caps(Caps {
+            cookie_echo: false,
+            referer_echo: true,
+        });
+        // OR-fold: a proxy keeps every capability it ever demonstrated.
+        assert_eq!(
+            x.caps(),
+            Caps {
+                cookie_echo: true,
+                referer_echo: true
+            }
+        );
+    }
+
+    #[test]
+    fn capabilities_derives_connect25() {
+        let mut x = p();
+        assert!(!x.capabilities().connect25);
+        x.add_type(Proto::Connect25, None);
+        assert!(x.capabilities().connect25);
+    }
+
+    #[test]
+    fn record_trust_unions_across_protocols() {
+        use crate::checker::TrustSignal;
+        let mut x = p();
+        x.record_trust(TrustReport {
+            signals: vec![TrustSignal::InjectedHeader],
+        });
+        // A later clean protocol (e.g. CONNECT:25, always trusted, checked last) must NOT erase it.
+        x.record_trust(TrustReport::default());
+        assert!(!x.trust().trusted());
+        assert_eq!(x.trust().signals, vec![TrustSignal::InjectedHeader]);
+        // Deduped: re-recording the same signal does not accumulate.
+        x.record_trust(TrustReport {
+            signals: vec![TrustSignal::InjectedHeader],
+        });
+        assert_eq!(x.trust().signals.len(), 1);
+    }
+
+    #[test]
+    fn percentile_linear_interpolation() {
+        // numpy "linear" (type-7): rank = q*(n-1), interpolate between the bracketing ranks.
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.5), 2.5); // rank 1.5 → 2 + .5*(3-2)
+        assert_eq!(percentile(&[], 0.5), 0.0); // empty
+        assert_eq!(percentile(&[5.0], 0.9), 5.0); // single element
+                                                  // 1..=10, cross-checked against numpy.percentile(interpolation="linear"):
+                                                  //   p90 → rank 8.1 → 9 + .1*(10-9) = 9.1 ; p95 → rank 8.55 → 9 + .55 = 9.55
+        assert_eq!(
+            percentile(&(1..=10).map(f64::from).collect::<Vec<_>>(), 0.90),
+            9.1
+        );
+        assert_eq!(
+            percentile(&(1..=10).map(f64::from).collect::<Vec<_>>(), 0.95),
+            9.55
+        );
+        // Unsorted input must not matter.
+        assert_eq!(percentile(&[4.0, 1.0, 3.0, 2.0], 0.5), 2.5);
+    }
+
+    #[test]
+    fn proxy_percentile_uses_runtimes() {
+        let mut x = p();
+        for rt in [0.1, 0.2, 0.3, 0.4] {
+            x.record_attempt(Some(rt), None);
+        }
+        // A timeout carries a runtime but is excluded from the population (like avg_resp_time).
+        x.record_attempt(Some(9.9), Some(ProxyError::Timeout));
+        assert_eq!(x.percentile(0.5), 0.25); // median of [.1,.2,.3,.4]
+        assert_eq!(p().percentile(0.5), 0.0); // no runtimes → 0.0
     }
 
     #[test]

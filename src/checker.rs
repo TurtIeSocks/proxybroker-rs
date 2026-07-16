@@ -12,8 +12,9 @@ use crate::judge::{Judge, JudgePool};
 use crate::negotiator::{negotiate, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
-use crate::types::{AnonLevel, Proto, TypeSpec};
+use crate::types::{AnonLevel, Caps, JudgeScheme, Proto, TypeSpec};
 use crate::utils::{fresh_marker, get_all_ip, get_status_code, request_headers};
+use rand::Rng;
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -26,13 +27,57 @@ pub struct Checker {
     real_ext_ips: HashSet<IpAddr>,
     requested: Vec<TypeSpec>,
     timeout: Duration,
-    max_tries: usize,
     post: bool,
     strict: bool,
+    relaxed_validity: bool,
+    trust_check: bool,
     /// DNS blocklist zones; empty disables the check. Kept with the resolver so `check` can
     /// reject a listed proxy before doing any real work.
     dnsbl: Vec<String>,
     resolver: std::sync::Arc<Resolver>,
+    /// Judged (a verified judge pool) or Liveness (graceful degradation, A2).
+    mode: CheckMode,
+    retry: RetryPolicy,
+}
+
+/// How the checker validates a proxy: against a verified judge, or — when no judge came up and the
+/// caller supplied a liveness URL — by a plain fetch-through-the-proxy 200 check (A2).
+enum CheckMode {
+    Judged,
+    Liveness(LivenessTarget),
+}
+
+/// A resolved liveness endpoint: a plain URL the checker GETs through the proxy, expecting 200.
+struct LivenessTarget {
+    host: String,
+    path: String,
+    ip: IpAddr,
+    scheme: JudgeScheme,
+}
+
+impl LivenessTarget {
+    /// Parse + resolve a liveness URL. Reuses [`Judge::parse`] for scheme/host/path. `None` if the
+    /// URL is malformed, is an SMTP URL (liveness is an HTTP GET), or the host does not resolve.
+    async fn resolve(url: &str, resolver: &Resolver) -> Option<LivenessTarget> {
+        let judge = Judge::parse(url)?;
+        if judge.scheme == JudgeScheme::Smtp {
+            return None;
+        }
+        let ip = resolver.resolve(&judge.host).await.ok()?;
+        Some(LivenessTarget {
+            host: judge.host,
+            path: judge.path,
+            ip,
+            scheme: judge.scheme,
+        })
+    }
+}
+
+/// What a single [`Checker::attempt`] validates against — a judge (with anonymity classification)
+/// or a liveness target (200 = working, level `None`).
+enum Probe<'a> {
+    Judged(&'a Judge),
+    Liveness(&'a LivenessTarget),
 }
 
 impl std::fmt::Debug for Checker {
@@ -47,6 +92,82 @@ impl std::fmt::Debug for Checker {
     }
 }
 
+/// Which errors retry and how long to wait between attempts (A5). Replaces a bare `max_tries`.
+///
+/// The [`Default`] reproduces the historical behavior exactly: 3 attempts, retry **only**
+/// `Timeout`, no delay — so existing callers are unaffected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPolicy {
+    /// Total attempts per protocol (`>= 1`).
+    pub max_tries: usize,
+    /// Which per-proxy errors are retryable. Default: just `Timeout` (parity).
+    pub retry_on: HashSet<ProxyError>,
+    /// Base delay before the first retry. Zero = no delay (parity).
+    pub backoff: Duration,
+    /// Per-attempt multiplier on the delay (exponential). `1.0` = constant.
+    pub factor: f64,
+    /// Symmetric jitter fraction applied to each delay, `0.0..=1.0`.
+    pub jitter: f64,
+    /// Upper bound on any single delay. Zero = uncapped.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_tries: 3,
+            retry_on: HashSet::from([ProxyError::Timeout]),
+            backoff: Duration::ZERO,
+            factor: 1.0,
+            jitter: 0.0,
+            max_backoff: Duration::ZERO,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// `max_tries` attempts, otherwise the default policy (retry only `Timeout`, no delay).
+    pub fn tries(max_tries: usize) -> Self {
+        RetryPolicy {
+            max_tries,
+            ..Default::default()
+        }
+    }
+
+    /// Retry the transient set — `{Timeout, Reset, ConnFailed, EmptyRecv}` — for `max_tries`.
+    pub fn transient(max_tries: usize) -> Self {
+        RetryPolicy {
+            max_tries,
+            retry_on: HashSet::from([
+                ProxyError::Timeout,
+                ProxyError::Reset,
+                ProxyError::ConnFailed,
+                ProxyError::EmptyRecv,
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// The delay before retry number `i` (0-based): `backoff * factor^i`, then symmetric jitter of
+    /// `±jitter` fraction, then clamped to `max_backoff`. The cap is applied **last** so it is a
+    /// hard upper bound on any single delay even with jitter. Zero base → zero (no wall-clock sleep
+    /// on the parity path).
+    pub fn backoff_for(&self, i: usize) -> Duration {
+        if self.backoff.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut d = self.backoff.as_secs_f64() * self.factor.powi(i as i32);
+        if self.jitter > 0.0 {
+            let r: f64 = rand::rng().random_range(-1.0..=1.0);
+            d *= 1.0 + self.jitter * r;
+        }
+        if !self.max_backoff.is_zero() {
+            d = d.min(self.max_backoff.as_secs_f64());
+        }
+        Duration::from_secs_f64(d.max(0.0))
+    }
+}
+
 /// Configuration for [`Checker::new`].
 #[derive(Debug, Clone, Default)]
 pub struct CheckerConfig {
@@ -55,13 +176,24 @@ pub struct CheckerConfig {
     /// Protocols (and optional anonymity levels) to check. Required — empty is an error.
     pub types: Vec<TypeSpec>,
     pub timeout: Duration,
-    pub max_tries: usize,
+    /// Retry policy: attempt count, which errors retry, and the backoff schedule (A5).
+    pub retry: RetryPolicy,
     /// Use `POST` instead of `GET` for the test request.
     pub post: bool,
     /// Require the proxy's anonymity level to match exactly (`--strict`).
     pub strict: bool,
+    /// Relax response validity to marker + IP only, demoting Referer/Cookie from validity gates to
+    /// recorded capability signals (A4). Default `false` = parity (all four required).
+    pub relaxed_validity: bool,
+    /// Run honeypot detection on each proxy and record the trust verdict (A6). Default `false` =
+    /// no assessment, zero cost.
+    pub trust_check: bool,
     /// DNS blocklist zones (`--dnsbl`); a proxy whose IP is listed in any zone is rejected.
     pub dnsbl: Vec<String>,
+    /// When the judge pool is empty, fall back to a plain liveness check against this URL instead
+    /// of failing with `NoJudges`. `None` keeps the strict judge-required behavior. Proxies
+    /// confirmed this way carry anonymity level `None` (unclassifiable without a judge).
+    pub liveness_url: Option<String>,
 }
 
 impl Checker {
@@ -85,19 +217,33 @@ impl Checker {
         let candidates: Vec<Judge> = urls.iter().filter_map(|u| Judge::parse(u)).collect();
         let judges =
             JudgePool::probe_all(candidates, &resolver, client, &real_ext_ips, cfg.timeout).await;
-        if judges.is_empty() {
-            return Err(Error::NoJudges);
-        }
+        // No judge came up: fail as before, unless a liveness URL enables graceful degradation
+        // (A2). A malformed/unresolvable liveness URL still errors — there is nothing to check.
+        let mode = if judges.is_empty() {
+            match &cfg.liveness_url {
+                Some(url) => CheckMode::Liveness(
+                    LivenessTarget::resolve(url, &resolver)
+                        .await
+                        .ok_or(Error::NoJudges)?,
+                ),
+                None => return Err(Error::NoJudges),
+            }
+        } else {
+            CheckMode::Judged
+        };
         Ok(Checker {
             judges,
             real_ext_ips,
             requested: cfg.types,
             timeout: cfg.timeout,
-            max_tries: cfg.max_tries,
+            retry: cfg.retry,
             post: cfg.post,
             strict: cfg.strict,
+            relaxed_validity: cfg.relaxed_validity,
+            trust_check: cfg.trust_check,
             dnsbl: cfg.dnsbl,
             resolver,
+            mode,
         })
     }
 
@@ -157,21 +303,40 @@ impl Checker {
     /// a timeout retries (`continue`), any other proxy error stops (`break`).
     async fn check_one(&self, proxy: &mut Proxy, proto: Proto) -> bool {
         let scheme = proto.judge_scheme();
-        let Some(judge) = self.judges.random(scheme) else {
-            return false; // no judge for this scheme
-        };
-        let target = Target {
-            host: judge.host.clone(),
-            ip: judge.ip,
-            port: scheme.default_port(),
+        // Resolve the probe + target for this protocol. Judged mode routes to a random judge for
+        // the scheme; Liveness mode always probes the single liveness endpoint.
+        let judge; // holds the Arc alive across the retry loop in Judged mode
+        let (probe, target) = match &self.mode {
+            CheckMode::Judged => {
+                let Some(j) = self.judges.random(scheme) else {
+                    return false; // no judge for this scheme
+                };
+                judge = j;
+                let target = Target {
+                    host: judge.host.clone(),
+                    ip: judge.ip,
+                    port: scheme.default_port(),
+                };
+                (Probe::Judged(&judge), target)
+            }
+            CheckMode::Liveness(lt) => {
+                let target = Target {
+                    host: lt.host.clone(),
+                    ip: Some(lt.ip),
+                    port: lt.scheme.default_port(),
+                };
+                (Probe::Liveness(lt), target)
+            }
         };
 
-        for _ in 0..self.max_tries {
+        for i in 0..self.retry.max_tries {
             let start = Instant::now();
-            match self.attempt(proxy, proto, &judge, &target).await {
-                Ok(Attempt::Working(level)) => {
+            match self.attempt(proxy, proto, &probe, &target).await {
+                Ok(Attempt::Working(obs)) => {
                     proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
-                    proxy.add_type(proto, level);
+                    proxy.add_type(proto, obs.level);
+                    proxy.record_caps(obs.caps);
+                    proxy.record_trust(obs.trust);
                     return true;
                 }
                 Ok(Attempt::Invalid) => {
@@ -180,13 +345,16 @@ impl Checker {
                     proxy.record_attempt(None, Some(ProxyError::BadResponse));
                     return false;
                 }
-                Err(ProxyError::Timeout) => {
-                    proxy.record_attempt(None, Some(ProxyError::Timeout));
-                    continue; // retry with a fresh connection
-                }
                 Err(e) => {
                     proxy.record_attempt(None, Some(e));
-                    return false; // break
+                    // Retry only errors the policy marks retryable, and only if attempts remain.
+                    // Default policy = {Timeout}, zero backoff → the historical timeout-only,
+                    // no-delay retry, exactly.
+                    if self.retry.retry_on.contains(&e) && i + 1 < self.retry.max_tries {
+                        tokio::time::sleep(self.retry.backoff_for(i)).await;
+                        continue;
+                    }
+                    return false;
                 }
             }
         }
@@ -199,7 +367,7 @@ impl Checker {
         &self,
         proxy: &Proxy,
         proto: Proto,
-        judge: &Judge,
+        probe: &Probe<'_>,
         target: &Target,
     ) -> Result<Attempt, ProxyError> {
         let tcp = tokio::time::timeout(self.timeout, TcpStream::connect((proxy.host, proxy.port)))
@@ -213,10 +381,18 @@ impl Checker {
 
         // CONNECT:25 has no test request — a granted tunnel is the whole check.
         if proto == Proto::Connect25 {
-            return Ok(Attempt::Working(None));
+            return Ok(Attempt::Working(Observation::default()));
         }
 
-        let (request, marker) = self.build_request(judge, proto);
+        // Build + send the request; the connect/negotiate/send/read/status handling is identical
+        // for both modes — only what we assert about the 200 response differs.
+        let (request, marker) = match probe {
+            Probe::Judged(judge) => {
+                let (req, marker) = self.build_request(judge, proto);
+                (req, Some(marker))
+            }
+            Probe::Liveness(lt) => (self.build_liveness_request(lt, proto), None),
+        };
         tokio::time::timeout(self.timeout, stream.write_all(&request))
             .await
             .map_err(|_| ProxyError::Timeout)?
@@ -227,17 +403,60 @@ impl Checker {
         if get_status_code(head, 9, 12) != 200 {
             return Err(ProxyError::BadStatus);
         }
-        let content = decompress(head, body);
 
-        if !response_is_valid(&content, &marker) {
-            return Ok(Attempt::Invalid);
+        match probe {
+            // Liveness: a 200 through the proxy is the whole check; there is no judge to reflect
+            // markers/IPs, so anonymity is unclassifiable → level None, no capability profile.
+            Probe::Liveness(_) => Ok(Attempt::Working(Observation::default())),
+            Probe::Judged(judge) => {
+                let content = decompress(head, body);
+                let marker = marker.expect("judged mode always builds a marker");
+                let caps = caps_from_content(&content);
+                // Default (strict): Referer + Cookie are validity gates (parity). Relaxed: only
+                // marker + a non-empty IP set are required, and the echo flags become recorded
+                // capability signals that can vary per proxy (A4).
+                let valid = if self.relaxed_validity {
+                    content.contains(&marker) && !get_all_ip(&content).is_empty()
+                } else {
+                    response_is_valid(&content, &marker)
+                };
+                if !valid {
+                    return Ok(Attempt::Invalid);
+                }
+                let level = if proto.checks_anon_level() {
+                    Some(self.anonymity_level(&content, judge))
+                } else {
+                    None
+                };
+                // Honeypot verdict (A6): only when opted in — the marker doubles as the canary.
+                let trust = if self.trust_check {
+                    TrustReport::assess(&sent_header_names(), &marker, &content)
+                } else {
+                    TrustReport::default()
+                };
+                Ok(Attempt::Working(Observation { level, caps, trust }))
+            }
         }
-        let level = if proto.checks_anon_level() {
-            Some(self.anonymity_level(&content, judge))
+    }
+
+    /// A plain `GET` for the liveness endpoint (A2), routed like the test request: absolute-form
+    /// for plain HTTP (it goes to the proxy), origin-form when tunnelled. No marker/cookie/referer
+    /// — there is no judge to reflect them; only the 200 matters.
+    fn build_liveness_request(&self, lt: &LivenessTarget, proto: Proto) -> Vec<u8> {
+        let mut hdrs = request_headers(None);
+        hdrs.insert("Host", lt.host.clone());
+        hdrs.insert("Connection", "close".to_owned());
+        let path = if proto.uses_full_path() {
+            format!("http://{}{}", lt.host, lt.path)
         } else {
-            None
+            lt.path.clone()
         };
-        Ok(Attempt::Working(level))
+        let headers: String = hdrs
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        format!("GET {path} HTTP/1.1\r\n{headers}\r\n\r\n").into_bytes()
     }
 
     /// Build the test request. HTTP uses an absolute-form request URI (it goes to the proxy,
@@ -325,10 +544,108 @@ impl Checker {
 
 /// Outcome of one connection attempt.
 enum Attempt {
-    /// The proxy works for this protocol; carries the anonymity level (HTTP only).
-    Working(Option<AnonLevel>),
+    /// The proxy works for this protocol; carries the classification [`Observation`].
+    Working(Observation),
     /// Connected and responded, but the response failed validation.
     Invalid,
+}
+
+/// What a working attempt observed about the proxy: its anonymity level (HTTP only), the
+/// capability profile (A4), and the trust verdict (A6).
+#[derive(Debug, Default)]
+struct Observation {
+    level: Option<AnonLevel>,
+    caps: Caps,
+    trust: TrustReport,
+}
+
+/// A specific way a proxy's judge round-trip looked hostile (A6). Reported individually — never a
+/// bare "untrusted" boolean — so the caller sees *which* signal fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSignal {
+    /// Our canary nonce did not survive the round-trip unmutated (content tampering).
+    CanaryMismatch,
+    /// The echoed request carried a header we never sent (injection).
+    InjectedHeader,
+    /// The HTTPS judge presented a certificate that did not match the pin (MITM). Reserved for the
+    /// optional cert-pin follow-up; the dependency-free core never emits it.
+    CertMismatch,
+}
+
+/// The honeypot/hostility verdict for a proxy (A6). Empty = trusted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustReport {
+    pub signals: Vec<TrustSignal>,
+}
+
+impl TrustReport {
+    /// No signal fired.
+    pub fn trusted(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    /// Assess a **decompressed** judge response against what we sent. Pure — the unit under test.
+    ///
+    /// - **Canary:** our nonce must appear verbatim (content tampering else).
+    /// - **Injected headers:** the echoed request (scanned as `Name: value` lines) must carry no
+    ///   header name outside the set we sent ∪ a benign-hop allowlist. `Via`/`X-Forwarded-For` are
+    ///   the *anonymity* signal, not trust, so they are allow-listed to avoid double-counting.
+    ///
+    /// The scan splits on `": "` (colon-space), so a URL value like `https://…` on its own line is
+    /// not mistaken for a header. It is a heuristic: opt-in, with documented false-positive guards.
+    ///
+    /// **Scope / limitations** (opt-in heuristic, honest about what it does *not* catch):
+    /// - The injected-header scan only works against judges that echo the **raw request headers**
+    ///   as `Name: value` lines. The bundled defaults do not: httpbin emits JSON (`"Name": "…"`,
+    ///   whose quoted key fails the name check) and azenv-style judges emit `HTTP_NAME = value`
+    ///   (no `": "`). So with the default judge pool this scan is inert (safe — no false positives,
+    ///   but no detection). For real injection detection, pass a raw-header-echo judge via
+    ///   `--judges`.
+    /// - On the standard check path `canary` is the validity marker, which validation already
+    ///   requires to be present — so `CanaryMismatch` cannot fire there. The signal exists for the
+    ///   pure-function contract (callers assessing content that did not pass validity).
+    pub fn assess(sent_header_names: &[&str], canary: &str, content: &str) -> TrustReport {
+        let mut signals = Vec::new();
+        if !content.contains(canary) {
+            signals.push(TrustSignal::CanaryMismatch);
+        }
+        const BENIGN: &[&str] = &[
+            "host",
+            "connection",
+            "content-length",
+            "x-forwarded-for",
+            "via",
+        ];
+        let sent: HashSet<String> = sent_header_names
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        for line in content.lines() {
+            let Some((name, _)) = line.split_once(": ") else {
+                continue;
+            };
+            let name = name.trim().to_ascii_lowercase();
+            // Only plausible header names (letters/digits/hyphen) — skips `REMOTE_ADDR = …` etc.
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                continue;
+            }
+            if !sent.contains(&name) && !BENIGN.contains(&name.as_str()) {
+                signals.push(TrustSignal::InjectedHeader);
+                break;
+            }
+        }
+        TrustReport { signals }
+    }
+}
+
+/// The header names the checker sends on the test request (A6 injected-header baseline): the
+/// constant request headers plus the three `build_request` adds.
+fn sent_header_names() -> Vec<&'static str> {
+    request_headers(None)
+        .keys()
+        .copied()
+        .chain(["Host", "Connection", "Content-Length"])
+        .collect()
 }
 
 /// Read the whole response. We send `Connection: close`, so the judge closes the connection
@@ -403,14 +720,25 @@ fn dnsbl_query(ip: IpAddr, zone: &str) -> Option<String> {
     }
 }
 
+/// The capability signals in a judge response (A4): whether the proxy forwarded our constant
+/// Referer and Cookie header values through. Shared with [`response_is_valid`] so the marker
+/// literals live in one place.
+fn caps_from_content(content: &str) -> Caps {
+    Caps {
+        cookie_echo: content.contains("cookie=ok"),
+        referer_echo: content.contains("https://www.google.com/"),
+    }
+}
+
 /// A valid judge response echoes our marker, at least one IP, and the constant Referer and
 /// Cookie header values — proving the proxy forwarded our request intact.
 /// `checker.py:_check_test_response`. Case-sensitive (Python does not lowercase here).
 fn response_is_valid(content: &str, marker: &str) -> bool {
+    let caps = caps_from_content(content);
     content.contains(marker)
         && !get_all_ip(content).is_empty()
-        && content.contains("https://www.google.com/") // Referer
-        && content.contains("cookie=ok") // Cookie
+        && caps.referer_echo
+        && caps.cookie_echo
 }
 
 #[cfg(test)]
@@ -448,5 +776,167 @@ mod tests {
         assert!(!response_is_valid(no_cookie, "5555"));
         // missing marker
         assert!(!response_is_valid(good, "9999"));
+    }
+
+    #[test]
+    fn caps_extracted_from_content() {
+        let both = "REMOTE_ADDR=1.2.3.4 cookie=ok Referer=https://www.google.com/";
+        assert_eq!(
+            caps_from_content(both),
+            Caps {
+                cookie_echo: true,
+                referer_echo: true
+            }
+        );
+        // drop the cookie echo
+        let no_cookie = "REMOTE_ADDR=1.2.3.4 Referer=https://www.google.com/";
+        assert_eq!(
+            caps_from_content(no_cookie),
+            Caps {
+                cookie_echo: false,
+                referer_echo: true
+            }
+        );
+        // neither
+        assert_eq!(caps_from_content("nothing here"), Caps::default());
+    }
+
+    #[test]
+    fn default_policy_retries_only_timeout() {
+        let p = RetryPolicy::default();
+        assert_eq!(p.max_tries, 3);
+        assert_eq!(p.retry_on, HashSet::from([ProxyError::Timeout]));
+        assert!(!p.retry_on.contains(&ProxyError::Reset));
+        assert!(p.backoff.is_zero());
+    }
+
+    #[test]
+    fn retry_policy_backoff_schedule() {
+        // Constant (factor 1.0): 100ms every attempt.
+        let c = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 1.0,
+            ..Default::default()
+        };
+        for i in 0..=2 {
+            assert_eq!(c.backoff_for(i).as_millis(), 100);
+        }
+        // Exponential (factor 2.0): 100 / 200 / 400.
+        let e = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(e.backoff_for(0).as_millis(), 100);
+        assert_eq!(e.backoff_for(1).as_millis(), 200);
+        assert_eq!(e.backoff_for(2).as_millis(), 400);
+        // max_backoff caps the delay.
+        let cap = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        };
+        assert_eq!(cap.backoff_for(2).as_millis(), 250);
+        // jitter 0.5 keeps each delay within [0.5x, 1.5x].
+        let j = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            jitter: 0.5,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            let ms = j.backoff_for(0).as_secs_f64() * 1000.0;
+            assert!((50.0..=150.0).contains(&ms), "jitter out of band: {ms}ms");
+        }
+        // max_backoff is a HARD ceiling even with jitter (clamp applied last).
+        let capped_jitter = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            jitter: 0.5,
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        };
+        for i in 0..=4 {
+            for _ in 0..32 {
+                assert!(
+                    capped_jitter.backoff_for(i) <= Duration::from_millis(250),
+                    "backoff exceeded the cap at i={i}"
+                );
+            }
+        }
+        // Zero base → zero: the parity path never sleeps.
+        assert_eq!(RetryPolicy::default().backoff_for(0), Duration::ZERO);
+    }
+
+    // The header names the checker sends (the injected-header baseline).
+    const SENT: &[&str] = &[
+        "User-Agent",
+        "Accept",
+        "Accept-Encoding",
+        "Pragma",
+        "Cache-control",
+        "Cookie",
+        "Referer",
+        "Host",
+        "Connection",
+        "Content-Length",
+    ];
+
+    #[test]
+    fn sent_header_names_matches_the_request() {
+        // The baseline must equal what build_request actually sends, or the scan false-positives.
+        let mut got = sent_header_names();
+        got.sort_unstable();
+        let mut want = SENT.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn trust_clean_response_is_trusted() {
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Cookie: cookie=ok\n\
+             Referer: https://www.google.com/\n\
+             Host: judge.example\n\
+             REMOTE_ADDR = 8.8.8.8\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
+    }
+
+    #[test]
+    fn trust_injected_header_is_flagged() {
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Cookie: cookie=ok\n\
+             X-Ad-Inject: buy now\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert_eq!(r.signals, vec![TrustSignal::InjectedHeader]);
+    }
+
+    #[test]
+    fn trust_canary_mutation_is_flagged() {
+        let content = "User-Agent: PxBroker/0.1/MUTATED\n\
+             Cookie: cookie=ok\n\
+             Host: judge.example\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert_eq!(r.signals, vec![TrustSignal::CanaryMismatch]);
+    }
+
+    #[test]
+    fn trust_forwarded_via_headers_are_not_injection() {
+        // Via / X-Forwarded-For are the anonymity signal, allow-listed so they don't double-count.
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Via: 1.1 someproxy\n\
+             X-Forwarded-For: 8.8.8.8\n\
+             Host: judge.example\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
+    }
+
+    #[test]
+    fn trust_url_value_on_its_own_is_not_a_header() {
+        // A bare URL must not be parsed as a `https:` header (the `": "` split guards this).
+        let content = "User-Agent: PxBroker/0.1/CANARY42\nhttps://www.google.com/\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
     }
 }

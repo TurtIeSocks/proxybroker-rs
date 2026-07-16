@@ -19,7 +19,7 @@
 //! A [`CancellationToken`] fired when the consumer drops the stream aborts in-flight checks —
 //! not a detached-task leak (critique #14).
 
-use crate::checker::{Checker, CheckerConfig};
+use crate::checker::{Checker, CheckerConfig, RetryPolicy};
 use crate::provider::{fetch, ProviderSpec};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
@@ -76,12 +76,27 @@ pub struct FindQuery {
     pub timeout: Duration,
     /// Max concurrent checks in flight. `api.py:max_conn`.
     pub max_conn: usize,
-    /// Attempts per protocol before giving up. `api.py:max_tries`.
-    pub max_tries: usize,
+    /// Retry policy: attempts per protocol, which errors retry, and the backoff schedule (A5).
+    pub retry: RetryPolicy,
     /// Use `POST` for the test request.
     pub post: bool,
     /// Require the anonymity level to match exactly.
     pub strict: bool,
+    /// Fallback liveness URL: when no judge verifies, validate proxies with a 200 from this URL
+    /// instead of failing. `None` keeps strict judge-required behavior (A2).
+    pub liveness_url: Option<String>,
+    /// Relax validity to marker+IP, recording Referer/Cookie as capabilities instead (A4).
+    pub relaxed_validity: bool,
+    /// Keep only proxies that forwarded our Cookie header through (A4).
+    pub require_cookie: bool,
+    /// Keep only proxies that forwarded our Referer header through (A4).
+    pub require_referer: bool,
+    /// Keep only proxies with a confirmed CONNECT:25 (SMTP) tunnel (A4).
+    pub require_connect25: bool,
+    /// Run honeypot detection and record the verdict (A6).
+    pub trust_check: bool,
+    /// Keep only proxies with a clean trust verdict (implies `trust_check`) (A6).
+    pub require_trusted: bool,
 }
 
 impl Default for FindQuery {
@@ -94,9 +109,16 @@ impl Default for FindQuery {
             dnsbl: Vec::new(),
             timeout: Duration::from_secs(8),
             max_conn: 200,
-            max_tries: 3,
+            retry: RetryPolicy::default(),
             post: false,
             strict: false,
+            liveness_url: None,
+            relaxed_validity: false,
+            require_cookie: false,
+            require_referer: false,
+            require_connect25: false,
+            trust_check: false,
+            require_trusted: false,
         }
     }
 }
@@ -121,8 +143,10 @@ pub struct FindQueryBuilder {
     timeout: Option<Duration>,
     max_conn: Option<usize>,
     max_tries: Option<usize>,
+    retry: Option<RetryPolicy>,
     post: Option<bool>,
     strict: Option<bool>,
+    liveness_url: Option<String>,
 }
 
 impl FindQueryBuilder {
@@ -169,9 +193,16 @@ impl FindQueryBuilder {
         self
     }
 
-    /// Attempts per protocol before giving up.
+    /// Attempts per protocol before giving up. Overrides just the count on the retry policy.
     pub fn max_tries(mut self, max_tries: usize) -> Self {
         self.max_tries = Some(max_tries);
+        self
+    }
+
+    /// The full retry policy (which errors retry + backoff schedule, A5). `max_tries`, if also
+    /// set, overrides this policy's attempt count.
+    pub fn retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = Some(retry);
         self
     }
 
@@ -184,6 +215,12 @@ impl FindQueryBuilder {
     /// Require the anonymity level to match exactly.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = Some(strict);
+        self
+    }
+
+    /// Fallback liveness URL for graceful degradation when no judge verifies (A2).
+    pub fn liveness_url(mut self, url: Option<String>) -> Self {
+        self.liveness_url = url;
         self
     }
 
@@ -200,9 +237,24 @@ impl FindQueryBuilder {
             dnsbl: self.dnsbl.unwrap_or(d.dnsbl),
             timeout: self.timeout.unwrap_or(d.timeout),
             max_conn: self.max_conn.unwrap_or(d.max_conn),
-            max_tries: self.max_tries.unwrap_or(d.max_tries),
+            retry: {
+                // `.retry(policy)` sets the whole policy; `.max_tries(n)` overrides just the count.
+                let mut r = self.retry.unwrap_or(d.retry);
+                if let Some(mt) = self.max_tries {
+                    r.max_tries = mt;
+                }
+                r
+            },
             post: self.post.unwrap_or(d.post),
             strict: self.strict.unwrap_or(d.strict),
+            liveness_url: self.liveness_url.or(d.liveness_url),
+            // A4/A6 flags have no builder setter (callers set the pub fields directly).
+            relaxed_validity: d.relaxed_validity,
+            require_cookie: d.require_cookie,
+            require_referer: d.require_referer,
+            require_connect25: d.require_connect25,
+            trust_check: d.trust_check,
+            require_trusted: d.require_trusted,
         }
     }
 }
@@ -334,6 +386,7 @@ impl Broker {
         let task_stats = stats.clone();
         let countries = uppercase_set(query.countries.clone());
         let (max_conn, limit) = (query.max_conn, query.limit);
+        let caps = CapsFilter::from_query(&query);
         tokio::spawn(async move {
             // Attach geo + apply the country filter before checking, mirroring find's source.
             let source = proxies.filter_map(move |mut proxy| {
@@ -346,6 +399,7 @@ impl Broker {
                 checker,
                 max_conn,
                 limit,
+                caps,
                 tx,
                 task_cancel,
                 task_stats,
@@ -373,10 +427,14 @@ impl Broker {
                 judges: query.judges.clone(),
                 types: query.types.clone(),
                 timeout: query.timeout,
-                max_tries: query.max_tries,
+                retry: query.retry.clone(),
                 post: query.post,
                 strict: query.strict,
+                relaxed_validity: query.relaxed_validity,
+                // --require-trusted implies running the check.
+                trust_check: query.trust_check || query.require_trusted,
                 dnsbl: query.dnsbl.clone(),
+                liveness_url: query.liveness_url.clone(),
             },
             resolver,
             &self.client,
@@ -427,6 +485,7 @@ impl Broker {
             checker,
             query.max_conn,
             query.limit,
+            CapsFilter::from_query(&query),
             tx,
             cancel,
             stats,
@@ -476,11 +535,15 @@ fn uppercase_set(countries: Option<Vec<String>>) -> Option<BTreeSet<String>> {
 /// cap, a [`TaskTracker`] wait-group drained before the stream ends, atomic limit accounting,
 /// per-check `stats.record`, and cancel-on-drop. Source-agnostic — `find` feeds provider
 /// candidates, `check` feeds user input.
+// Internal check driver: all eight parameters are distinct run state (source, checker, flow
+// control, filter, and the tx/cancel/stats plumbing). Bundling them would only add indirection.
+#[allow(clippy::too_many_arguments)]
 async fn check_stream<S>(
     source: S,
     checker: Arc<Checker>,
     max_conn: usize,
     limit: Option<usize>,
+    caps: CapsFilter,
     tx: mpsc::Sender<Proxy>,
     cancel: CancellationToken,
     stats: Arc<std::sync::Mutex<StatsCollector>>,
@@ -514,7 +577,9 @@ async fn check_stream<S>(
                     // Record EVERY checked proxy (working or not) before it is sent or dropped,
                     // so the stats reflect the whole checked set (review F4).
                     stats.lock().unwrap().record(&proxy);
-                    if working {
+                    // A working proxy is still dropped if it fails the capability filter (A4);
+                    // it stays counted in stats (it *is* working), it just isn't emitted.
+                    if working && caps.passes(&proxy) {
                         // Reserve a slot atomically; emit only if under the limit.
                         let n = sent.fetch_add(1, Ordering::SeqCst);
                         match limit {
@@ -535,6 +600,35 @@ async fn check_stream<S>(
     // Wait-group: drain every spawned check before dropping tx and ending the stream.
     tracker.close();
     tracker.wait().await;
+}
+
+/// The post-check capability filter (A4): a working proxy is kept only if it satisfies every
+/// requested capability. All-false (the default) is a no-op.
+#[derive(Clone, Copy, Default)]
+struct CapsFilter {
+    cookie: bool,
+    referer: bool,
+    connect25: bool,
+    trusted: bool,
+}
+
+impl CapsFilter {
+    fn from_query(q: &FindQuery) -> Self {
+        CapsFilter {
+            cookie: q.require_cookie,
+            referer: q.require_referer,
+            connect25: q.require_connect25,
+            trusted: q.require_trusted,
+        }
+    }
+
+    fn passes(&self, p: &Proxy) -> bool {
+        let c = p.capabilities();
+        (!self.cookie || c.cookie_echo)
+            && (!self.referer || c.referer_echo)
+            && (!self.connect25 || c.connect25)
+            && (!self.trusted || p.trust().trusted())
+    }
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
@@ -713,9 +807,16 @@ mod tests {
                 dnsbl: vec!["zen.example.org".into()],
                 timeout: Duration::from_secs(3),
                 max_conn: 7,
-                max_tries: 2,
+                retry: RetryPolicy::tries(2),
                 post: true,
                 strict: true,
+                liveness_url: None,
+                relaxed_validity: false,
+                require_cookie: false,
+                require_referer: false,
+                require_connect25: false,
+                trust_check: false,
+                require_trusted: false,
             }
         );
     }

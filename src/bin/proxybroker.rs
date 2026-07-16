@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use proxybroker::broker::{Broker, FindQuery, GrabQuery};
 use proxybroker::types::{AnonLevel, ParseProtoError, Proto, TypeSpec};
-use proxybroker::Proxy;
+use proxybroker::{Proxy, ProxyError, RetryPolicy};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -264,6 +265,47 @@ struct FindArgs {
     #[arg(long)]
     strict: bool,
 
+    /// Fallback endpoint to probe when no judge verifies. Enables graceful degradation; proxies
+    /// confirmed via liveness report anonymity "None" (so combining it with --lvl yields nothing).
+    #[arg(long, value_name = "URL")]
+    liveness_url: Option<String>,
+
+    /// Which errors trigger a retry: timeout (default), transient, or all.
+    #[arg(long, value_enum, default_value_t = RetryOn::Timeout)]
+    retry_on: RetryOn,
+
+    /// Base backoff before a retry, in milliseconds (0 = no delay).
+    #[arg(long, default_value_t = 0)]
+    backoff_ms: u64,
+
+    /// Accept proxies that forward the request (marker+IP) even if they strip Referer/Cookie,
+    /// recording what they pass through as capabilities.
+    #[arg(long)]
+    relaxed_validity: bool,
+
+    /// Keep only proxies that pass our Cookie header through (implies richer signal under
+    /// --relaxed-validity).
+    #[arg(long)]
+    require_cookie: bool,
+
+    /// Keep only proxies that pass our Referer header through.
+    #[arg(long)]
+    require_referer: bool,
+
+    /// Keep only proxies with a confirmed CONNECT:25 (SMTP) tunnel.
+    #[arg(long)]
+    require_connect25: bool,
+
+    /// Run honeypot detection on each proxy and record the verdict. The injected-header scan needs
+    /// a judge that echoes raw request headers (Name: value); the bundled judges do not, so pair it
+    /// with a raw-header-echo judge via --judges for real detection.
+    #[arg(long)]
+    trust_check: bool,
+
+    /// Keep only proxies whose trust verdict is clean (implies --trust-check).
+    #[arg(long)]
+    require_trusted: bool,
+
     /// Print an aggregate summary (by protocol/anonymity/country) to stderr when done.
     #[arg(long)]
     show_stats: bool,
@@ -375,6 +417,39 @@ struct CheckArgs {
     /// of --format/--outfile.
     #[arg(long, value_name = "PATH")]
     save: Option<PathBuf>,
+}
+
+/// Which errors `--retry-on` retries (A5). `factor`/`jitter`/`max_backoff` stay library-only.
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum RetryOn {
+    /// Retry only `Timeout` (parity default).
+    #[default]
+    Timeout,
+    /// Retry the transient set: `Timeout`, `Reset`, `ConnFailed`, `EmptyRecv`.
+    Transient,
+    /// Retry every transient check-path error (adds `BadStatus`).
+    All,
+}
+
+/// Assemble a [`RetryPolicy`] from the CLI knobs.
+fn retry_policy(max_tries: usize, on: RetryOn, backoff_ms: u64) -> RetryPolicy {
+    let mut p = match on {
+        RetryOn::Timeout => RetryPolicy::tries(max_tries),
+        RetryOn::Transient => RetryPolicy::transient(max_tries),
+        RetryOn::All => RetryPolicy {
+            max_tries,
+            retry_on: HashSet::from([
+                ProxyError::Timeout,
+                ProxyError::Reset,
+                ProxyError::ConnFailed,
+                ProxyError::EmptyRecv,
+                ProxyError::BadStatus,
+            ]),
+            ..Default::default()
+        },
+    };
+    p.backoff = Duration::from_millis(backoff_ms);
+    p
 }
 
 /// Format for the `--show-stats` summary (which always goes to stderr, orthogonal to `--format`).
@@ -720,13 +795,21 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         .dnsbl(args.dnsbl)
         .timeout(Duration::from_secs(args.timeout))
         .max_conn(args.max_conn)
-        .max_tries(args.max_tries)
+        .retry(retry_policy(args.max_tries, args.retry_on, args.backoff_ms))
         .post(args.post)
-        .strict(args.strict);
+        .strict(args.strict)
+        .liveness_url(args.liveness_url);
     if !args.countries.is_empty() {
         builder = builder.countries(args.countries);
     }
-    let query = builder.build();
+    let mut query = builder.build();
+    // A4 capability flags (pub fields; no builder setter needed).
+    query.relaxed_validity = args.relaxed_validity;
+    query.require_cookie = args.require_cookie;
+    query.require_referer = args.require_referer;
+    query.require_connect25 = args.require_connect25;
+    query.trust_check = args.trust_check;
+    query.require_trusted = args.require_trusted;
 
     let mut stream = broker.find(query).await?;
     write_stream(
@@ -807,9 +890,16 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         dnsbl: args.dnsbl,
         timeout: Duration::from_secs(args.timeout),
         max_conn: args.max_conn,
-        max_tries: args.max_tries,
+        retry: RetryPolicy::tries(args.max_tries),
         post: args.post,
         strict: args.strict,
+        liveness_url: None, // --liveness-url is a find-only flag; check works from an explicit list
+        relaxed_validity: false, // A4/A6 flags are find-only for now
+        require_cookie: false,
+        require_referer: false,
+        require_connect25: false,
+        trust_check: false,
+        require_trusted: false,
     };
 
     let mut stream = broker
