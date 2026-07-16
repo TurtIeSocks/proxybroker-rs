@@ -148,6 +148,10 @@ struct FindArgs {
     #[arg(long, num_args = 1.., value_name = "URL")]
     judges: Vec<String>,
 
+    /// DNS blocklist zones; reject proxies listed in any (e.g. zen.spamhaus.org).
+    #[arg(long, num_args = 1.., value_name = "ZONE")]
+    dnsbl: Vec<String>,
+
     /// Per-request timeout in seconds.
     #[arg(long, default_value_t = 8)]
     timeout: u64,
@@ -325,6 +329,7 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         countries: (!args.countries.is_empty()).then_some(args.countries),
         limit: (args.limit > 0).then_some(args.limit),
         judges: args.judges,
+        dnsbl: args.dnsbl,
         timeout: Duration::from_secs(args.timeout),
         max_conn: args.max_conn,
         max_tries: args.max_tries,

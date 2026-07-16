@@ -21,7 +21,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Everything needed to run checks against one proxy.
-#[derive(Debug)]
 pub struct Checker {
     judges: JudgePool,
     real_ext_ips: HashSet<IpAddr>,
@@ -30,10 +29,26 @@ pub struct Checker {
     max_tries: usize,
     post: bool,
     strict: bool,
+    /// DNS blocklist zones; empty disables the check. Kept with the resolver so `check` can
+    /// reject a listed proxy before doing any real work.
+    dnsbl: Vec<String>,
+    resolver: std::sync::Arc<Resolver>,
+}
+
+impl std::fmt::Debug for Checker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Resolver holds a hickory resolver that is not Debug; summarize instead.
+        f.debug_struct("Checker")
+            .field("judges", &self.judges.counts())
+            .field("requested", &self.requested)
+            .field("strict", &self.strict)
+            .field("dnsbl", &self.dnsbl)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Configuration for [`Checker::new`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CheckerConfig {
     /// Judge URLs to probe. Empty → the bundled defaults.
     pub judges: Vec<String>,
@@ -45,6 +60,8 @@ pub struct CheckerConfig {
     pub post: bool,
     /// Require the proxy's anonymity level to match exactly (`--strict`).
     pub strict: bool,
+    /// DNS blocklist zones (`--dnsbl`); a proxy whose IP is listed in any zone is rejected.
+    pub dnsbl: Vec<String>,
 }
 
 impl Checker {
@@ -53,7 +70,7 @@ impl Checker {
     /// - [`Error::NoJudges`] if no judge verifies (`checker.py:137`).
     pub async fn new(
         cfg: CheckerConfig,
-        resolver: &Resolver,
+        resolver: std::sync::Arc<Resolver>,
         client: &reqwest::Client,
         real_ext_ips: HashSet<IpAddr>,
     ) -> Result<Checker, Error> {
@@ -67,7 +84,7 @@ impl Checker {
         };
         let candidates: Vec<Judge> = urls.iter().filter_map(|u| Judge::parse(u)).collect();
         let judges =
-            JudgePool::probe_all(candidates, resolver, client, &real_ext_ips, cfg.timeout).await;
+            JudgePool::probe_all(candidates, &resolver, client, &real_ext_ips, cfg.timeout).await;
         if judges.is_empty() {
             return Err(Error::NoJudges);
         }
@@ -79,12 +96,21 @@ impl Checker {
             max_tries: cfg.max_tries,
             post: cfg.post,
             strict: cfg.strict,
+            dnsbl: cfg.dnsbl,
+            resolver,
         })
     }
 
     /// Check a proxy across the protocols it is expected to support (intersected with the
     /// requested set), record its working types, and return whether it passes. `checker.py:check`.
     pub async fn check(&self, proxy: &mut Proxy) -> bool {
+        // A proxy listed in a configured DNS blocklist is rejected before any real work
+        // (`checker.py:167` runs this first).
+        if !self.dnsbl.is_empty() && self.in_dnsbl(proxy.host).await {
+            tracing::debug!(addr = %proxy.addr(), "rejected: found in DNSBL");
+            return false;
+        }
+
         let requested: HashSet<Proto> = self.requested.iter().map(|t| t.proto).collect();
 
         // ngtrs = expected ∩ requested, iterated in Proto::ALL order (never HashMap order,
@@ -106,6 +132,25 @@ impl Checker {
         }
 
         any && self.types_passed(proxy)
+    }
+
+    /// Is the proxy's IP listed in any configured DNS blocklist? Mirrors `checker.py:_in_DNSBL`:
+    /// reverse the address, prepend it to each zone, and if ANY such name resolves, the IP is
+    /// listed. Queries run concurrently. IPv6 is not checked (see [`dnsbl_query`]).
+    async fn in_dnsbl(&self, host: IpAddr) -> bool {
+        let queries: Vec<String> = self
+            .dnsbl
+            .iter()
+            .filter_map(|zone| dnsbl_query(host, zone))
+            .collect();
+        if queries.is_empty() {
+            return false;
+        }
+        let probes = queries.iter().map(|q| self.resolver.resolve(q));
+        futures_util::future::join_all(probes)
+            .await
+            .iter()
+            .any(|r| r.is_ok())
     }
 
     /// Check one protocol, retrying on timeout up to `max_tries`. Mirrors `checker.py:_check`:
@@ -342,6 +387,20 @@ fn decompress(head: &[u8], body: &[u8]) -> String {
     decoded.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
 }
 
+/// The DNSBL query name for `ip` in `zone`: the reversed IPv4 octets, then the zone
+/// (`1.2.3.4` + `zen.spamhaus.org` → `4.3.2.1.zen.spamhaus.org`). Returns `None` for IPv6:
+/// DNSBLs use a nibble-reversed format for v6 that `checker.py`'s simple `split(".")` reversal
+/// does not produce, so — like the Python — v6 is effectively unsupported and skipped here.
+fn dnsbl_query(ip: IpAddr, zone: &str) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            Some(format!("{}.{}.{}.{}.{}", o[3], o[2], o[1], o[0], zone))
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
 /// A valid judge response echoes our marker, at least one IP, and the constant Referer and
 /// Cookie header values — proving the proxy forwarded our request intact.
 /// `checker.py:_check_test_response`. Case-sensitive (Python does not lowercase here).
@@ -361,6 +420,20 @@ mod tests {
         let (h, b) = split_head_body(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\nbody here");
         assert_eq!(h, b"HTTP/1.1 200 OK\r\nX: y");
         assert_eq!(b, b"body here");
+    }
+
+    #[test]
+    fn dnsbl_query_reverses_ipv4_octets() {
+        // checker.py: ".".join(reversed(host.split("."))) + "." + zone
+        assert_eq!(
+            dnsbl_query("1.2.3.4".parse().unwrap(), "zen.spamhaus.org").as_deref(),
+            Some("4.3.2.1.zen.spamhaus.org")
+        );
+        // IPv6 is skipped (Python's dot-split reversal does not produce a valid v6 query).
+        assert_eq!(
+            dnsbl_query("2001:db8::1".parse().unwrap(), "zen.spamhaus.org"),
+            None
+        );
     }
 
     #[test]

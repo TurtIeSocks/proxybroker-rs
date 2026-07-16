@@ -57,16 +57,15 @@ fn cfg(judge_url: &str) -> CheckerConfig {
         types: vec![TypeSpec::any(Proto::Http)],
         timeout: Duration::from_secs(3),
         max_tries: 2,
-        post: false,
-        strict: false,
+        ..Default::default()
     }
 }
 
 async fn make_checker(judge: std::net::SocketAddr) -> Checker {
-    let resolver = Resolver::new(Duration::from_secs(3)).unwrap();
+    let resolver = std::sync::Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
     let client = reqwest::Client::new();
     let real: HashSet<IpAddr> = HashSet::from(["203.0.113.9".parse().unwrap()]);
-    Checker::new(cfg(&format!("http://{judge}/")), &resolver, &client, real)
+    Checker::new(cfg(&format!("http://{judge}/")), resolver, &client, real)
         .await
         .expect("judge should verify")
 }
@@ -138,12 +137,12 @@ async fn invalid_response_fails_the_check() {
 async fn no_judges_is_an_error() {
     // A judge that never echoes the real IP cannot verify → Checker::new fails with NoJudges.
     let (bad_judge, _j) = echo_server("nothing useful here UA=PxBroker/x/{marker}").await;
-    let resolver = Resolver::new(Duration::from_secs(2)).unwrap();
+    let resolver = std::sync::Arc::new(Resolver::new(Duration::from_secs(2)).unwrap());
     let client = reqwest::Client::new();
     let real: HashSet<IpAddr> = HashSet::from(["203.0.113.9".parse().unwrap()]);
     let err = Checker::new(
         cfg(&format!("http://{bad_judge}/")),
-        &resolver,
+        resolver,
         &client,
         real,
     )

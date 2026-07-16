@@ -69,6 +69,8 @@ pub struct FindQuery {
     pub limit: Option<usize>,
     /// Judge URLs to probe. Empty = the bundled defaults.
     pub judges: Vec<String>,
+    /// DNS blocklist zones; a proxy whose IP is listed in any is rejected. Empty disables.
+    pub dnsbl: Vec<String>,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Max concurrent checks in flight. `api.py:max_conn`.
@@ -88,6 +90,7 @@ impl Default for FindQuery {
             countries: None,
             limit: None,
             judges: Vec::new(),
+            dnsbl: Vec::new(),
             timeout: Duration::from_secs(8),
             max_conn: 200,
             max_tries: 3,
@@ -201,8 +204,9 @@ impl Broker {
                 max_tries: query.max_tries,
                 post: query.post,
                 strict: query.strict,
+                dnsbl: query.dnsbl.clone(),
             },
-            &resolver,
+            resolver.clone(),
             &self.client,
             real_ext_ips,
         )
