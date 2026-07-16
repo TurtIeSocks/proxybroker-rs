@@ -12,6 +12,7 @@ pub mod broker;
 pub mod error;
 #[cfg(feature = "geo")]
 pub mod geo;
+pub mod negotiator;
 pub mod parse;
 pub mod provider;
 pub mod proxy;
@@ -23,6 +24,7 @@ pub use broker::{Broker, GrabQuery, ProxyStream};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;
+pub use negotiator::{Stream, Target};
 pub use provider::{Candidate, ProviderSpec};
 pub use proxy::{Country, Proxy};
 pub use resolver::Resolver;
