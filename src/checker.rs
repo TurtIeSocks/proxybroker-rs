@@ -148,20 +148,21 @@ impl RetryPolicy {
         }
     }
 
-    /// The delay before retry number `i` (0-based): `min(max_backoff, backoff * factor^i)`, then
-    /// symmetric jitter of `±jitter` fraction. Zero base → zero (no wall-clock sleep on the
-    /// parity path).
+    /// The delay before retry number `i` (0-based): `backoff * factor^i`, then symmetric jitter of
+    /// `±jitter` fraction, then clamped to `max_backoff`. The cap is applied **last** so it is a
+    /// hard upper bound on any single delay even with jitter. Zero base → zero (no wall-clock sleep
+    /// on the parity path).
     pub fn backoff_for(&self, i: usize) -> Duration {
         if self.backoff.is_zero() {
             return Duration::ZERO;
         }
         let mut d = self.backoff.as_secs_f64() * self.factor.powi(i as i32);
-        if !self.max_backoff.is_zero() {
-            d = d.min(self.max_backoff.as_secs_f64());
-        }
         if self.jitter > 0.0 {
             let r: f64 = rand::rng().random_range(-1.0..=1.0);
             d *= 1.0 + self.jitter * r;
+        }
+        if !self.max_backoff.is_zero() {
+            d = d.min(self.max_backoff.as_secs_f64());
         }
         Duration::from_secs_f64(d.max(0.0))
     }
@@ -835,6 +836,22 @@ mod tests {
         for _ in 0..64 {
             let ms = j.backoff_for(0).as_secs_f64() * 1000.0;
             assert!((50.0..=150.0).contains(&ms), "jitter out of band: {ms}ms");
+        }
+        // max_backoff is a HARD ceiling even with jitter (clamp applied last).
+        let capped_jitter = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            jitter: 0.5,
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        };
+        for i in 0..=4 {
+            for _ in 0..32 {
+                assert!(
+                    capped_jitter.backoff_for(i) <= Duration::from_millis(250),
+                    "backoff exceeded the cap at i={i}"
+                );
+            }
         }
         // Zero base → zero: the parity path never sleeps.
         assert_eq!(RetryPolicy::default().backoff_for(0), Duration::ZERO);
