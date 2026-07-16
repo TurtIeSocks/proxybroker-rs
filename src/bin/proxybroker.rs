@@ -473,9 +473,18 @@ impl<'a> Emitter<'a> {
 /// `https` if the proxy can tunnel TLS, else `http` — the URL scheme for `--format url`. A grabbed
 /// (unchecked) proxy has no confirmed types, so it falls back to `http`. `Scheme` has no
 /// `Display`, so the two-arm choice is inlined here rather than widened into the library.
+/// The proxy's own URL scheme for `--format url` and `{{scheme}}` — i.e. how a client dials the
+/// proxy, which is what a consumer (`curl --proxy`, `requests`) needs. SOCKS proxies are `socks5`/
+/// `socks4`; the whole HTTP family (`HTTP`, `HTTPS`, `CONNECT:*`) is reached over plain HTTP, so it
+/// is `http`. The `HTTPS`/`CONNECT` capability describes *target* traffic the proxy can tunnel, not
+/// a TLS endpoint — emitting `https://` there would tell tooling the proxy itself speaks TLS (it
+/// does not) and mis-dispatch the connection.
 fn scheme_str(p: &Proxy) -> &'static str {
-    if p.schemes().contains(&proxybroker::Scheme::Https) {
-        "https"
+    let protos = p.types();
+    if protos.contains_key(&Proto::Socks5) {
+        "socks5"
+    } else if protos.contains_key(&Proto::Socks4) {
+        "socks4"
     } else {
         "http"
     }
@@ -990,12 +999,26 @@ mod format_tests {
             Emitter::new(Format::Url, None).item(&proxy_fixture()),
             "http://1.2.3.4:8080\n"
         );
-        // A SOCKS5 proxy tunnels TLS → https.
+        // An HTTPS-capable (CONNECT-to-443) HTTP proxy is still dialed over plain HTTP → http.
+        let mut https = Proxy::new("9.9.9.9".parse().unwrap(), 8080, BTreeSet::new());
+        https.add_type(Proto::Https, None);
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&https),
+            "http://9.9.9.9:8080\n"
+        );
+        // A SOCKS5 proxy speaks the SOCKS wire protocol → socks5, so the URL is directly usable.
         let mut p = Proxy::new("5.6.7.8".parse().unwrap(), 1080, BTreeSet::new());
         p.add_type(Proto::Socks5, None);
         assert_eq!(
             Emitter::new(Format::Url, None).item(&p),
-            "https://5.6.7.8:1080\n"
+            "socks5://5.6.7.8:1080\n"
+        );
+        // SOCKS4 likewise.
+        let mut p4 = Proxy::new("5.6.7.8".parse().unwrap(), 1080, BTreeSet::new());
+        p4.add_type(Proto::Socks4, None);
+        assert_eq!(
+            Emitter::new(Format::Url, None).item(&p4),
+            "socks4://5.6.7.8:1080\n"
         );
     }
 
