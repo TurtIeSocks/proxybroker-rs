@@ -170,6 +170,11 @@ struct ServeArgs {
     #[arg(long)]
     prefer_connect: bool,
 
+    /// Retry through another proxy when the upstream HTTP status is outside this set (e.g. 200 204
+    /// 301 302), to dodge block pages. Empty = accept any status. HTTP requests only.
+    #[arg(long, num_args = 1.., value_name = "CODE")]
+    http_allowed_codes: Vec<u16>,
+
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
@@ -428,6 +433,8 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         sticky_header: args.sticky_header.clone(),
         fail_timeout: Duration::from_secs(args.fail_timeout),
         prefer_connect: args.prefer_connect,
+        http_allowed_codes: (!args.http_allowed_codes.is_empty())
+            .then(|| args.http_allowed_codes.clone()),
         ..Default::default()
     };
 

@@ -48,6 +48,31 @@ fn http_proxy_at(addr: std::net::SocketAddr) -> Proxy {
     p
 }
 
+/// A mock upstream returning a chosen HTTP `status` line (e.g. "403 Forbidden") with `body`.
+async fn mock_status(
+    status: &'static str,
+    body: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (addr, h)
+}
+
 #[tokio::test]
 async fn server_relays_http_request_through_a_pool_proxy() {
     let (upstream, _u) = mock_upstream("RELAYED-BODY").await;
@@ -213,6 +238,78 @@ async fn emits_502_after_max_tries_all_fail() {
         .expect("read should not time out")
         .unwrap();
     assert!(String::from_utf8_lossy(&resp).contains("502"));
+}
+
+async fn serve_get(pool: Arc<Pool>) -> String {
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+#[tokio::test]
+async fn retries_when_upstream_status_not_allowed() {
+    // A 403 block page is not forwarded — the request retries the next proxy, which returns 200.
+    let (blocked, _a) = mock_status("403 Forbidden", "BLOCKED").await;
+    let (ok, _b) = mock_status("200 OK", "GOOD").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(blocked), http_proxy_at(ok)],
+        PoolConfig {
+            http_allowed_codes: Some(vec![200]),
+            ..PoolConfig::default()
+        },
+    );
+    let body = serve_get(pool).await;
+    assert!(body.contains("GOOD"), "should retry past the 403: {body:?}");
+    assert!(
+        !body.contains("BLOCKED"),
+        "the 403 body must not reach the client"
+    );
+}
+
+#[tokio::test]
+async fn allowed_status_is_forwarded_verbatim() {
+    // An allowed non-200 status is forwarded whole, including the peeked status line (no byte loss).
+    let (up, _u) = mock_status("301 Moved Permanently", "REDIR-BODY").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(up)],
+        PoolConfig {
+            http_allowed_codes: Some(vec![301]),
+            ..PoolConfig::default()
+        },
+    );
+    let body = serve_get(pool).await;
+    assert!(
+        body.contains("301 Moved Permanently"),
+        "peeked status line lost: {body:?}"
+    );
+    assert!(body.contains("REDIR-BODY"), "body lost: {body:?}");
+}
+
+#[tokio::test]
+async fn none_allowed_codes_accepts_any() {
+    // With no allow-list the splice is blind (today's behaviour): a 500 is forwarded unchanged.
+    let (up, _u) = mock_status("500 Internal Server Error", "ERRBODY").await;
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let body = serve_get(pool).await;
+    assert!(
+        body.contains("500"),
+        "500 should be forwarded when no allow-list: {body:?}"
+    );
+    assert!(body.contains("ERRBODY"));
 }
 
 #[tokio::test(start_paused = true)]

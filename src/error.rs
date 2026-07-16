@@ -40,6 +40,9 @@ pub enum ProxyError {
     BadResponse,
     /// Error while relaying in the local server. `errors.py:48 ErrorOnStream`.
     ErrorOnStream,
+    /// The upstream returned an HTTP status outside the served pool's `--http-allowed-codes`
+    /// set (B11). A local-server-only, retryable failure — no Python analogue.
+    DisallowedStatus(u16),
     /// Host did not resolve. `errors.py:12 ResolveError` (which has no `errmsg` in Python —
     /// the string is new). Deliberately never counted: at `api.py:443` the resolve fails
     /// before a `Proxy` exists, so there is no `stat` dict to increment. Exists as a return
@@ -59,6 +62,7 @@ impl ProxyError {
             ProxyError::BadStatus => "bad_status",
             ProxyError::BadResponse => "bad_response",
             ProxyError::ErrorOnStream => "error_on_stream",
+            ProxyError::DisallowedStatus(_) => "disallowed_status",
             ProxyError::Resolve => "resolve_failed",
         }
     }

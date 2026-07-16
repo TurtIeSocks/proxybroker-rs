@@ -82,6 +82,10 @@ pub struct PoolConfig {
     /// B10: prefer `CONNECT:80`-capable proxies. A tie-break for `Best`/`Sticky` (health still
     /// dominates), a primary filter for `RoundRobin`/`Random`. Default `false`.
     pub prefer_connect: bool,
+    /// B11: for HTTP requests, retry through another proxy when the upstream status is outside
+    /// this set (e.g. dodge a `403`/`503` block page). `None` = accept any status (no peek, blind
+    /// splice — today's behaviour). CONNECT tunnels are opaque and never status-gated.
+    pub http_allowed_codes: Option<Vec<u16>>,
 }
 
 impl Default for PoolConfig {
@@ -97,6 +101,7 @@ impl Default for PoolConfig {
             max_sessions: 10_000,
             fail_timeout: Duration::from_secs(30),
             prefer_connect: false,
+            http_allowed_codes: None,
         }
     }
 }
@@ -502,7 +507,17 @@ async fn handle_client(
         };
         let proto = choose_proto(&proxy, req.scheme);
 
-        match relay(&mut client, &proxy, proto, &target, &req, timeout).await {
+        match relay(
+            &mut client,
+            &proxy,
+            proto,
+            &target,
+            &req,
+            timeout,
+            pool.config.http_allowed_codes.as_deref(),
+        )
+        .await
+        {
             RelayOutcome::Ok => {
                 proxy.record_attempt(Some(0.0), None);
                 pool.put_ok(proxy);
@@ -575,7 +590,9 @@ enum RelayOutcome {
 }
 
 /// Relay one client request through `proxy` using `proto`, reporting where it ended so the caller
-/// only retries a failure the client has not yet seen (B2's commit boundary).
+/// only retries a failure the client has not yet seen (B2's commit boundary). When `allowed_codes`
+/// is set, an HTTP response whose status is outside the set is a **pre-commit** retryable failure
+/// (B11), so the block page never reaches the client.
 async fn relay(
     client: &mut TcpStream,
     proxy: &Proxy,
@@ -583,6 +600,7 @@ async fn relay(
     target: &Target,
     req: &ClientRequest,
     timeout: Duration,
+    allowed_codes: Option<&[u16]>,
 ) -> RelayOutcome {
     use crate::error::ProxyError;
     use RelayOutcome::{ClientCommitted, RetryableFailure};
@@ -618,6 +636,19 @@ async fn relay(
             if upstream.write_all(&req.raw).await.is_err() {
                 return RetryableFailure(ProxyError::Reset);
             }
+            // B11: peek the upstream status BEFORE any client write. A disallowed status is a
+            // pre-commit retryable failure; an allowed one is replayed to the client (the peeked
+            // bytes must not be lost) and becomes the commit point.
+            if let Some(allowed) = allowed_codes {
+                match peek_http_status(&mut upstream, allowed, timeout).await {
+                    Ok(head) => {
+                        if client.write_all(&head).await.is_err() {
+                            return ClientCommitted(ProxyError::Reset);
+                        }
+                    }
+                    Err(e) => return RetryableFailure(e),
+                }
+            }
         }
     }
 
@@ -628,6 +659,56 @@ async fn relay(
         Ok(_) => RelayOutcome::Ok,
         Err(_) => ClientCommitted(ProxyError::ErrorOnStream),
     }
+}
+
+/// Read an HTTP response's status line from `upstream` (bounded), returning the raw bytes read so
+/// they can be replayed to the client. Errors if the status is not in `allowed`, if the upstream
+/// closes, or on a read timeout — all pre-commit, so the caller can retry another proxy. Reads
+/// byte-by-byte so a status line split across TCP segments still parses (B11).
+async fn peek_http_status(
+    upstream: &mut Stream,
+    allowed: &[u16],
+    deadline: Duration,
+) -> Result<Vec<u8>, crate::error::ProxyError> {
+    use crate::error::ProxyError;
+    let mut head = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    let read = async {
+        loop {
+            let n = upstream
+                .read(&mut byte)
+                .await
+                .map_err(|_| ProxyError::Reset)?;
+            if n == 0 {
+                return Err(ProxyError::EmptyRecv);
+            }
+            head.push(byte[0]);
+            // The status line ends at the first CRLF; cap the scan so a header-less stream cannot
+            // buffer without bound.
+            if head.ends_with(b"\r\n") || head.len() >= 256 {
+                return Ok(head);
+            }
+        }
+    };
+    let head = tokio::time::timeout(deadline, read)
+        .await
+        .map_err(|_| ProxyError::Timeout)??;
+    let code = parse_http_status(&head);
+    if allowed.contains(&code) {
+        Ok(head)
+    } else {
+        Err(ProxyError::DisallowedStatus(code))
+    }
+}
+
+/// The status code from an HTTP status line (`HTTP/1.1 200 OK` → `200`); `0` on anything
+/// unparseable (which no `allowed` set contains, so it is treated as disallowed).
+fn parse_http_status(head: &[u8]) -> u16 {
+    std::str::from_utf8(head)
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Read and parse the client's first request line + Host, enough to route it.
@@ -876,6 +957,18 @@ mod tests {
             Some(0),
             "health dominates the CONNECT bias"
         );
+    }
+
+    #[test]
+    fn parse_http_status_extracts_code() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n"), 200);
+        assert_eq!(parse_http_status(b"HTTP/1.0 403 Forbidden\r\n"), 403);
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 301 Moved Permanently\r\n"),
+            301
+        );
+        assert_eq!(parse_http_status(b"garbage"), 0); // unparseable → 0 (in no allow-list)
+        assert_eq!(parse_http_status(b"HTTP/1.1 \r\n"), 0);
     }
 
     #[test]
