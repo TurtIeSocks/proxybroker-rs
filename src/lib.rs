@@ -44,6 +44,8 @@ pub mod resolver;
 pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(all(feature = "mcp", feature = "server"))]
+pub mod mcp;
 pub mod stats;
 pub mod types;
 pub mod utils;
