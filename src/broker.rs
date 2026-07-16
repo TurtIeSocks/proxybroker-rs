@@ -1,26 +1,45 @@
 //! The [`Broker`]: orchestrates providers into a stream of proxies.
 //!
-//! This module currently implements the `grab` path (scrape providers, no checking). The
-//! `find`/`serve` paths build on it and land later.
+//! `grab` scrapes providers without checking; `find` scrapes and checks. (`serve` builds on
+//! `find` and lands with the server.)
 //!
 //! Delivery is a [`ProxyStream`], not proxybroker2's fire-and-forget-onto-a-queue. Termination
 //! is the channel closing (drop the sender), not a `None` poison pill — broadcast- and
 //! multi-consumer-safe by construction. Dropping the stream drops the receiver, so the source
 //! task's next `send` fails and it stops: cancellation for free, without a sentinel or a
 //! detached-task leak (design critique #14). See `decisions.md`.
+//!
+//! `find`'s concurrency is the delicate part (`decisions.md` §1). proxybroker2's `_on_check`
+//! is a queue impersonating **two** primitives, which must stay separate here:
+//!
+//! - a [`Semaphore`](tokio::sync::Semaphore) bounds in-flight checks (the concurrency cap);
+//! - a [`TaskTracker`](tokio_util::task::TaskTracker) is the wait-group we drain before
+//!   ending the stream, so no check is silently dropped.
+//!
+//! A [`CancellationToken`] fired when the consumer drops the stream aborts in-flight checks —
+//! not a detached-task leak (critique #14).
 
+use crate::checker::{Checker, CheckerConfig};
 use crate::provider::{fetch, ProviderSpec};
 use crate::proxy::Proxy;
+use crate::resolver::Resolver;
+use crate::types::TypeSpec;
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, Semaphore};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[cfg(feature = "geo")]
 use crate::geo::GeoDb;
+
+use crate::error::Error;
 
 /// The maximum number of providers fetched concurrently. `api.py:MAX_CONCURRENT_PROVIDERS`.
 const MAX_CONCURRENT_PROVIDERS: usize = 3;
@@ -39,11 +58,53 @@ pub struct GrabQuery {
     pub limit: Option<usize>,
 }
 
+/// What to find and check. `types` is required (empty is [`Error::NoTypes`]).
+#[derive(Debug, Clone)]
+pub struct FindQuery {
+    /// Protocols (and optional anonymity levels) a proxy must support.
+    pub types: Vec<TypeSpec>,
+    /// Keep only proxies in these ISO country codes. `None` = no filter.
+    pub countries: Option<Vec<String>>,
+    /// Stop after this many working proxies. `None` = unlimited.
+    pub limit: Option<usize>,
+    /// Judge URLs to probe. Empty = the bundled defaults.
+    pub judges: Vec<String>,
+    /// Per-request timeout.
+    pub timeout: Duration,
+    /// Max concurrent checks in flight. `api.py:max_conn`.
+    pub max_conn: usize,
+    /// Attempts per protocol before giving up. `api.py:max_tries`.
+    pub max_tries: usize,
+    /// Use `POST` for the test request.
+    pub post: bool,
+    /// Require the anonymity level to match exactly.
+    pub strict: bool,
+}
+
+impl Default for FindQuery {
+    fn default() -> Self {
+        FindQuery {
+            types: Vec::new(),
+            countries: None,
+            limit: None,
+            judges: Vec::new(),
+            timeout: Duration::from_secs(8),
+            max_conn: 200,
+            max_tries: 3,
+            post: false,
+            strict: false,
+        }
+    }
+}
+
 /// Finds proxies from a set of providers.
 #[derive(Clone)]
 pub struct Broker {
     providers: Arc<Vec<ProviderSpec>>,
     client: reqwest::Client,
+    /// Injectable so tests can stub external-IP discovery and DNS offline. `None` = build a
+    /// default resolver on first `find`.
+    resolver: Option<Arc<Resolver>>,
     #[cfg(feature = "geo")]
     geo: Option<Arc<GeoDb>>,
 }
@@ -63,7 +124,10 @@ impl Broker {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let broker = self.clone();
         tokio::spawn(async move { broker.grab_task(query, tx).await });
-        ProxyStream { rx }
+        ProxyStream {
+            rx,
+            _cancel_on_drop: None,
+        }
     }
 
     async fn grab_task(self, query: GrabQuery, tx: mpsc::Sender<Proxy>) {
@@ -110,6 +174,138 @@ impl Broker {
         }
     }
 
+    /// Gather **and check** proxies. `api.py:Broker.find`.
+    ///
+    /// Unlike proxybroker2's `find` (fire-and-forget onto a queue), this returns a
+    /// `Result<ProxyStream>`: the up-front work that can fail — discovering the host's
+    /// external IPs and verifying at least one judge — happens before the stream is returned,
+    /// so [`Error::NoTypes`], [`Error::ExtIpUnknown`], and [`Error::NoJudges`] surface here
+    /// rather than silently producing an empty stream.
+    pub async fn find(&self, query: FindQuery) -> Result<ProxyStream, Error> {
+        if query.types.is_empty() {
+            return Err(Error::NoTypes);
+        }
+        // A resolver for external-IP discovery and judge-host resolution. Proxy candidates are
+        // already IP literals (from provider extraction), so no proxy-host DNS is needed.
+        let resolver = match &self.resolver {
+            Some(r) => r.clone(),
+            None => Arc::new(Resolver::new(query.timeout)?),
+        };
+        let real_ext_ips = resolver.external_ips().await?;
+
+        let checker = Checker::new(
+            CheckerConfig {
+                judges: query.judges.clone(),
+                types: query.types.clone(),
+                timeout: query.timeout,
+                max_tries: query.max_tries,
+                post: query.post,
+                strict: query.strict,
+            },
+            &resolver,
+            &self.client,
+            real_ext_ips,
+        )
+        .await?;
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        // Dropping the stream fires this token, aborting in-flight checks — no watcher task
+        // (a watcher holding a Sender would keep the channel open and deadlock termination).
+        let cancel = CancellationToken::new();
+        let broker = self.clone();
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            broker
+                .find_task(query, Arc::new(checker), tx, task_cancel)
+                .await
+        });
+        Ok(ProxyStream {
+            rx,
+            _cancel_on_drop: Some(cancel.drop_guard()),
+        })
+    }
+
+    async fn find_task(
+        self,
+        query: FindQuery,
+        checker: Arc<Checker>,
+        tx: mpsc::Sender<Proxy>,
+        cancel: CancellationToken,
+    ) {
+        let countries: Option<BTreeSet<String>> = query
+            .countries
+            .map(|cs| cs.into_iter().map(|c| c.to_uppercase()).collect());
+
+        let sem = Arc::new(Semaphore::new(query.max_conn));
+        let tracker = TaskTracker::new();
+        let sent = Arc::new(AtomicUsize::new(0));
+
+        let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+        let client = self.client.clone();
+        let specs: Vec<ProviderSpec> = self.providers.as_ref().clone();
+        let mut fetches = futures_util::stream::iter(specs)
+            .map(|spec| {
+                let client = client.clone();
+                async move { fetch(&spec, &client).await }
+            })
+            .buffer_unordered(MAX_CONCURRENT_PROVIDERS);
+
+        'outer: while let Some(candidates) = fetches.next().await {
+            for cand in candidates {
+                if cancel.is_cancelled() || is_limit_reached(&sent, query.limit) {
+                    break 'outer;
+                }
+                let Ok(host) = cand.host.parse::<IpAddr>() else {
+                    continue;
+                };
+                if !seen.insert((host, cand.port)) {
+                    continue;
+                }
+                let mut proxy = Proxy::new(host, cand.port, cand.protocols.clone());
+                self.attach_geo(&mut proxy);
+                if !country_ok(&proxy, countries.as_ref()) {
+                    continue;
+                }
+
+                // Acquire a concurrency permit BEFORE spawning; move it into the task so its
+                // Drop frees the slot — race-free by construction (decisions.md §1).
+                let Ok(permit) = sem.clone().acquire_owned().await else {
+                    break 'outer;
+                };
+                let checker = checker.clone();
+                let tx = tx.clone();
+                let sent = sent.clone();
+                let cancel = cancel.clone();
+                let limit = query.limit;
+                tracker.spawn(async move {
+                    let _permit = permit;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {} // consumer gone — abort
+                        working = checker.check(&mut proxy) => {
+                            if working {
+                                // Reserve a slot atomically; emit only if under the limit.
+                                let n = sent.fetch_add(1, Ordering::SeqCst);
+                                match limit {
+                                    Some(l) if n >= l => cancel.cancel(),
+                                    _ => {
+                                        let _ = tx.send(proxy).await;
+                                        if limit.is_some_and(|l| n + 1 >= l) {
+                                            cancel.cancel();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Wait-group: drain every spawned check before dropping tx and ending the stream.
+        tracker.close();
+        tracker.wait().await;
+    }
+
     #[cfg(feature = "geo")]
     fn attach_geo(&self, proxy: &mut Proxy) {
         if let Some(db) = &self.geo {
@@ -119,6 +315,11 @@ impl Broker {
 
     #[cfg(not(feature = "geo"))]
     fn attach_geo(&self, _proxy: &mut Proxy) {}
+}
+
+/// Has the emit count reached the limit? `None` = unlimited.
+fn is_limit_reached(sent: &AtomicUsize, limit: Option<usize>) -> bool {
+    limit.is_some_and(|l| sent.load(Ordering::SeqCst) >= l)
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
@@ -138,6 +339,7 @@ fn country_ok(proxy: &Proxy, countries: Option<&BTreeSet<String>>) -> bool {
 pub struct BrokerBuilder {
     providers: Option<Vec<ProviderSpec>>,
     client: Option<reqwest::Client>,
+    resolver: Option<Arc<Resolver>>,
     #[cfg(feature = "geo")]
     geo: Option<Arc<GeoDb>>,
 }
@@ -155,6 +357,13 @@ impl BrokerBuilder {
         self
     }
 
+    /// Use a specific resolver — mainly for tests, which stub external-IP discovery and DNS
+    /// so `find` runs fully offline.
+    pub fn resolver(mut self, resolver: Resolver) -> Self {
+        self.resolver = Some(Arc::new(resolver));
+        self
+    }
+
     /// Attach a geo database for country lookup and filtering.
     #[cfg(feature = "geo")]
     pub fn geo(mut self, db: GeoDb) -> Self {
@@ -169,6 +378,7 @@ impl BrokerBuilder {
                     .unwrap_or_else(crate::provider::bundled_registry),
             ),
             client: self.client.unwrap_or_default(),
+            resolver: self.resolver,
             #[cfg(feature = "geo")]
             geo: self.geo,
         }
@@ -177,8 +387,12 @@ impl BrokerBuilder {
 
 /// A stream of discovered proxies. Ends when the source is exhausted, the limit is reached,
 /// or this stream is dropped (which stops the source task).
+#[derive(Debug)]
 pub struct ProxyStream {
     rx: mpsc::Receiver<Proxy>,
+    /// For `find`: dropping the stream fires this token, aborting in-flight check tasks. For
+    /// `grab` it is `None` — dropping the receiver already stops the single source task.
+    _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
 }
 
 impl Stream for ProxyStream {

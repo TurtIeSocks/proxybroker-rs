@@ -22,7 +22,7 @@ pub mod resolver;
 pub mod types;
 pub mod utils;
 
-pub use broker::{Broker, GrabQuery, ProxyStream};
+pub use broker::{Broker, FindQuery, GrabQuery, ProxyStream};
 pub use checker::{Checker, CheckerConfig};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
