@@ -78,6 +78,12 @@ indicatif = { version = "0.18", optional = true }
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.52", features = ["full", "test-util"] }
+criterion = { version = "0.7", features = ["async_tokio"] }
+libc = "0.2"
+
+[[bench]]
+name = "check_pipeline"
+harness = false
 
 [[bin]]
 name = "proxybroker"
