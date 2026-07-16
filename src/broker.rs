@@ -358,6 +358,8 @@ pub struct BrokerBuilder {
     resolver: Option<Arc<Resolver>>,
     #[cfg(feature = "geo")]
     geo: Option<Arc<GeoDb>>,
+    #[cfg(feature = "geo")]
+    no_geo: bool,
 }
 
 impl BrokerBuilder {
@@ -380,14 +382,37 @@ impl BrokerBuilder {
         self
     }
 
-    /// Attach a geo database for country lookup and filtering.
+    /// Attach a geo database for country lookup and filtering, overriding the bundled default.
     #[cfg(feature = "geo")]
     pub fn geo(mut self, db: GeoDb) -> Self {
         self.geo = Some(Arc::new(db));
         self
     }
 
+    /// Do **not** attach any geo database. Country filtering will then reject every proxy (a
+    /// proxy with unknown location cannot match a country), and proxies carry no `geo`. Use
+    /// this to skip loading the ~8 MB bundled database when you do not need geolocation.
+    #[cfg(feature = "geo")]
+    pub fn without_geo(mut self) -> Self {
+        self.no_geo = true;
+        self
+    }
+
     pub fn build(self) -> Broker {
+        // Auto-attach the bundled geo database when built with `geo-bundled` (the default) and
+        // the caller neither supplied one nor opted out. Without this, country filtering
+        // silently rejects everything — a footgun for library users, since a proxy with no
+        // known location can never match a requested country.
+        #[cfg(feature = "geo")]
+        let geo = match (self.geo, self.no_geo) {
+            (Some(db), _) => Some(db),
+            (None, true) => None,
+            #[cfg(feature = "geo-bundled")]
+            (None, false) => GeoDb::bundled().ok().map(Arc::new),
+            #[cfg(not(feature = "geo-bundled"))]
+            (None, false) => None,
+        };
+
         Broker {
             providers: Arc::new(
                 self.providers
@@ -396,7 +421,7 @@ impl BrokerBuilder {
             client: self.client.unwrap_or_default(),
             resolver: self.resolver,
             #[cfg(feature = "geo")]
-            geo: self.geo,
+            geo,
         }
     }
 }
