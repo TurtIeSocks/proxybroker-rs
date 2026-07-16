@@ -76,6 +76,9 @@ pub struct PoolConfig {
     pub sticky_header: Option<String>,
     /// Upper bound on the sticky-session map, so a long-lived server cannot grow it without limit.
     pub max_sessions: usize,
+    /// How long a proxy is benched (skipped unless it is the only option) after a failure, before
+    /// it is re-probed. Default 30s (`server.py` parity).
+    pub fail_timeout: Duration,
 }
 
 impl Default for PoolConfig {
@@ -89,13 +92,23 @@ impl Default for PoolConfig {
             strategy: Strategy::Best,
             sticky_header: None,
             max_sessions: 10_000,
+            fail_timeout: Duration::from_secs(30),
         }
     }
 }
 
+/// A pooled proxy plus its bench state. The `blocked_until` timestamp is server-only and lives
+/// here rather than on [`Proxy`] — `Proxy` is the serialized value type shared with `find`/`check`
+/// and must not carry a transient selection timestamp (keeps the JSON contract stable).
+struct Pooled {
+    proxy: Proxy,
+    /// `Some(t)` = benched (skipped unless it is the only option) until `t`; `None` = ready.
+    blocked_until: Option<tokio::time::Instant>,
+}
+
 /// A pool of checked proxies, refilled from a [`ProxyStream`] by a background importer.
 pub struct Pool {
-    state: Mutex<Vec<Proxy>>,
+    state: Mutex<Vec<Pooled>>,
     /// [`Strategy::Sticky`] pins: client → the **address** (not index — indices churn under
     /// `swap_remove`) of the proxy it is bound to. Only written by `Sticky`.
     sessions: Mutex<HashMap<ClientKey, (IpAddr, u16)>>,
@@ -113,6 +126,10 @@ impl Pool {
         let proxies = proxies
             .into_iter()
             .filter(|p| crate::broker::country_ok(p, config.countries.as_ref()))
+            .map(|proxy| Pooled {
+                proxy,
+                blocked_until: None,
+            })
             .collect();
         Pool {
             state: Mutex::new(proxies),
@@ -146,7 +163,10 @@ impl Pool {
                     if !crate::broker::country_ok(&proxy, pool.config.countries.as_ref()) {
                         continue;
                     }
-                    pool.state.lock().unwrap().push(proxy);
+                    pool.state.lock().unwrap().push(Pooled {
+                        proxy,
+                        blocked_until: None,
+                    });
                     pool.notify.notify_waiters();
                 }
                 // Source exhausted: wake anyone waiting so they stop instead of hanging.
@@ -195,11 +215,12 @@ impl Pool {
             strategy: self.config.strategy,
             sticky,
             round_robin_cursor: self.round_robin.load(Ordering::SeqCst),
+            now: tokio::time::Instant::now(),
         };
         let chosen = {
             let mut pool = self.state.lock().unwrap();
             let idx = best_for(&pool, &ctx)?;
-            pool.swap_remove(idx)
+            pool.swap_remove(idx).proxy
         };
         if self.config.strategy == Strategy::RoundRobin {
             self.round_robin.fetch_add(1, Ordering::SeqCst);
@@ -223,9 +244,23 @@ impl Pool {
         s.insert(key, addr);
     }
 
-    /// Return a proxy after use, dropping it if it has become too slow or too error-prone.
-    /// `server.py:ProxyPool.put`.
-    pub fn put(&self, proxy: Proxy) {
+    /// Return a proxy that served successfully — ready for immediate reselection.
+    pub fn put_ok(&self, proxy: Proxy) {
+        self.put_inner(proxy, None);
+    }
+
+    /// Return a proxy that just failed — benched for `fail_timeout` (skipped unless it is the only
+    /// eligible proxy) so a transient failure neither instantly re-selects it nor permanently
+    /// demotes it. `server.py`'s `fail_timeout` re-entry.
+    pub fn put_failed(&self, proxy: Proxy) {
+        let until = tokio::time::Instant::now() + self.config.fail_timeout;
+        self.put_inner(proxy, Some(until));
+    }
+
+    /// Return a proxy to the pool with the given bench state, dropping it outright if it has become
+    /// too slow or too error-prone (`server.py:ProxyPool.put`). Hard eviction is unchanged by B5's
+    /// benching — a *persistently* unhealthy proxy is removed, not merely benched.
+    fn put_inner(&self, proxy: Proxy, blocked_until: Option<tokio::time::Instant>) {
         let unhealthy = proxy.requests() >= self.config.min_req
             && (proxy.error_rate() > self.config.max_error_rate
                 || proxy.avg_resp_time() > self.config.max_resp_time);
@@ -233,7 +268,10 @@ impl Pool {
             tracing::debug!(addr = %proxy.addr(), "evicted from pool");
             return;
         }
-        self.state.lock().unwrap().push(proxy);
+        self.state.lock().unwrap().push(Pooled {
+            proxy,
+            blocked_until,
+        });
         self.notify.notify_waiters();
     }
 }
@@ -247,46 +285,59 @@ struct SelectCtx {
     /// The address this client is pinned to, for [`Strategy::Sticky`]; `None` = no pin yet.
     sticky: Option<(IpAddr, u16)>,
     round_robin_cursor: usize,
+    /// Reference time for the bench check (B5): a proxy is ready iff `blocked_until` is `None`
+    /// or `<= now`.
+    now: tokio::time::Instant,
 }
 
-/// Index of the proxy to serve, per `ctx.strategy`, among the scheme-eligible proxies. The single
-/// isolated selection point every serving feature extends. Returns `None` when none are eligible.
-fn best_for(pool: &[Proxy], ctx: &SelectCtx) -> Option<usize> {
-    let eligible: Vec<usize> = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.schemes().contains(&ctx.scheme))
-        .map(|(i, _)| i)
-        .collect();
-    if eligible.is_empty() {
+/// Index of the proxy to serve, per `ctx.strategy`, among the scheme-eligible proxies. Two tiers
+/// (B5): rank the **ready** proxies (never benched, or bench window elapsed) by the strategy; only
+/// if none are ready fall back to the **benched** ones as a backup (better than a 502). The single
+/// isolated selection point every serving feature extends. `None` when nothing is eligible.
+fn best_for(pool: &[Pooled], ctx: &SelectCtx) -> Option<usize> {
+    let tier_of = |ready: bool| -> Vec<usize> {
+        pool.iter()
+            .enumerate()
+            .filter(|(_, p)| p.proxy.schemes().contains(&ctx.scheme))
+            .filter(|(_, p)| p.blocked_until.is_none_or(|t| t <= ctx.now) == ready)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let ready = tier_of(true);
+    let tier = if ready.is_empty() {
+        tier_of(false)
+    } else {
+        ready
+    };
+    if tier.is_empty() {
         return None;
     }
     match ctx.strategy {
-        Strategy::Best => best_by_priority(pool, &eligible),
-        Strategy::RoundRobin => Some(eligible[ctx.round_robin_cursor % eligible.len()]),
-        Strategy::Random => Some(eligible[next_rand(eligible.len())]),
+        Strategy::Best => best_by_priority(pool, &tier),
+        Strategy::RoundRobin => Some(tier[ctx.round_robin_cursor % tier.len()]),
+        Strategy::Random => Some(tier[next_rand(tier.len())]),
         Strategy::Sticky => {
-            // Reuse the pinned proxy if it is still pooled and eligible; otherwise fall back to
-            // Best (a fresh client, or the pin was evicted — self-healing, the caller re-pins).
+            // Reuse the pinned proxy if it is still in this tier; otherwise fall back to Best (a
+            // fresh client, or the pin was evicted — self-healing, the caller re-pins).
             if let Some(addr) = ctx.sticky {
-                if let Some(&i) = eligible
+                if let Some(&i) = tier
                     .iter()
-                    .find(|&&i| (pool[i].host, pool[i].port) == addr)
+                    .find(|&&i| (pool[i].proxy.host, pool[i].proxy.port) == addr)
                 {
                     return Some(i);
                 }
             }
-            best_by_priority(pool, &eligible)
+            best_by_priority(pool, &tier)
         }
     }
 }
 
 /// Lowest `(error_rate, avg_resp_time)` among `eligible`, `total_cmp`-ordered so tied `f64`s
 /// never panic (the `server.py` heapq bug). This is `Strategy::Best`.
-fn best_by_priority(pool: &[Proxy], eligible: &[usize]) -> Option<usize> {
+fn best_by_priority(pool: &[Pooled], eligible: &[usize]) -> Option<usize> {
     eligible.iter().copied().min_by(|&a, &b| {
-        let (ae, at) = pool[a].priority();
-        let (be, bt) = pool[b].priority();
+        let (ae, at) = pool[a].proxy.priority();
+        let (be, bt) = pool[b].proxy.priority();
         ae.total_cmp(&be).then(at.total_cmp(&bt))
     })
 }
@@ -409,13 +460,13 @@ async fn handle_client(
         match relay(&mut client, &proxy, proto, &target, &req, timeout).await {
             Ok(()) => {
                 proxy.record_attempt(Some(0.0), None);
-                pool.put(proxy);
+                pool.put_ok(proxy);
                 return Ok(());
             }
             Err(e) => {
                 proxy.record_attempt(None, Some(e));
-                pool.put(proxy);
-                // try the next proxy
+                pool.put_failed(proxy); // bench it for fail_timeout before it is tried again
+                                        // try the next proxy
             }
         }
     }
@@ -578,17 +629,21 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn proxy_with(rt: f64, scheme: Proto) -> Proxy {
-        // Distinct addr per call so sticky/round-robin picks are distinguishable by `addr()`.
+    fn proxy_with(rt: f64, scheme: Proto) -> Pooled {
         proxy_at(rt, scheme, "1.2.3.4")
     }
 
-    fn proxy_at(rt: f64, scheme: Proto, ip: &str) -> Proxy {
+    /// A ready (never-benched) pooled proxy at `ip` with response time `rt`. Distinct addr per
+    /// call so sticky/round-robin picks are distinguishable.
+    fn proxy_at(rt: f64, scheme: Proto, ip: &str) -> Pooled {
         let mut p = Proxy::new(ip.parse().unwrap(), 80, BTreeSet::new());
         p.add_type(scheme, None);
         // Give it a runtime so avg_resp_time reflects `rt`.
         p.record_attempt(Some(rt), None);
-        p
+        Pooled {
+            proxy: p,
+            blocked_until: None,
+        }
     }
 
     /// A default `Best` selection context for `scheme`.
@@ -598,6 +653,7 @@ mod tests {
             strategy: Strategy::Best,
             sticky: None,
             round_robin_cursor: 0,
+            now: tokio::time::Instant::now(),
         }
     }
 
@@ -609,7 +665,33 @@ mod tests {
             proxy_with(0.3, Proto::Http),
         ];
         let idx = best_for(&pool, &ctx(Scheme::Http)).unwrap();
-        assert_eq!(pool[idx].avg_resp_time(), 0.1);
+        assert_eq!(pool[idx].proxy.avg_resp_time(), 0.1);
+    }
+
+    #[test]
+    fn best_for_prefers_ready_over_benched() {
+        // Two-tier ranking: a ready but slower proxy beats a faster but benched one; when only
+        // the benched proxy is eligible, it is served as the backup tier.
+        let now = tokio::time::Instant::now();
+        let mut benched = proxy_at(0.1, Proto::Http, "2.2.2.2"); // faster
+        benched.blocked_until = Some(now + Duration::from_secs(30));
+        let pool = vec![proxy_at(0.9, Proto::Http, "1.1.1.1"), benched]; // index 0 ready, 1 benched
+        let mut c = ctx(Scheme::Http);
+        c.now = now;
+        assert_eq!(
+            best_for(&pool, &c),
+            Some(0),
+            "ready proxy beats a faster benched one"
+        );
+
+        // Only a benched proxy present → backup tier still serves it.
+        let mut lone = proxy_at(0.1, Proto::Http, "3.3.3.3");
+        lone.blocked_until = Some(now + Duration::from_secs(30));
+        assert_eq!(
+            best_for(&[lone], &c),
+            Some(0),
+            "benched proxy is the backup tier"
+        );
     }
 
     #[test]

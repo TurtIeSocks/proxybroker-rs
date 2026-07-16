@@ -138,6 +138,69 @@ async fn pool_country_match_is_case_insensitive() {
     assert!(pool.get(Scheme::Http, &any_key()).await.is_some());
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_proxy_is_benched_then_re_probed() {
+    // A proxy that fails is benched for fail_timeout and skipped while a healthy one exists;
+    // after the window elapses it re-enters selection (the re-probe). tokio's paused clock drives
+    // the timer — no real sleeps.
+    let pool = Pool::from_proxies(
+        vec![proxy_in("1.1.1.1", "US"), proxy_in("2.2.2.2", "US")],
+        PoolConfig {
+            fail_timeout: Duration::from_secs(30),
+            ..PoolConfig::default()
+        },
+    );
+    let k = any_key();
+
+    // Bench one proxy.
+    let benched = pool.get(Scheme::Http, &k).await.unwrap();
+    let benched_addr = benched.addr();
+    pool.put_failed(benched);
+
+    // The still-ready proxy is chosen over the benched one.
+    let ready = pool.get(Scheme::Http, &k).await.unwrap();
+    assert_ne!(ready.addr(), benched_addr, "a benched proxy is skipped");
+    pool.put_ok(ready); // both back in the pool (one benched, one ready)
+
+    // After the bench window, the benched proxy re-enters selection.
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let a = pool.get(Scheme::Http, &k).await.unwrap();
+    let b = pool.get(Scheme::Http, &k).await.unwrap();
+    assert!(
+        [a.addr(), b.addr()].contains(&benched_addr),
+        "benched proxy is re-probed after fail_timeout"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn benched_proxy_is_backup_when_pool_otherwise_empty() {
+    // With nothing else eligible, a benched proxy is still served (better than a 502).
+    let pool = Pool::from_proxies(vec![proxy_in("1.1.1.1", "US")], PoolConfig::default());
+    let k = any_key();
+    let p = pool.get(Scheme::Http, &k).await.unwrap();
+    pool.put_failed(p);
+    assert!(
+        pool.get(Scheme::Http, &k).await.is_some(),
+        "a benched proxy is the backup tier when nothing else is eligible"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_unhealthy_still_evicted() {
+    // Benching is additive: a proxy over the error-rate threshold (after min_req) is still hard-
+    // evicted by put_*, not merely benched.
+    let mut p = proxy_in("1.1.1.1", "US");
+    for _ in 0..5 {
+        p.record_attempt(None, Some(proxybroker::ProxyError::ConnFailed)); // 5 reqs, 100% errors
+    }
+    let pool = Pool::from_proxies(vec![], PoolConfig::default());
+    pool.put_ok(p); // unhealthy → dropped, not pooled
+    assert!(
+        pool.get(Scheme::Http, &any_key()).await.is_none(),
+        "a persistently unhealthy proxy is evicted"
+    );
+}
+
 #[tokio::test]
 async fn sticky_returns_same_proxy_for_same_client() {
     // Pool-level proof of the session map: the same client key, across a get/put/get cycle, is
@@ -152,7 +215,7 @@ async fn sticky_returns_same_proxy_for_same_client() {
     let a = ClientKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
     let first = pool.get(Scheme::Http, &a).await.unwrap();
     let pinned = first.addr();
-    pool.put(first); // healthy return — back into the pool
+    pool.put_ok(first); // healthy return — back into the pool
     let second = pool.get(Scheme::Http, &a).await.unwrap();
     assert_eq!(
         second.addr(),
