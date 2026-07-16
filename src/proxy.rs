@@ -7,6 +7,7 @@
 //! lives in the checker/negotiator and is passed in. See `docs/systematic-refactor/map.md`
 //! (socket ownership) and `decisions.md`.
 
+use crate::checker::TrustReport;
 use crate::error::ProxyError;
 use crate::types::{AnonLevel, Caps, Proto, Scheme};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
@@ -78,6 +79,8 @@ pub struct Proxy {
     /// Capability profile (A4), OR-accumulated across confirmed protocols. Not serialized (stays
     /// out of the parity JSON); exposed via [`Proxy::caps`]/[`Proxy::capabilities`] + CLI filters.
     caps: Caps,
+    /// Honeypot/trust verdict (A6). Empty (trusted) unless `--trust-check` ran. Not serialized.
+    trust: TrustReport,
 }
 
 /// A proxy's full capability profile (A4): the recorded [`Caps`] plus CONNECT:25 support derived
@@ -134,6 +137,7 @@ impl Proxy {
             runtimes: Vec::new(),
             auth: None,
             caps: Caps::default(),
+            trust: TrustReport::default(),
         }
     }
 
@@ -200,6 +204,16 @@ impl Proxy {
             referer_echo: self.caps.referer_echo,
             connect25: self.types.contains_key(&Proto::Connect25),
         }
+    }
+
+    /// The honeypot/trust verdict (A6). Empty (trusted) unless `--trust-check` assessed this proxy.
+    pub fn trust(&self) -> &TrustReport {
+        &self.trust
+    }
+
+    /// Record the trust verdict from a working attempt (A6).
+    pub fn set_trust(&mut self, r: TrustReport) {
+        self.trust = r;
     }
 
     /// Error rate in `0.0..=1.0`, rounded to 2 dp. `0.0` before any request. `proxy.py:error_rate`.
@@ -424,6 +438,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             runtimes: Vec::new(),
             auth: None, // secrets are never serialized, so never deserialized either
             caps: Caps::default(), // capabilities are not serialized; re-measured on a fresh check
+            trust: TrustReport::default(), // trust is not serialized; re-assessed on a fresh check
         })
     }
 }

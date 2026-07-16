@@ -296,6 +296,14 @@ struct FindArgs {
     #[arg(long)]
     require_connect25: bool,
 
+    /// Run honeypot detection on each proxy and record the verdict (canary + injected-header scan).
+    #[arg(long)]
+    trust_check: bool,
+
+    /// Keep only proxies whose trust verdict is clean (implies --trust-check).
+    #[arg(long)]
+    require_trusted: bool,
+
     /// Print an aggregate summary (by protocol/anonymity/country) to stderr when done.
     #[arg(long)]
     show_stats: bool,
@@ -798,6 +806,8 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
     query.require_cookie = args.require_cookie;
     query.require_referer = args.require_referer;
     query.require_connect25 = args.require_connect25;
+    query.trust_check = args.trust_check;
+    query.require_trusted = args.require_trusted;
 
     let mut stream = broker.find(query).await?;
     write_stream(
@@ -882,10 +892,12 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         post: args.post,
         strict: args.strict,
         liveness_url: None, // --liveness-url is a find-only flag; check works from an explicit list
-        relaxed_validity: false, // A4 capability flags are find-only for now
+        relaxed_validity: false, // A4/A6 flags are find-only for now
         require_cookie: false,
         require_referer: false,
         require_connect25: false,
+        trust_check: false,
+        require_trusted: false,
     };
 
     let mut stream = broker

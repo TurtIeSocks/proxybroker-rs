@@ -93,6 +93,10 @@ pub struct FindQuery {
     pub require_referer: bool,
     /// Keep only proxies with a confirmed CONNECT:25 (SMTP) tunnel (A4).
     pub require_connect25: bool,
+    /// Run honeypot detection and record the verdict (A6).
+    pub trust_check: bool,
+    /// Keep only proxies with a clean trust verdict (implies `trust_check`) (A6).
+    pub require_trusted: bool,
 }
 
 impl Default for FindQuery {
@@ -113,6 +117,8 @@ impl Default for FindQuery {
             require_cookie: false,
             require_referer: false,
             require_connect25: false,
+            trust_check: false,
+            require_trusted: false,
         }
     }
 }
@@ -242,11 +248,13 @@ impl FindQueryBuilder {
             post: self.post.unwrap_or(d.post),
             strict: self.strict.unwrap_or(d.strict),
             liveness_url: self.liveness_url.or(d.liveness_url),
-            // A4 capability flags have no builder setter (callers set the pub fields directly).
+            // A4/A6 flags have no builder setter (callers set the pub fields directly).
             relaxed_validity: d.relaxed_validity,
             require_cookie: d.require_cookie,
             require_referer: d.require_referer,
             require_connect25: d.require_connect25,
+            trust_check: d.trust_check,
+            require_trusted: d.require_trusted,
         }
     }
 }
@@ -423,6 +431,8 @@ impl Broker {
                 post: query.post,
                 strict: query.strict,
                 relaxed_validity: query.relaxed_validity,
+                // --require-trusted implies running the check.
+                trust_check: query.trust_check || query.require_trusted,
                 dnsbl: query.dnsbl.clone(),
                 liveness_url: query.liveness_url.clone(),
             },
@@ -599,6 +609,7 @@ struct CapsFilter {
     cookie: bool,
     referer: bool,
     connect25: bool,
+    trusted: bool,
 }
 
 impl CapsFilter {
@@ -607,6 +618,7 @@ impl CapsFilter {
             cookie: q.require_cookie,
             referer: q.require_referer,
             connect25: q.require_connect25,
+            trusted: q.require_trusted,
         }
     }
 
@@ -615,6 +627,7 @@ impl CapsFilter {
         (!self.cookie || c.cookie_echo)
             && (!self.referer || c.referer_echo)
             && (!self.connect25 || c.connect25)
+            && (!self.trusted || p.trust().trusted())
     }
 }
 
@@ -802,6 +815,8 @@ mod tests {
                 require_cookie: false,
                 require_referer: false,
                 require_connect25: false,
+                trust_check: false,
+                require_trusted: false,
             }
         );
     }

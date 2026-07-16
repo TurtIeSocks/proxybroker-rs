@@ -30,6 +30,7 @@ pub struct Checker {
     post: bool,
     strict: bool,
     relaxed_validity: bool,
+    trust_check: bool,
     /// DNS blocklist zones; empty disables the check. Kept with the resolver so `check` can
     /// reject a listed proxy before doing any real work.
     dnsbl: Vec<String>,
@@ -183,6 +184,9 @@ pub struct CheckerConfig {
     /// Relax response validity to marker + IP only, demoting Referer/Cookie from validity gates to
     /// recorded capability signals (A4). Default `false` = parity (all four required).
     pub relaxed_validity: bool,
+    /// Run honeypot detection on each proxy and record the trust verdict (A6). Default `false` =
+    /// no assessment, zero cost.
+    pub trust_check: bool,
     /// DNS blocklist zones (`--dnsbl`); a proxy whose IP is listed in any zone is rejected.
     pub dnsbl: Vec<String>,
     /// When the judge pool is empty, fall back to a plain liveness check against this URL instead
@@ -235,6 +239,7 @@ impl Checker {
             post: cfg.post,
             strict: cfg.strict,
             relaxed_validity: cfg.relaxed_validity,
+            trust_check: cfg.trust_check,
             dnsbl: cfg.dnsbl,
             resolver,
             mode,
@@ -330,6 +335,7 @@ impl Checker {
                     proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
                     proxy.add_type(proto, obs.level);
                     proxy.record_caps(obs.caps);
+                    proxy.set_trust(obs.trust);
                     return true;
                 }
                 Ok(Attempt::Invalid) => {
@@ -421,7 +427,13 @@ impl Checker {
                 } else {
                     None
                 };
-                Ok(Attempt::Working(Observation { level, caps }))
+                // Honeypot verdict (A6): only when opted in — the marker doubles as the canary.
+                let trust = if self.trust_check {
+                    TrustReport::assess(&sent_header_names(), &marker, &content)
+                } else {
+                    TrustReport::default()
+                };
+                Ok(Attempt::Working(Observation { level, caps, trust }))
             }
         }
     }
@@ -537,12 +549,91 @@ enum Attempt {
     Invalid,
 }
 
-/// What a working attempt observed about the proxy: its anonymity level (HTTP only) and the
-/// capability profile (A4). A6 extends this with a trust verdict.
+/// What a working attempt observed about the proxy: its anonymity level (HTTP only), the
+/// capability profile (A4), and the trust verdict (A6).
 #[derive(Debug, Default)]
 struct Observation {
     level: Option<AnonLevel>,
     caps: Caps,
+    trust: TrustReport,
+}
+
+/// A specific way a proxy's judge round-trip looked hostile (A6). Reported individually — never a
+/// bare "untrusted" boolean — so the caller sees *which* signal fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSignal {
+    /// Our canary nonce did not survive the round-trip unmutated (content tampering).
+    CanaryMismatch,
+    /// The echoed request carried a header we never sent (injection).
+    InjectedHeader,
+    /// The HTTPS judge presented a certificate that did not match the pin (MITM). Reserved for the
+    /// optional cert-pin follow-up; the dependency-free core never emits it.
+    CertMismatch,
+}
+
+/// The honeypot/hostility verdict for a proxy (A6). Empty = trusted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustReport {
+    pub signals: Vec<TrustSignal>,
+}
+
+impl TrustReport {
+    /// No signal fired.
+    pub fn trusted(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    /// Assess a **decompressed** judge response against what we sent. Pure — the unit under test.
+    ///
+    /// - **Canary:** our nonce must appear verbatim (content tampering else).
+    /// - **Injected headers:** the echoed request (scanned as `Name: value` lines) must carry no
+    ///   header name outside the set we sent ∪ a benign-hop allowlist. `Via`/`X-Forwarded-For` are
+    ///   the *anonymity* signal, not trust, so they are allow-listed to avoid double-counting.
+    ///
+    /// The scan splits on `": "` (colon-space), so a URL value like `https://…` on its own line is
+    /// not mistaken for a header. It is a heuristic: opt-in, with documented false-positive guards.
+    pub fn assess(sent_header_names: &[&str], canary: &str, content: &str) -> TrustReport {
+        let mut signals = Vec::new();
+        if !content.contains(canary) {
+            signals.push(TrustSignal::CanaryMismatch);
+        }
+        const BENIGN: &[&str] = &[
+            "host",
+            "connection",
+            "content-length",
+            "x-forwarded-for",
+            "via",
+        ];
+        let sent: HashSet<String> = sent_header_names
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        for line in content.lines() {
+            let Some((name, _)) = line.split_once(": ") else {
+                continue;
+            };
+            let name = name.trim().to_ascii_lowercase();
+            // Only plausible header names (letters/digits/hyphen) — skips `REMOTE_ADDR = …` etc.
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                continue;
+            }
+            if !sent.contains(&name) && !BENIGN.contains(&name.as_str()) {
+                signals.push(TrustSignal::InjectedHeader);
+                break;
+            }
+        }
+        TrustReport { signals }
+    }
+}
+
+/// The header names the checker sends on the test request (A6 injected-header baseline): the
+/// constant request headers plus the three `build_request` adds.
+fn sent_header_names() -> Vec<&'static str> {
+    request_headers(None)
+        .keys()
+        .copied()
+        .chain(["Host", "Connection", "Content-Length"])
+        .collect()
 }
 
 /// Read the whole response. We send `Connection: close`, so the judge closes the connection
@@ -747,5 +838,77 @@ mod tests {
         }
         // Zero base → zero: the parity path never sleeps.
         assert_eq!(RetryPolicy::default().backoff_for(0), Duration::ZERO);
+    }
+
+    // The header names the checker sends (the injected-header baseline).
+    const SENT: &[&str] = &[
+        "User-Agent",
+        "Accept",
+        "Accept-Encoding",
+        "Pragma",
+        "Cache-control",
+        "Cookie",
+        "Referer",
+        "Host",
+        "Connection",
+        "Content-Length",
+    ];
+
+    #[test]
+    fn sent_header_names_matches_the_request() {
+        // The baseline must equal what build_request actually sends, or the scan false-positives.
+        let mut got = sent_header_names();
+        got.sort_unstable();
+        let mut want = SENT.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn trust_clean_response_is_trusted() {
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Cookie: cookie=ok\n\
+             Referer: https://www.google.com/\n\
+             Host: judge.example\n\
+             REMOTE_ADDR = 8.8.8.8\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
+    }
+
+    #[test]
+    fn trust_injected_header_is_flagged() {
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Cookie: cookie=ok\n\
+             X-Ad-Inject: buy now\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert_eq!(r.signals, vec![TrustSignal::InjectedHeader]);
+    }
+
+    #[test]
+    fn trust_canary_mutation_is_flagged() {
+        let content = "User-Agent: PxBroker/0.1/MUTATED\n\
+             Cookie: cookie=ok\n\
+             Host: judge.example\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert_eq!(r.signals, vec![TrustSignal::CanaryMismatch]);
+    }
+
+    #[test]
+    fn trust_forwarded_via_headers_are_not_injection() {
+        // Via / X-Forwarded-For are the anonymity signal, allow-listed so they don't double-count.
+        let content = "User-Agent: PxBroker/0.1/CANARY42\n\
+             Via: 1.1 someproxy\n\
+             X-Forwarded-For: 8.8.8.8\n\
+             Host: judge.example\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
+    }
+
+    #[test]
+    fn trust_url_value_on_its_own_is_not_a_header() {
+        // A bare URL must not be parsed as a `https:` header (the `": "` split guards this).
+        let content = "User-Agent: PxBroker/0.1/CANARY42\nhttps://www.google.com/\n";
+        let r = TrustReport::assess(SENT, "CANARY42", content);
+        assert!(r.trusted(), "unexpected signals: {:?}", r.signals);
     }
 }
