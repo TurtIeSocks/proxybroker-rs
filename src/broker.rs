@@ -19,7 +19,7 @@
 //! A [`CancellationToken`] fired when the consumer drops the stream aborts in-flight checks —
 //! not a detached-task leak (critique #14).
 
-use crate::checker::{Checker, CheckerConfig};
+use crate::checker::{Checker, CheckerConfig, RetryPolicy};
 use crate::provider::{fetch, ProviderSpec};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
@@ -76,8 +76,8 @@ pub struct FindQuery {
     pub timeout: Duration,
     /// Max concurrent checks in flight. `api.py:max_conn`.
     pub max_conn: usize,
-    /// Attempts per protocol before giving up. `api.py:max_tries`.
-    pub max_tries: usize,
+    /// Retry policy: attempts per protocol, which errors retry, and the backoff schedule (A5).
+    pub retry: RetryPolicy,
     /// Use `POST` for the test request.
     pub post: bool,
     /// Require the anonymity level to match exactly.
@@ -97,7 +97,7 @@ impl Default for FindQuery {
             dnsbl: Vec::new(),
             timeout: Duration::from_secs(8),
             max_conn: 200,
-            max_tries: 3,
+            retry: RetryPolicy::default(),
             post: false,
             strict: false,
             liveness_url: None,
@@ -125,6 +125,7 @@ pub struct FindQueryBuilder {
     timeout: Option<Duration>,
     max_conn: Option<usize>,
     max_tries: Option<usize>,
+    retry: Option<RetryPolicy>,
     post: Option<bool>,
     strict: Option<bool>,
     liveness_url: Option<String>,
@@ -174,9 +175,16 @@ impl FindQueryBuilder {
         self
     }
 
-    /// Attempts per protocol before giving up.
+    /// Attempts per protocol before giving up. Overrides just the count on the retry policy.
     pub fn max_tries(mut self, max_tries: usize) -> Self {
         self.max_tries = Some(max_tries);
+        self
+    }
+
+    /// The full retry policy (which errors retry + backoff schedule, A5). `max_tries`, if also
+    /// set, overrides this policy's attempt count.
+    pub fn retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = Some(retry);
         self
     }
 
@@ -211,7 +219,14 @@ impl FindQueryBuilder {
             dnsbl: self.dnsbl.unwrap_or(d.dnsbl),
             timeout: self.timeout.unwrap_or(d.timeout),
             max_conn: self.max_conn.unwrap_or(d.max_conn),
-            max_tries: self.max_tries.unwrap_or(d.max_tries),
+            retry: {
+                // `.retry(policy)` sets the whole policy; `.max_tries(n)` overrides just the count.
+                let mut r = self.retry.unwrap_or(d.retry);
+                if let Some(mt) = self.max_tries {
+                    r.max_tries = mt;
+                }
+                r
+            },
             post: self.post.unwrap_or(d.post),
             strict: self.strict.unwrap_or(d.strict),
             liveness_url: self.liveness_url.or(d.liveness_url),
@@ -385,7 +400,7 @@ impl Broker {
                 judges: query.judges.clone(),
                 types: query.types.clone(),
                 timeout: query.timeout,
-                max_tries: query.max_tries,
+                retry: query.retry.clone(),
                 post: query.post,
                 strict: query.strict,
                 dnsbl: query.dnsbl.clone(),
@@ -726,7 +741,7 @@ mod tests {
                 dnsbl: vec!["zen.example.org".into()],
                 timeout: Duration::from_secs(3),
                 max_conn: 7,
-                max_tries: 2,
+                retry: RetryPolicy::tries(2),
                 post: true,
                 strict: true,
                 liveness_url: None,

@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use proxybroker::broker::{Broker, FindQuery};
 use proxybroker::resolver::Resolver;
 use proxybroker::types::{Proto, TypeSpec};
-use proxybroker::Proxy;
+use proxybroker::{Proxy, RetryPolicy};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,7 +70,7 @@ fn query(judge: std::net::SocketAddr, limit: Option<usize>) -> FindQuery {
         limit,
         timeout: Duration::from_secs(3),
         max_conn: 8,
-        max_tries: 1,
+        retry: RetryPolicy::tries(1),
         ..Default::default()
     }
 }

@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use proxybroker::broker::{Broker, FindQuery, GrabQuery};
 use proxybroker::types::{AnonLevel, ParseProtoError, Proto, TypeSpec};
-use proxybroker::Proxy;
+use proxybroker::{Proxy, ProxyError, RetryPolicy};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -269,6 +270,14 @@ struct FindArgs {
     #[arg(long, value_name = "URL")]
     liveness_url: Option<String>,
 
+    /// Which errors trigger a retry: timeout (default), transient, or all.
+    #[arg(long, value_enum, default_value_t = RetryOn::Timeout)]
+    retry_on: RetryOn,
+
+    /// Base backoff before a retry, in milliseconds (0 = no delay).
+    #[arg(long, default_value_t = 0)]
+    backoff_ms: u64,
+
     /// Print an aggregate summary (by protocol/anonymity/country) to stderr when done.
     #[arg(long)]
     show_stats: bool,
@@ -380,6 +389,39 @@ struct CheckArgs {
     /// of --format/--outfile.
     #[arg(long, value_name = "PATH")]
     save: Option<PathBuf>,
+}
+
+/// Which errors `--retry-on` retries (A5). `factor`/`jitter`/`max_backoff` stay library-only.
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum RetryOn {
+    /// Retry only `Timeout` (parity default).
+    #[default]
+    Timeout,
+    /// Retry the transient set: `Timeout`, `Reset`, `ConnFailed`, `EmptyRecv`.
+    Transient,
+    /// Retry every transient check-path error (adds `BadStatus`).
+    All,
+}
+
+/// Assemble a [`RetryPolicy`] from the CLI knobs.
+fn retry_policy(max_tries: usize, on: RetryOn, backoff_ms: u64) -> RetryPolicy {
+    let mut p = match on {
+        RetryOn::Timeout => RetryPolicy::tries(max_tries),
+        RetryOn::Transient => RetryPolicy::transient(max_tries),
+        RetryOn::All => RetryPolicy {
+            max_tries,
+            retry_on: HashSet::from([
+                ProxyError::Timeout,
+                ProxyError::Reset,
+                ProxyError::ConnFailed,
+                ProxyError::EmptyRecv,
+                ProxyError::BadStatus,
+            ]),
+            ..Default::default()
+        },
+    };
+    p.backoff = Duration::from_millis(backoff_ms);
+    p
 }
 
 /// Format for the `--show-stats` summary (which always goes to stderr, orthogonal to `--format`).
@@ -725,7 +767,7 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         .dnsbl(args.dnsbl)
         .timeout(Duration::from_secs(args.timeout))
         .max_conn(args.max_conn)
-        .max_tries(args.max_tries)
+        .retry(retry_policy(args.max_tries, args.retry_on, args.backoff_ms))
         .post(args.post)
         .strict(args.strict)
         .liveness_url(args.liveness_url);
@@ -813,7 +855,7 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         dnsbl: args.dnsbl,
         timeout: Duration::from_secs(args.timeout),
         max_conn: args.max_conn,
-        max_tries: args.max_tries,
+        retry: RetryPolicy::tries(args.max_tries),
         post: args.post,
         strict: args.strict,
         liveness_url: None, // --liveness-url is a find-only flag; check works from an explicit list

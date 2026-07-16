@@ -3,7 +3,7 @@
 //! `NoJudges`. Fully offline (constraint C5): a "bad judge" that never echoes the real IP forces
 //! an empty judge pool, and a mock proxy returns the status under test.
 
-use proxybroker::checker::{Checker, CheckerConfig};
+use proxybroker::checker::{Checker, CheckerConfig, RetryPolicy};
 use proxybroker::proxy::Proxy;
 use proxybroker::resolver::Resolver;
 use proxybroker::types::{AnonLevel, Proto, TypeSpec};
@@ -50,7 +50,7 @@ fn cfg(
             levels,
         }],
         timeout: Duration::from_secs(3),
-        max_tries: 2,
+        retry: RetryPolicy::tries(2),
         liveness_url: liveness,
         ..Default::default()
     }

@@ -3,7 +3,7 @@
 //! negotiate (no-op for HTTP), test request, validate, classify anonymity — with no internet
 //! (constraint C5).
 
-use proxybroker::checker::{Checker, CheckerConfig};
+use proxybroker::checker::{Checker, CheckerConfig, RetryPolicy};
 use proxybroker::proxy::Proxy;
 use proxybroker::resolver::Resolver;
 use proxybroker::types::{AnonLevel, Proto, TypeSpec};
@@ -56,7 +56,7 @@ fn cfg(judge_url: &str) -> CheckerConfig {
         judges: vec![judge_url.to_string()],
         types: vec![TypeSpec::any(Proto::Http)],
         timeout: Duration::from_secs(3),
-        max_tries: 2,
+        retry: RetryPolicy::tries(2),
         ..Default::default()
     }
 }

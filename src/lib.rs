@@ -45,7 +45,7 @@ pub mod types;
 pub mod utils;
 
 pub use broker::{Broker, FindQuery, FindQueryBuilder, GrabQuery, ProxyStream};
-pub use checker::{Checker, CheckerConfig};
+pub use checker::{Checker, CheckerConfig, RetryPolicy};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;

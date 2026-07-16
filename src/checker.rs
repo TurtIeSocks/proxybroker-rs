@@ -14,6 +14,7 @@ use crate::proxy::Proxy;
 use crate::resolver::Resolver;
 use crate::types::{AnonLevel, JudgeScheme, Proto, TypeSpec};
 use crate::utils::{fresh_marker, get_all_ip, get_status_code, request_headers};
+use rand::Rng;
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -26,7 +27,6 @@ pub struct Checker {
     real_ext_ips: HashSet<IpAddr>,
     requested: Vec<TypeSpec>,
     timeout: Duration,
-    max_tries: usize,
     post: bool,
     strict: bool,
     /// DNS blocklist zones; empty disables the check. Kept with the resolver so `check` can
@@ -35,6 +35,7 @@ pub struct Checker {
     resolver: std::sync::Arc<Resolver>,
     /// Judged (a verified judge pool) or Liveness (graceful degradation, A2).
     mode: CheckMode,
+    retry: RetryPolicy,
 }
 
 /// How the checker validates a proxy: against a verified judge, or — when no judge came up and the
@@ -89,6 +90,81 @@ impl std::fmt::Debug for Checker {
     }
 }
 
+/// Which errors retry and how long to wait between attempts (A5). Replaces a bare `max_tries`.
+///
+/// The [`Default`] reproduces the historical behavior exactly: 3 attempts, retry **only**
+/// `Timeout`, no delay — so existing callers are unaffected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPolicy {
+    /// Total attempts per protocol (`>= 1`).
+    pub max_tries: usize,
+    /// Which per-proxy errors are retryable. Default: just `Timeout` (parity).
+    pub retry_on: HashSet<ProxyError>,
+    /// Base delay before the first retry. Zero = no delay (parity).
+    pub backoff: Duration,
+    /// Per-attempt multiplier on the delay (exponential). `1.0` = constant.
+    pub factor: f64,
+    /// Symmetric jitter fraction applied to each delay, `0.0..=1.0`.
+    pub jitter: f64,
+    /// Upper bound on any single delay. Zero = uncapped.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_tries: 3,
+            retry_on: HashSet::from([ProxyError::Timeout]),
+            backoff: Duration::ZERO,
+            factor: 1.0,
+            jitter: 0.0,
+            max_backoff: Duration::ZERO,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// `max_tries` attempts, otherwise the default policy (retry only `Timeout`, no delay).
+    pub fn tries(max_tries: usize) -> Self {
+        RetryPolicy {
+            max_tries,
+            ..Default::default()
+        }
+    }
+
+    /// Retry the transient set — `{Timeout, Reset, ConnFailed, EmptyRecv}` — for `max_tries`.
+    pub fn transient(max_tries: usize) -> Self {
+        RetryPolicy {
+            max_tries,
+            retry_on: HashSet::from([
+                ProxyError::Timeout,
+                ProxyError::Reset,
+                ProxyError::ConnFailed,
+                ProxyError::EmptyRecv,
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// The delay before retry number `i` (0-based): `min(max_backoff, backoff * factor^i)`, then
+    /// symmetric jitter of `±jitter` fraction. Zero base → zero (no wall-clock sleep on the
+    /// parity path).
+    pub fn backoff_for(&self, i: usize) -> Duration {
+        if self.backoff.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut d = self.backoff.as_secs_f64() * self.factor.powi(i as i32);
+        if !self.max_backoff.is_zero() {
+            d = d.min(self.max_backoff.as_secs_f64());
+        }
+        if self.jitter > 0.0 {
+            let r: f64 = rand::rng().random_range(-1.0..=1.0);
+            d *= 1.0 + self.jitter * r;
+        }
+        Duration::from_secs_f64(d.max(0.0))
+    }
+}
+
 /// Configuration for [`Checker::new`].
 #[derive(Debug, Clone, Default)]
 pub struct CheckerConfig {
@@ -97,7 +173,8 @@ pub struct CheckerConfig {
     /// Protocols (and optional anonymity levels) to check. Required — empty is an error.
     pub types: Vec<TypeSpec>,
     pub timeout: Duration,
-    pub max_tries: usize,
+    /// Retry policy: attempt count, which errors retry, and the backoff schedule (A5).
+    pub retry: RetryPolicy,
     /// Use `POST` instead of `GET` for the test request.
     pub post: bool,
     /// Require the proxy's anonymity level to match exactly (`--strict`).
@@ -150,7 +227,7 @@ impl Checker {
             real_ext_ips,
             requested: cfg.types,
             timeout: cfg.timeout,
-            max_tries: cfg.max_tries,
+            retry: cfg.retry,
             post: cfg.post,
             strict: cfg.strict,
             dnsbl: cfg.dnsbl,
@@ -241,7 +318,7 @@ impl Checker {
             }
         };
 
-        for _ in 0..self.max_tries {
+        for i in 0..self.retry.max_tries {
             let start = Instant::now();
             match self.attempt(proxy, proto, &probe, &target).await {
                 Ok(Attempt::Working(level)) => {
@@ -255,13 +332,16 @@ impl Checker {
                     proxy.record_attempt(None, Some(ProxyError::BadResponse));
                     return false;
                 }
-                Err(ProxyError::Timeout) => {
-                    proxy.record_attempt(None, Some(ProxyError::Timeout));
-                    continue; // retry with a fresh connection
-                }
                 Err(e) => {
                     proxy.record_attempt(None, Some(e));
-                    return false; // break
+                    // Retry only errors the policy marks retryable, and only if attempts remain.
+                    // Default policy = {Timeout}, zero backoff → the historical timeout-only,
+                    // no-delay retry, exactly.
+                    if self.retry.retry_on.contains(&e) && i + 1 < self.retry.max_tries {
+                        tokio::time::sleep(self.retry.backoff_for(i)).await;
+                        continue;
+                    }
+                    return false;
                 }
             }
         }
@@ -559,5 +639,56 @@ mod tests {
         assert!(!response_is_valid(no_cookie, "5555"));
         // missing marker
         assert!(!response_is_valid(good, "9999"));
+    }
+
+    #[test]
+    fn default_policy_retries_only_timeout() {
+        let p = RetryPolicy::default();
+        assert_eq!(p.max_tries, 3);
+        assert_eq!(p.retry_on, HashSet::from([ProxyError::Timeout]));
+        assert!(!p.retry_on.contains(&ProxyError::Reset));
+        assert!(p.backoff.is_zero());
+    }
+
+    #[test]
+    fn retry_policy_backoff_schedule() {
+        // Constant (factor 1.0): 100ms every attempt.
+        let c = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 1.0,
+            ..Default::default()
+        };
+        for i in 0..=2 {
+            assert_eq!(c.backoff_for(i).as_millis(), 100);
+        }
+        // Exponential (factor 2.0): 100 / 200 / 400.
+        let e = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(e.backoff_for(0).as_millis(), 100);
+        assert_eq!(e.backoff_for(1).as_millis(), 200);
+        assert_eq!(e.backoff_for(2).as_millis(), 400);
+        // max_backoff caps the delay.
+        let cap = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            factor: 2.0,
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        };
+        assert_eq!(cap.backoff_for(2).as_millis(), 250);
+        // jitter 0.5 keeps each delay within [0.5x, 1.5x].
+        let j = RetryPolicy {
+            backoff: Duration::from_millis(100),
+            jitter: 0.5,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            let ms = j.backoff_for(0).as_secs_f64() * 1000.0;
+            assert!((50.0..=150.0).contains(&ms), "jitter out of band: {ms}ms");
+        }
+        // Zero base → zero: the parity path never sleeps.
+        assert_eq!(RetryPolicy::default().backoff_for(0), Duration::ZERO);
     }
 }
