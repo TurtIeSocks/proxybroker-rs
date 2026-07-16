@@ -40,11 +40,15 @@ pub mod persist;
 pub mod provider;
 pub mod proxy;
 pub mod resolver;
+#[cfg(all(feature = "server", feature = "persist"))]
+pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod stats;
 pub mod types;
 pub mod utils;
+#[cfg(all(feature = "server", feature = "watch"))]
+pub mod watch;
 
 pub use broker::{Broker, FindQuery, FindQueryBuilder, GrabQuery, ProxyStream};
 pub use checker::{Checker, CheckerConfig, RetryPolicy, TrustReport, TrustSignal};
@@ -60,9 +64,13 @@ pub use persist::{SqliteStore, SCHEMA_VERSION};
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{read_ndjson, write_ndjson, Capabilities, Country, Credentials, Proxy};
 pub use resolver::Resolver;
+#[cfg(all(feature = "server", feature = "persist"))]
+pub use scheduler::{decayed_score, next_interval, spawn_rechecker, RecheckConfig, RecheckHandle};
 #[cfg(feature = "metrics")]
 pub use server::{render_metrics, serve_metrics};
 #[cfg(feature = "server")]
 pub use server::{serve, ClientKey, Pool, PoolConfig, PoolSnapshot, ServerHandle, Strategy};
 pub use stats::Stats;
 pub use types::{AnonLevel, Caps, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
+#[cfg(all(feature = "server", feature = "watch"))]
+pub use watch::{reconcile, spawn_watch, WatchHandle};
