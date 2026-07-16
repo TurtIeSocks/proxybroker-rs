@@ -1,7 +1,8 @@
 //! The `proxybroker` CLI — a thin shell over the library.
 //!
-//! Currently exposes `grab` (scrape providers, no checking). `find` and `serve` land with
-//! the checker and server modules.
+//! - `grab` — scrape providers, no checking.
+//! - `find` — scrape, check, and classify anonymity.
+//! - `serve` — run a local rotating proxy server (requires the `server` feature).
 
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
