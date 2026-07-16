@@ -88,6 +88,12 @@ impl Proxy {
         self.types.insert(proto, level);
     }
 
+    /// Remove a confirmed protocol. Used by the checker's strict-mode filtering, which drops
+    /// types whose anonymity level does not match the request (`checker.py:_types_passed`).
+    pub fn remove_type(&mut self, proto: Proto) {
+        self.types.remove(&proto);
+    }
+
     /// True once any protocol is confirmed. `proxy.py:is_working` (set when types is non-empty).
     pub fn is_working(&self) -> bool {
         !self.types.is_empty()

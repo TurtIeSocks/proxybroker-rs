@@ -9,6 +9,7 @@
 //! `docs/systematic-refactor/map.md`.
 
 pub mod broker;
+pub mod checker;
 pub mod error;
 #[cfg(feature = "geo")]
 pub mod geo;
@@ -22,6 +23,7 @@ pub mod types;
 pub mod utils;
 
 pub use broker::{Broker, GrabQuery, ProxyStream};
+pub use checker::{Checker, CheckerConfig};
 pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;

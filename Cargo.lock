@@ -1189,6 +1189,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "flate2",
  "futures-core",
  "futures-util",
  "hickory-resolver",

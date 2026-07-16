@@ -25,6 +25,9 @@ pub struct Judge {
     pub url: String,
     pub scheme: JudgeScheme,
     pub host: String,
+    /// Path + query, e.g. `/get?show_env` — sent as the request target (origin-form when
+    /// tunnelled, absolute-form for plain HTTP).
+    pub path: String,
     pub ip: Option<IpAddr>,
     pub marks: Marks,
 }
@@ -48,10 +51,15 @@ impl Judge {
             _ => return None,
         };
         let host = parsed.host_str()?.to_owned();
+        let path = match parsed.query() {
+            Some(q) => format!("{}?{}", parsed.path(), q),
+            None => parsed.path().to_owned(),
+        };
         Some(Judge {
             url: url.to_owned(),
             scheme,
             host,
+            path,
             ip: None,
             marks: Marks::default(),
         })
