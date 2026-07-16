@@ -12,6 +12,7 @@ pub mod broker;
 pub mod error;
 #[cfg(feature = "geo")]
 pub mod geo;
+pub mod judge;
 pub mod negotiator;
 pub mod parse;
 pub mod provider;
