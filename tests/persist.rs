@@ -157,3 +157,43 @@ fn migration_from_v0_creates_table() {
     assert_eq!(has_table, 1);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn two_connections_can_write_concurrently() {
+    // The D3 re-checker opens a SECOND connection to the same --state DB while the D2 upsert
+    // observer holds the first. Guards that two connections both persist all their writes; the
+    // busy_timeout in SqliteStore::open lets a contended writer wait rather than error SQLITE_BUSY
+    // (the exact contention is timing-dependent, so this is a regression guard, not a forced race).
+    let path = tmp_db();
+    SqliteStore::open(&path).unwrap(); // create + migrate once
+
+    let mut threads = Vec::new();
+    for t in 0..2u8 {
+        let path = path.clone();
+        threads.push(std::thread::spawn(move || {
+            let store = SqliteStore::open(&path).unwrap();
+            for i in 0..150u16 {
+                let mut p = Proxy::new(
+                    format!("10.{t}.{}.{}", i / 256, i % 256).parse().unwrap(),
+                    8080,
+                    BTreeSet::new(),
+                );
+                p.add_type(Proto::Http, Some(AnonLevel::High));
+                p.record_attempt(Some(0.1), None);
+                store
+                    .upsert(&p)
+                    .expect("concurrent upsert must not SQLITE_BUSY");
+            }
+        }));
+    }
+    for th in threads {
+        th.join().unwrap();
+    }
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.load().unwrap().len(),
+        300,
+        "all rows from both writers persisted"
+    );
+    let _ = std::fs::remove_file(&path);
+}

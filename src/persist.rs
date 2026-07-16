@@ -55,6 +55,12 @@ mod sqlite {
         /// setting `PRAGMA user_version` to [`SCHEMA_VERSION`].
         pub fn open(path: impl AsRef<std::path::Path>) -> Result<SqliteStore, Error> {
             let conn = Connection::open(path).map_err(db)?;
+            // The D3 re-checker opens a SECOND connection to this same DB alongside the D2 upsert
+            // observer. Wait out a locked DB instead of erroring SQLITE_BUSY on a contended write —
+            // the scheduler discards upsert errors, so a dropped write would silently lose a
+            // re-check outcome.
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(db)?;
             migrate(&conn)?;
             Ok(SqliteStore {
                 conn: Mutex::new(conn),
