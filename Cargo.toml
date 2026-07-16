@@ -27,6 +27,8 @@ default = ["cli", "server", "geo", "geo-bundled"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
 # Local rotating proxy server. Pure library users mostly do not want a listening socket.
 server = []
+# Prometheus metrics endpoint for `serve` (F1). No new dependency — a hand-rolled text exporter.
+metrics = ["server"]
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.

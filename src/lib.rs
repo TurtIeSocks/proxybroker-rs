@@ -54,7 +54,9 @@ pub use parse::parse_proxy_lines;
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{read_ndjson, write_ndjson, Capabilities, Country, Credentials, Proxy};
 pub use resolver::Resolver;
+#[cfg(feature = "metrics")]
+pub use server::{render_metrics, serve_metrics};
 #[cfg(feature = "server")]
-pub use server::{serve, ClientKey, Pool, PoolConfig, ServerHandle, Strategy};
+pub use server::{serve, ClientKey, Pool, PoolConfig, PoolSnapshot, ServerHandle, Strategy};
 pub use stats::Stats;
 pub use types::{AnonLevel, Caps, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};

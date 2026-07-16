@@ -196,6 +196,11 @@ struct ServeArgs {
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
+
+    /// Serve a Prometheus text metrics endpoint on this address (F1).
+    #[cfg(feature = "metrics")]
+    #[arg(long, value_name = "ADDR")]
+    metrics: Option<std::net::SocketAddr>,
 }
 
 #[derive(clap::Args)]
@@ -728,6 +733,17 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         Pool::spawn(stream, pool_config)
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
+    // F1: an optional Prometheus endpoint alongside the proxy server. Cloned before `serve` takes
+    // the pool; the handle lives until shutdown.
+    #[cfg(feature = "metrics")]
+    let _metrics = match args.metrics {
+        Some(maddr) => {
+            let h = proxybroker::serve_metrics(maddr, pool.clone()).await?;
+            eprintln!("metrics on {}", h.local_addr());
+            Some(h)
+        }
+        None => None,
+    };
     let handle = serve(
         addr,
         pool,
