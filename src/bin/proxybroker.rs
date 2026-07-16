@@ -359,11 +359,39 @@ enum Format {
     Json,
 }
 
-impl Format {
-    fn render(self, proxy: &Proxy) -> String {
-        match self {
-            Format::Default | Format::Txt => proxy.addr(),
-            Format::Json => serde_json::to_string(proxy).unwrap(),
+/// Stateful output formatter: a one-time `prefix` (CSV header, JSON-array `[`), a per-proxy `item`
+/// (which owns its own newline / array separator), and a one-time `suffix` (JSON-array `]`). One
+/// source of format truth shared by both `write_stream` sink loops. Later waves' formats plug in as
+/// new `Format` variants + arms here.
+struct Emitter {
+    format: Format,
+}
+
+impl Emitter {
+    fn new(format: Format) -> Self {
+        Emitter { format }
+    }
+
+    /// Bytes emitted once before the first proxy. `None` for the streaming line formats.
+    fn prefix(&self) -> Option<String> {
+        match self.format {
+            Format::Default | Format::Txt | Format::Json => None,
+        }
+    }
+
+    /// One proxy rendered as a self-contained chunk (including its trailing newline for line
+    /// formats). `&mut self` so structural formats (JSON array) can track separator state.
+    fn item(&mut self, proxy: &Proxy) -> String {
+        match self.format {
+            Format::Default | Format::Txt => format!("{}\n", proxy.addr()),
+            Format::Json => format!("{}\n", serde_json::to_string(proxy).unwrap()),
+        }
+    }
+
+    /// Bytes emitted once after the last proxy. `None` for line formats.
+    fn suffix(&self) -> Option<String> {
+        match self.format {
+            Format::Default | Format::Txt | Format::Json => None,
         }
     }
 }
@@ -656,24 +684,37 @@ where
     };
 
     // Writing to a file is async I/O; stdout is a blocking lock. Keep them separate rather
-    // than boxing a trait object over two very different sinks.
+    // than boxing a trait object over two very different sinks; the *format* logic lives only in
+    // the shared `Emitter`, so the two branches differ only in their I/O mechanics.
+    let mut emitter = Emitter::new(format);
     if let Some(path) = outfile {
         let mut file = tokio::fs::File::create(path).await?;
+        if let Some(p) = emitter.prefix() {
+            file.write_all(p.as_bytes()).await?;
+        }
         let mut count = 0u64;
         while let Some(proxy) = stream.next().await {
-            file.write_all(format.render(&proxy).as_bytes()).await?;
-            file.write_all(b"\n").await?;
+            file.write_all(emitter.item(&proxy).as_bytes()).await?;
             save_line(&proxy)?;
             count += 1;
+        }
+        if let Some(s) = emitter.suffix() {
+            file.write_all(s.as_bytes()).await?;
         }
         file.flush().await?;
         eprintln!("wrote {count} proxies to {}", path.display());
     } else {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
+        if let Some(p) = emitter.prefix() {
+            write!(lock, "{p}")?;
+        }
         while let Some(proxy) = stream.next().await {
-            writeln!(lock, "{}", format.render(&proxy))?;
+            write!(lock, "{}", emitter.item(&proxy))?;
             save_line(&proxy)?;
+        }
+        if let Some(s) = emitter.suffix() {
+            write!(lock, "{s}")?;
         }
     }
     Ok(())
@@ -741,5 +782,46 @@ mod tests {
         ]);
         assert_eq!(comma, vec!["US".to_string(), "DE".to_string()]);
         assert_eq!(comma, space);
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use proxybroker::{AnonLevel, Country, Proto, Proxy};
+    use std::collections::BTreeSet;
+
+    /// A checked proxy with geo + one HTTP type at High + one recorded runtime.
+    fn proxy_fixture() -> Proxy {
+        let mut p = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        p.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+        });
+        p.add_type(Proto::Http, Some(AnonLevel::High));
+        p.record_attempt(Some(0.42), None);
+        p
+    }
+
+    #[test]
+    fn emitter_default_is_addr_per_line() {
+        let mut e = Emitter::new(Format::Default);
+        assert!(e.prefix().is_none());
+        assert_eq!(e.item(&proxy_fixture()), "1.2.3.4:8080\n");
+        assert!(e.suffix().is_none());
+    }
+
+    #[test]
+    fn emitter_json_is_ndjson() {
+        let mut e = Emitter::new(Format::Json);
+        assert!(e.prefix().is_none() && e.suffix().is_none());
+        let line = e.item(&proxy_fixture());
+        assert!(line.ends_with('\n'), "{line:?}");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one object per line: {line:?}"
+        );
+        assert!(line.trim_end().starts_with('{'), "{line:?}");
     }
 }
