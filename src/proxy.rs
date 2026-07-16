@@ -13,10 +13,22 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 
-/// Country of an IP. DB-IP Country Lite is country-resolution only, so region/city — present
-/// in proxybroker2's JSON — are always empty here. The shape is preserved for compatibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Country of an IP. The bundled DB-IP Country-Lite is country-resolution only, so `region`/`city`
+/// — present in proxybroker2's JSON — stay `None` for it. They populate only when the caller opens
+/// a richer MaxMind **City** DB via `--geo-db` (C7); the JSON shape is fixed either way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Country {
+    pub code: String,
+    pub name: String,
+    /// Subdivision (state/province), from a City DB only.
+    pub region: Option<Region>,
+    /// City name, from a City DB only.
+    pub city: Option<String>,
+}
+
+/// A subdivision (ISO 3166-2 state/province), populated only from a City DB.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Region {
     pub code: String,
     pub name: String,
 }
@@ -221,18 +233,22 @@ impl Serialize for Proxy {
         st.serialize_field("host", &self.host.to_string())?;
         st.serialize_field("port", &self.port)?;
 
-        // geo: { country: {code,name}, region:{code,name}, city } — region/city always empty
-        // because DB-IP Country Lite is country-only.
+        // geo: { country: {code,name}, region:{code,name}, city }. region/city fill only from a
+        // user City DB (C7); the bundled Country-Lite leaves them empty/null — the shape is fixed.
         let (code, name) = match &self.geo {
             Some(c) => (c.code.as_str(), c.name.as_str()),
             None => ("", ""),
         };
+        let region = self.geo.as_ref().and_then(|c| c.region.as_ref());
         st.serialize_field(
             "geo",
             &serde_json::json!({
                 "country": { "code": code, "name": name },
-                "region":  { "code": "", "name": "" },
-                "city": serde_json::Value::Null,
+                "region": {
+                    "code": region.map_or("", |r| r.code.as_str()),
+                    "name": region.map_or("", |r| r.name.as_str()),
+                },
+                "city": self.geo.as_ref().and_then(|c| c.city.as_deref()),
             }),
         )?;
 
@@ -302,6 +318,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             Some(Country {
                 code,
                 name: raw.geo.country.name,
+                ..Default::default()
             })
         };
         let mut types = BTreeMap::new();
@@ -392,6 +409,7 @@ mod tests {
         x.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         x.add_type(Proto::Http, Some(AnonLevel::High));
         x.add_type(Proto::Connect80, None);
@@ -431,6 +449,7 @@ mod tests {
         a.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         a.add_type(Proto::Http, Some(AnonLevel::High));
         let mut b = Proxy::new("5.6.7.8".parse().unwrap(), 3128, BTreeSet::new());
@@ -524,6 +543,7 @@ mod tests {
         x.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         x.add_type(Proto::Http, Some(AnonLevel::High));
         x.add_type(Proto::Connect80, None);

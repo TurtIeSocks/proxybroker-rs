@@ -179,6 +179,7 @@ mod tests {
             p.geo = Some(Country {
                 code: c.into(),
                 name: c.into(),
+                ..Default::default()
             });
         }
         p

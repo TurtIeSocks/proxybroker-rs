@@ -954,6 +954,7 @@ mod format_tests {
         p.geo = Some(Country {
             code: "US".into(),
             name: "United States".into(),
+            ..Default::default()
         });
         p.add_type(Proto::Http, Some(AnonLevel::High));
         p.record_attempt(Some(0.42), None);
