@@ -502,8 +502,13 @@ pub async fn serve(
     let max_tries = pool.config.max_tries;
     // Encode the expected header once at startup, not per request. `Arc` so each connection shares
     // one copy.
-    let expected: Option<Arc<str>> = auth.map(|up| {
-        Arc::from(format!("Basic {}", crate::utils::base64_encode(up.as_bytes())).as_str())
+    let expected: Option<Arc<AuthExpect>> = auth.map(|up| {
+        let (user, pass) = up.split_once(':').unwrap_or((up.as_str(), ""));
+        Arc::new(AuthExpect {
+            user: user.to_string(),
+            pass: pass.to_string(),
+            basic: format!("Basic {}", crate::utils::base64_encode(up.as_bytes())),
+        })
     });
     // The `proxycontrol` history map, shared across all connections (B6).
     let history = Arc::new(History::new());
@@ -559,7 +564,9 @@ enum Frontend {
     HttpForward,
     /// HTTP `CONNECT`: acknowledge with `200 Connection established`, then tunnel.
     HttpConnect,
-    // B12 adds `Socks5` here (acknowledge with a SOCKS5 success frame, then tunnel).
+    /// SOCKS5 front-end (B12): acknowledge with a SOCKS5 success frame, then tunnel. Auth (RFC
+    /// 1929) is handled during parsing, not by the HTTP `407` gate.
+    Socks5,
 }
 
 /// The client's intent, parsed from its first request.
@@ -586,25 +593,29 @@ async fn handle_client(
     resolver: Arc<Resolver>,
     timeout: Duration,
     max_tries: usize,
-    expected_auth: Option<Arc<str>>,
+    expected_auth: Option<Arc<AuthExpect>>,
     history: Arc<History>,
 ) -> std::io::Result<()> {
-    let Some(req) = parse_client_request(&mut client, timeout).await else {
+    let Some(req) = parse_client_request(&mut client, timeout, expected_auth.as_deref()).await
+    else {
         return Ok(());
     };
-    // B9: gate on client credentials before consuming any pool proxy. A plain `==` is fine — the
-    // secret is a shared static string, not a per-user hash, so constant-time compare is overkill.
-    // Auth is checked BEFORE the control API (a deliberate deviation from Python), so introspection
-    // cannot reveal pool membership on an authenticated server.
-    if let Some(expected) = &expected_auth {
-        if req.proxy_auth.as_deref() != Some(expected.as_ref()) {
-            let _ = client
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                      Proxy-Authenticate: Basic realm=\"proxybroker\"\r\n\r\n",
-                )
-                .await;
-            return Ok(());
+    // B9: gate HTTP clients on credentials before consuming any pool proxy. (A SOCKS5 client was
+    // already authed via RFC 1929 during parsing, so it is not re-gated here — an HTTP 407 to a
+    // SOCKS5 client would be a protocol error.) A plain `==` is fine — the secret is a shared
+    // static string. Auth is checked BEFORE the control API (a deliberate deviation from Python),
+    // so introspection cannot reveal pool membership on an authenticated server.
+    if req.frontend != Frontend::Socks5 {
+        if let Some(expected) = &expected_auth {
+            if req.proxy_auth.as_deref() != Some(expected.basic.as_str()) {
+                let _ = client
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                          Proxy-Authenticate: Basic realm=\"proxybroker\"\r\n\r\n",
+                    )
+                    .await;
+                return Ok(());
+            }
         }
     }
     // B6: `proxycontrol` requests are handled locally and never consume a pool proxy.
@@ -621,8 +632,8 @@ async fn handle_client(
 
     for _ in 0..max_tries {
         let Some(mut proxy) = pool.get(req.scheme, &key).await else {
-            // No proxy available and the source is exhausted.
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            // No proxy available and the source is exhausted — tell the client in its own protocol.
+            let _ = client.write_all(terminal_failure(req.frontend)).await;
             return Ok(());
         };
         let proto = choose_proto(&proxy, req.scheme);
@@ -669,8 +680,18 @@ async fn handle_client(
             }
         }
     }
-    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+    let _ = client.write_all(terminal_failure(req.frontend)).await;
     Ok(())
+}
+
+/// The client-visible "could not serve" reply, in the client's own protocol (B12): an HTTP `502`
+/// for HTTP/CONNECT front-ends, or a SOCKS5 general-failure reply for a SOCKS5 client (an HTTP body
+/// would be garbage to a SOCKS5 client mid-handshake).
+fn terminal_failure(frontend: Frontend) -> &'static [u8] {
+    match frontend {
+        Frontend::Socks5 => &[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0], // REP=01 general failure
+        _ => b"HTTP/1.1 502 Bad Gateway\r\n\r\n",
+    }
 }
 
 /// The sticky session key for this request: the configured header's value (HTTP only, when
@@ -685,6 +706,14 @@ fn client_key(config: &PoolConfig, peer_ip: IpAddr, req: &ClientRequest) -> Clie
         }
     }
     ClientKey::Ip(peer_ip)
+}
+
+/// The server's expected client credentials (B9/B12), precomputed once at startup: the raw
+/// user/pass for the SOCKS5 RFC 1929 comparison, and the HTTP `Basic <b64>` header form.
+struct AuthExpect {
+    user: String,
+    pass: String,
+    basic: String,
 }
 
 /// Per-client record of which upstream last served a request-target — the `proxycontrol` history
@@ -867,6 +896,18 @@ async fn relay(
                 return RelayOutcome::ClientGone;
             }
         }
+        Frontend::Socks5 => {
+            // SOCKS5 success reply (B12): VER=05 REP=00 RSV=00 ATYP=01 BND.ADDR=0.0.0.0 BND.PORT=0.
+            // A stub bound address, so we do not leak which upstream served the tunnel. No
+            // X-Proxy-Info — a SOCKS5 tunnel is opaque.
+            if client
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .is_err()
+            {
+                return RelayOutcome::ClientGone;
+            }
+        }
         Frontend::HttpForward => {
             // The buffered request goes upstream first — the client has still received nothing, so
             // a write failure here is retryable. When the proxy has credentials (B8), inject a
@@ -993,9 +1034,25 @@ fn request_has_body(raw: &[u8]) -> bool {
     }
 }
 
-/// Read and parse the client's first request line + Host, enough to route it.
-async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Option<ClientRequest> {
-    let mut buf = Vec::with_capacity(1024);
+/// Read and parse the client's first request, auto-detecting the front-end protocol (B12): a first
+/// byte of `0x05` is a SOCKS5 greeting; anything else is HTTP (forward or CONNECT).
+async fn parse_client_request(
+    client: &mut TcpStream,
+    timeout: Duration,
+    expected_auth: Option<&AuthExpect>,
+) -> Option<ClientRequest> {
+    // Sniff the first byte.
+    let mut first = [0u8; 1];
+    tokio::time::timeout(timeout, client.read_exact(&mut first))
+        .await
+        .ok()?
+        .ok()?;
+    if first[0] == 0x05 {
+        return parse_socks5_request(client, timeout, expected_auth).await;
+    }
+
+    // HTTP: seed the buffer with the sniffed byte, then read to the blank line.
+    let mut buf = vec![first[0]];
     let mut byte = [0u8; 1];
     let deadline = tokio::time::timeout(timeout, async {
         loop {
@@ -1058,6 +1115,120 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
             path,
         })
     }
+}
+
+/// Parse a SOCKS5 client handshake (B12): greeting → method select (no-auth, or RFC 1929 when the
+/// server has `--auth`) → CONNECT request. The `0x05` version byte was already consumed. Returns a
+/// tunnel [`ClientRequest`] (`Scheme::Https`, `Frontend::Socks5`), or `None` after writing the
+/// appropriate SOCKS5 rejection. Only `CMD=CONNECT` is supported; all three address types are.
+async fn parse_socks5_request(
+    client: &mut TcpStream,
+    timeout: Duration,
+    expected_auth: Option<&AuthExpect>,
+) -> Option<ClientRequest> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    tokio::time::timeout(timeout, async {
+        // Greeting: NMETHODS, then the offered method bytes.
+        let mut nmethods = [0u8; 1];
+        client.read_exact(&mut nmethods).await.ok()?;
+        let mut methods = vec![0u8; nmethods[0] as usize];
+        client.read_exact(&mut methods).await.ok()?;
+
+        match expected_auth {
+            None => {
+                // No-auth: require the client to offer 0x00.
+                if !methods.contains(&0x00) {
+                    let _ = client.write_all(&[0x05, 0xFF]).await; // no acceptable methods
+                    return None;
+                }
+                client.write_all(&[0x05, 0x00]).await.ok()?;
+            }
+            Some(exp) => {
+                // Require username/password (0x02), symmetric with the HTTP 407 gate.
+                if !methods.contains(&0x02) {
+                    let _ = client.write_all(&[0x05, 0xFF]).await;
+                    return None;
+                }
+                client.write_all(&[0x05, 0x02]).await.ok()?;
+                // RFC 1929: VER=01, ULEN, user, PLEN, pass.
+                let mut vu = [0u8; 2];
+                client.read_exact(&mut vu).await.ok()?;
+                let mut user = vec![0u8; vu[1] as usize];
+                client.read_exact(&mut user).await.ok()?;
+                let mut pl = [0u8; 1];
+                client.read_exact(&mut pl).await.ok()?;
+                let mut pass = vec![0u8; pl[0] as usize];
+                client.read_exact(&mut pass).await.ok()?;
+                if user == exp.user.as_bytes() && pass == exp.pass.as_bytes() {
+                    client.write_all(&[0x01, 0x00]).await.ok()?; // auth success
+                } else {
+                    let _ = client.write_all(&[0x01, 0x01]).await; // auth failure
+                    return None;
+                }
+            }
+        }
+
+        // CONNECT request: VER=05, CMD, RSV, ATYP.
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.ok()?;
+        if hdr[0] != 0x05 {
+            return None;
+        }
+        if hdr[1] != 0x01 {
+            // Only CONNECT; reject BIND/UDP with REP=07 (command not supported).
+            let _ = client
+                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return None;
+        }
+        let (host, port) = match hdr[3] {
+            0x01 => {
+                let mut a = [0u8; 4];
+                client.read_exact(&mut a).await.ok()?;
+                let mut p = [0u8; 2];
+                client.read_exact(&mut p).await.ok()?;
+                (Ipv4Addr::from(a).to_string(), u16::from_be_bytes(p))
+            }
+            0x04 => {
+                let mut a = [0u8; 16];
+                client.read_exact(&mut a).await.ok()?;
+                let mut p = [0u8; 2];
+                client.read_exact(&mut p).await.ok()?;
+                (Ipv6Addr::from(a).to_string(), u16::from_be_bytes(p))
+            }
+            0x03 => {
+                let mut l = [0u8; 1];
+                client.read_exact(&mut l).await.ok()?;
+                let mut d = vec![0u8; l[0] as usize];
+                client.read_exact(&mut d).await.ok()?;
+                let mut p = [0u8; 2];
+                client.read_exact(&mut p).await.ok()?;
+                (
+                    String::from_utf8_lossy(&d).into_owned(),
+                    u16::from_be_bytes(p),
+                )
+            }
+            _ => {
+                let _ = client
+                    .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) // addr type unsupported
+                    .await;
+                return None;
+            }
+        };
+        Some(ClientRequest {
+            // An opaque SOCKS5 CONNECT tunnel → Https scheme, so choose_proto prefers a tunnelling
+            // upstream proto.
+            scheme: Scheme::Https,
+            frontend: Frontend::Socks5,
+            path: format!("{host}:{port}"),
+            host,
+            port,
+            raw: Vec::new(),
+            proxy_auth: None,
+        })
+    })
+    .await
+    .ok()?
 }
 
 /// Split `host:port`, bracketed IPv6 aware, with a default port.
