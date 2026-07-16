@@ -190,14 +190,78 @@ impl Broker {
         if query.types.is_empty() {
             return Err(Error::NoTypes);
         }
-        // A resolver for external-IP discovery and judge-host resolution. Proxy candidates are
-        // already IP literals (from provider extraction), so no proxy-host DNS is needed.
+        let checker = self.build_checker(&query).await?;
+        let (tx, rx, cancel, stats) = new_run();
+        let broker = self.clone();
+        let task_cancel = cancel.clone();
+        let task_stats = stats.clone();
+        tokio::spawn(async move {
+            broker
+                .find_task(query, checker, tx, task_cancel, task_stats)
+                .await
+        });
+        Ok(ProxyStream {
+            rx,
+            _cancel_on_drop: Some(cancel.drop_guard()),
+            stats: Some(stats),
+        })
+    }
+
+    /// Gather **and check** proxies the caller already has, instead of scraping providers.
+    /// The counterpart to [`Broker::find`], sharing the same check pipeline — see `check_stream`.
+    ///
+    /// `proxies` is any stream of unchecked [`Proxy`]s (parse a file/stdin with
+    /// [`crate::parse::parse_proxy_lines`], or build them directly). Geo is attached per proxy so
+    /// serialized output carries country. The same errors surface up front as `find`
+    /// ([`Error::NoTypes`], [`Error::ExtIpUnknown`], [`Error::NoJudges`]).
+    pub async fn check<S>(&self, proxies: S, query: FindQuery) -> Result<ProxyStream, Error>
+    where
+        S: Stream<Item = Proxy> + Send + 'static,
+    {
+        if query.types.is_empty() {
+            return Err(Error::NoTypes);
+        }
+        let checker = self.build_checker(&query).await?;
+        let (tx, rx, cancel, stats) = new_run();
+        let broker = self.clone();
+        let task_cancel = cancel.clone();
+        let task_stats = stats.clone();
+        let countries = uppercase_set(query.countries.clone());
+        let (max_conn, limit) = (query.max_conn, query.limit);
+        tokio::spawn(async move {
+            // Attach geo + apply the country filter before checking, mirroring find's source.
+            let source = proxies.filter_map(move |mut proxy| {
+                broker.attach_geo(&mut proxy);
+                let keep = country_ok(&proxy, countries.as_ref()).then_some(proxy);
+                std::future::ready(keep)
+            });
+            check_stream(
+                source,
+                checker,
+                max_conn,
+                limit,
+                tx,
+                task_cancel,
+                task_stats,
+            )
+            .await;
+        });
+        Ok(ProxyStream {
+            rx,
+            _cancel_on_drop: Some(cancel.drop_guard()),
+            stats: Some(stats),
+        })
+    }
+
+    /// The resolver + external-IP discovery + [`Checker`] setup shared by `find` and `check`.
+    /// Proxy candidates are already IP literals, so the resolver is only for external-IP
+    /// discovery and judge-host resolution.
+    async fn build_checker(&self, query: &FindQuery) -> Result<Arc<Checker>, Error> {
         let resolver = match &self.resolver {
             Some(r) => r.clone(),
             None => Arc::new(Resolver::new(query.timeout)?),
         };
         let real_ext_ips = resolver.external_ips().await?;
-
         let checker = Checker::new(
             CheckerConfig {
                 judges: query.judges.clone(),
@@ -208,32 +272,12 @@ impl Broker {
                 strict: query.strict,
                 dnsbl: query.dnsbl.clone(),
             },
-            resolver.clone(),
+            resolver,
             &self.client,
             real_ext_ips,
         )
         .await?;
-
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        // Dropping the stream fires this token, aborting in-flight checks — no watcher task
-        // (a watcher holding a Sender would keep the channel open and deadlock termination).
-        let cancel = CancellationToken::new();
-        // Shared across every check task so stats cover ALL checked proxies, not just the
-        // working ones streamed out (design review F4).
-        let stats = Arc::new(std::sync::Mutex::new(StatsCollector::default()));
-        let broker = self.clone();
-        let task_cancel = cancel.clone();
-        let task_stats = stats.clone();
-        tokio::spawn(async move {
-            broker
-                .find_task(query, Arc::new(checker), tx, task_cancel, task_stats)
-                .await
-        });
-        Ok(ProxyStream {
-            rx,
-            _cancel_on_drop: Some(cancel.drop_guard()),
-            stats: Some(stats),
-        })
+        Ok(Arc::new(checker))
     }
 
     async fn find_task(
@@ -244,82 +288,44 @@ impl Broker {
         cancel: CancellationToken,
         stats: Arc<std::sync::Mutex<StatsCollector>>,
     ) {
-        let countries: Option<BTreeSet<String>> = query
-            .countries
-            .map(|cs| cs.into_iter().map(|c| c.to_uppercase()).collect());
-
-        let sem = Arc::new(Semaphore::new(query.max_conn));
-        let tracker = TaskTracker::new();
-        let sent = Arc::new(AtomicUsize::new(0));
-
-        let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+        let countries = uppercase_set(query.countries.clone());
         let client = self.client.clone();
         let specs: Vec<ProviderSpec> = self.providers.as_ref().clone();
-        let mut fetches = futures_util::stream::iter(specs)
+        let fetches = futures_util::stream::iter(specs)
             .map(|spec| {
                 let client = client.clone();
                 async move { fetch(&spec, &client).await }
             })
             .buffer_unordered(MAX_CONCURRENT_PROVIDERS);
 
-        'outer: while let Some(candidates) = fetches.next().await {
-            for cand in candidates {
-                if cancel.is_cancelled() || is_limit_reached(&sent, query.limit) {
-                    break 'outer;
-                }
-                let Ok(host) = cand.host.parse::<IpAddr>() else {
-                    continue;
-                };
-                if !seen.insert((host, cand.port)) {
-                    continue;
-                }
-                let mut proxy = Proxy::new(host, cand.port, cand.protocols.clone());
-                self.attach_geo(&mut proxy);
-                if !country_ok(&proxy, countries.as_ref()) {
-                    continue;
-                }
-
-                // Acquire a concurrency permit BEFORE spawning; move it into the task so its
-                // Drop frees the slot — race-free by construction (decisions.md §1).
-                let Ok(permit) = sem.clone().acquire_owned().await else {
-                    break 'outer;
-                };
-                let checker = checker.clone();
-                let tx = tx.clone();
-                let sent = sent.clone();
-                let cancel = cancel.clone();
-                let stats = stats.clone();
-                let limit = query.limit;
-                tracker.spawn(async move {
-                    let _permit = permit;
-                    tokio::select! {
-                        _ = cancel.cancelled() => {} // consumer gone — abort
-                        working = checker.check(&mut proxy) => {
-                            // Record EVERY checked proxy (working or not) before it is sent or
-                            // dropped, so the stats reflect the whole checked set (review F4).
-                            stats.lock().unwrap().record(&proxy);
-                            if working {
-                                // Reserve a slot atomically; emit only if under the limit.
-                                let n = sent.fetch_add(1, Ordering::SeqCst);
-                                match limit {
-                                    Some(l) if n >= l => cancel.cancel(),
-                                    _ => {
-                                        let _ = tx.send(proxy).await;
-                                        if limit.is_some_and(|l| n + 1 >= l) {
-                                            cancel.cancel();
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        // Flatten provider batches into a per-proxy stream: dedup on (host, port), attach geo,
+        // apply the country filter. `seen` is threaded through the FnMut closure.
+        let broker = self.clone();
+        let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+        let source = fetches
+            .flat_map(|cands| futures_util::stream::iter(cands))
+            .filter_map(move |cand| {
+                let keep = match cand.host.parse::<IpAddr>() {
+                    Ok(host) if seen.insert((host, cand.port)) => {
+                        let mut proxy = Proxy::new(host, cand.port, cand.protocols.clone());
+                        broker.attach_geo(&mut proxy);
+                        country_ok(&proxy, countries.as_ref()).then_some(proxy)
                     }
-                });
-            }
-        }
+                    _ => None,
+                };
+                std::future::ready(keep)
+            });
 
-        // Wait-group: drain every spawned check before dropping tx and ending the stream.
-        tracker.close();
-        tracker.wait().await;
+        check_stream(
+            source,
+            checker,
+            query.max_conn,
+            query.limit,
+            tx,
+            cancel,
+            stats,
+        )
+        .await;
     }
 
     #[cfg(feature = "geo")]
@@ -336,6 +342,93 @@ impl Broker {
 /// Has the emit count reached the limit? `None` = unlimited.
 fn is_limit_reached(sent: &AtomicUsize, limit: Option<usize>) -> bool {
     limit.is_some_and(|l| sent.load(Ordering::SeqCst) >= l)
+}
+
+/// The channel + cancellation + stats triple every run (`find`/`check`) is built from.
+type Run = (
+    mpsc::Sender<Proxy>,
+    mpsc::Receiver<Proxy>,
+    CancellationToken,
+    Arc<std::sync::Mutex<StatsCollector>>,
+);
+
+fn new_run() -> Run {
+    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+    // Shared across every check task so stats cover ALL checked proxies, not just the working
+    // ones streamed out (design review F4).
+    let stats = Arc::new(std::sync::Mutex::new(StatsCollector::default()));
+    (tx, rx, cancel, stats)
+}
+
+/// Uppercase an optional country list into a set for case-insensitive matching.
+fn uppercase_set(countries: Option<Vec<String>>) -> Option<BTreeSet<String>> {
+    countries.map(|v| v.into_iter().map(|c| c.to_uppercase()).collect())
+}
+
+/// The per-proxy concurrency pipeline shared by `find` and `check`: a [`Semaphore`] concurrency
+/// cap, a [`TaskTracker`] wait-group drained before the stream ends, atomic limit accounting,
+/// per-check `stats.record`, and cancel-on-drop. Source-agnostic — `find` feeds provider
+/// candidates, `check` feeds user input.
+async fn check_stream<S>(
+    source: S,
+    checker: Arc<Checker>,
+    max_conn: usize,
+    limit: Option<usize>,
+    tx: mpsc::Sender<Proxy>,
+    cancel: CancellationToken,
+    stats: Arc<std::sync::Mutex<StatsCollector>>,
+) where
+    S: Stream<Item = Proxy> + Send,
+{
+    let sem = Arc::new(Semaphore::new(max_conn));
+    let tracker = TaskTracker::new();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let mut source = std::pin::pin!(source);
+
+    while let Some(mut proxy) = source.next().await {
+        if cancel.is_cancelled() || is_limit_reached(&sent, limit) {
+            break;
+        }
+        // Acquire a permit BEFORE spawning; move it into the task so its Drop frees the slot —
+        // race-free by construction (decisions.md §1).
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
+        let checker = checker.clone();
+        let tx = tx.clone();
+        let sent = sent.clone();
+        let cancel = cancel.clone();
+        let stats = stats.clone();
+        tracker.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = cancel.cancelled() => {} // consumer gone — abort
+                working = checker.check(&mut proxy) => {
+                    // Record EVERY checked proxy (working or not) before it is sent or dropped,
+                    // so the stats reflect the whole checked set (review F4).
+                    stats.lock().unwrap().record(&proxy);
+                    if working {
+                        // Reserve a slot atomically; emit only if under the limit.
+                        let n = sent.fetch_add(1, Ordering::SeqCst);
+                        match limit {
+                            Some(l) if n >= l => cancel.cancel(),
+                            _ => {
+                                let _ = tx.send(proxy).await;
+                                if limit.is_some_and(|l| n + 1 >= l) {
+                                    cancel.cancel();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Wait-group: drain every spawned check before dropping tx and ending the stream.
+    tracker.close();
+    tracker.wait().await;
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
