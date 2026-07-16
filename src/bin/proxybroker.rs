@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "warn")]
     log: String,
 
+    /// Log output format: text (default) or json (line-delimited, for a log pipeline).
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+
     /// Path to a MaxMind-format country database, overriding the bundled DB-IP one.
     #[arg(long, global = true, value_name = "PATH")]
     geo_db: Option<PathBuf>,
@@ -419,6 +423,14 @@ struct CheckArgs {
     save: Option<PathBuf>,
 }
 
+/// Log output format (F3).
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 /// Which errors `--retry-on` retries (A5). `factor`/`jitter`/`max_backoff` stay library-only.
 #[derive(Clone, Copy, Default, ValueEnum)]
 enum RetryOn {
@@ -623,7 +635,7 @@ fn csv_row(p: &Proxy) -> String {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    init_tracing(&cli.log);
+    init_tracing(&cli.log, matches!(cli.log_format, LogFormat::Json));
 
     match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -989,14 +1001,17 @@ where
     Ok(())
 }
 
-fn init_tracing(level: &str) {
+fn init_tracing(level: &str, json: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("proxybroker={level}")));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    // --log-format json renders the whole log stream (incl. F3 check events) as line-delimited JSON.
+    if json {
+        let _ = builder.json().try_init();
+    } else {
+        let _ = builder.try_init();
+    }
 }
 
 #[cfg(all(test, feature = "server"))]

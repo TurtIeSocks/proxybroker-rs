@@ -333,7 +333,18 @@ impl Checker {
             let start = Instant::now();
             match self.attempt(proxy, proto, &probe, &target).await {
                 Ok(Attempt::Working(obs)) => {
-                    proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
+                    let rtt = start.elapsed().as_secs_f64();
+                    // F3: one structured event per terminal outcome, on target proxybroker::check
+                    // (mutable independently of the default filter, e.g. proxybroker::check=info).
+                    tracing::info!(
+                        target: "proxybroker::check",
+                        addr = %proxy.addr(),
+                        proto = proto.as_str(),
+                        outcome = "working",
+                        rtt,
+                        "check outcome",
+                    );
+                    proxy.record_attempt(Some(rtt), None);
                     proxy.add_type(proto, obs.level);
                     proxy.record_caps(obs.caps);
                     proxy.record_trust(obs.trust);
@@ -342,10 +353,32 @@ impl Checker {
                 Ok(Attempt::Invalid) => {
                     // Response did not validate — the proxy does not work for this protocol.
                     // Python breaks here (no retry).
+                    tracing::info!(
+                        target: "proxybroker::check",
+                        addr = %proxy.addr(),
+                        proto = proto.as_str(),
+                        outcome = "invalid",
+                        "check outcome",
+                    );
                     proxy.record_attempt(None, Some(ProxyError::BadResponse));
                     return false;
                 }
                 Err(e) => {
+                    // `outcome` is a fixed lowercase label for grouping; the specific error keeps
+                    // its byte-for-byte ProxyError::as_str in a separate `error` field.
+                    let outcome = if e == ProxyError::Timeout {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
+                    tracing::info!(
+                        target: "proxybroker::check",
+                        addr = %proxy.addr(),
+                        proto = proto.as_str(),
+                        outcome,
+                        error = e.as_str(),
+                        "check outcome",
+                    );
                     proxy.record_attempt(None, Some(e));
                     // Retry only errors the policy marks retryable, and only if attempts remain.
                     // Default policy = {Timeout}, zero backoff → the historical timeout-only,
