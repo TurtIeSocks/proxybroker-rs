@@ -32,44 +32,82 @@ pub struct Stats {
 impl Stats {
     /// Aggregate a slice of proxies.
     pub fn from_proxies(proxies: &[Proxy]) -> Stats {
-        let mut s = Stats {
-            total: proxies.len(),
-            ..Default::default()
-        };
-        let mut rt_sum = 0.0;
-        let mut rt_n = 0usize;
-
+        let mut c = StatsCollector::default();
         for p in proxies {
-            if p.is_working() {
-                s.working += 1;
-            }
-            for (proto, level) in p.types() {
-                *s.by_protocol.entry(*proto).or_default() += 1;
+            c.record(p);
+        }
+        c.finish()
+    }
+}
+
+/// Incremental aggregator. The `find` pipeline records **every** proxy it checks (working or
+/// not) into a shared collector, so the resulting [`Stats`] cover the whole checked set — not
+/// just the working proxies streamed to the caller. This is what makes `working` meaningful
+/// and the error histogram complete, matching `api.py:show_stats`, which iterates
+/// `unique_proxies` (all handled proxies).
+#[derive(Debug, Default)]
+pub struct StatsCollector {
+    total: usize,
+    working: usize,
+    by_protocol: BTreeMap<Proto, usize>,
+    by_anonymity: BTreeMap<AnonLevel, usize>,
+    by_country: BTreeMap<String, usize>,
+    errors: BTreeMap<&'static str, u32>,
+    rt_sum: f64,
+    rt_n: usize,
+}
+
+impl StatsCollector {
+    /// Fold one proxy's outcome into the running totals.
+    pub fn record(&mut self, p: &Proxy) {
+        self.total += 1;
+        if p.is_working() {
+            self.working += 1;
+        }
+        for (proto, level) in p.types() {
+            *self.by_protocol.entry(*proto).or_default() += 1;
+            // Anonymity levels only apply to HTTP; make that explicit rather than relying on
+            // "Some(level) ⇔ HTTP", so the "(HTTP)" label cannot silently go wrong.
+            if *proto == Proto::Http {
                 if let Some(lvl) = level {
-                    *s.by_anonymity.entry(*lvl).or_default() += 1;
+                    *self.by_anonymity.entry(*lvl).or_default() += 1;
                 }
             }
-            let country = p
-                .geo
-                .as_ref()
-                .map(|c| c.code.clone())
-                .unwrap_or_else(|| "??".into());
-            *s.by_country.entry(country).or_default() += 1;
-            for (err, n) in p.errors() {
-                *s.errors.entry(err.as_str()).or_default() += n;
-            }
-            let art = p.avg_resp_time();
-            if art > 0.0 {
-                rt_sum += art;
-                rt_n += 1;
-            }
         }
-        s.avg_resp_time = if rt_n > 0 {
-            format!("{:.2}", rt_sum / rt_n as f64).parse().unwrap()
-        } else {
-            0.0
-        };
-        s
+        // Unknown geo uses "--" to track proxybroker2's resolver sentinel.
+        let country = p
+            .geo
+            .as_ref()
+            .map(|c| c.code.clone())
+            .unwrap_or_else(|| "--".into());
+        *self.by_country.entry(country).or_default() += 1;
+        for (err, n) in p.errors() {
+            *self.errors.entry(err.as_str()).or_default() += n;
+        }
+        let art = p.avg_resp_time();
+        if art > 0.0 {
+            self.rt_sum += art;
+            self.rt_n += 1;
+        }
+    }
+
+    /// Produce the final [`Stats`].
+    pub fn finish(&self) -> Stats {
+        Stats {
+            total: self.total,
+            working: self.working,
+            by_protocol: self.by_protocol.clone(),
+            by_anonymity: self.by_anonymity.clone(),
+            by_country: self.by_country.clone(),
+            errors: self.errors.clone(),
+            avg_resp_time: if self.rt_n > 0 {
+                format!("{:.2}", self.rt_sum / self.rt_n as f64)
+                    .parse()
+                    .unwrap()
+            } else {
+                0.0
+            },
+        }
     }
 }
 
@@ -173,9 +211,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_country_is_double_question_mark() {
+    fn unknown_country_uses_dashes_like_proxybroker2() {
         let s = Stats::from_proxies(&[proxy("1.1.1.1", &[(Proto::Http, None)], None)]);
-        assert_eq!(s.by_country["??"], 1);
+        assert_eq!(s.by_country["--"], 1);
+    }
+
+    #[test]
+    fn collector_records_failed_proxies_too() {
+        // The whole point of F4's fix: a proxy that confirmed nothing (not working) still
+        // contributes to `total` and the error histogram.
+        let mut failed = Proxy::new("9.9.9.9".parse().unwrap(), 80, BTreeSet::new());
+        failed.record_attempt(None, Some(ProxyError::Timeout));
+        let mut c = StatsCollector::default();
+        c.record(&proxy(
+            "1.1.1.1",
+            &[(Proto::Http, Some(AnonLevel::High))],
+            None,
+        ));
+        c.record(&failed);
+        let s = c.finish();
+        assert_eq!(s.total, 2);
+        assert_eq!(s.working, 1); // only the one with a confirmed type
+        assert_eq!(s.errors["connection_timeout"], 1); // the failed one's error is counted
     }
 
     #[test]

@@ -312,7 +312,8 @@ async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::
         // 0-as-unlimited (which would otherwise make a `take(0)` yield nothing).
         limit: (args.limit > 0).then_some(args.limit),
     };
-    write_stream(broker.grab(query), args.format, args.outfile.as_deref()).await
+    let mut stream = broker.grab(query);
+    write_stream(&mut stream, args.format, args.outfile.as_deref()).await
 }
 
 async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -341,49 +342,25 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         strict: args.strict,
     };
 
-    let stream = broker.find(query).await?;
+    let mut stream = broker.find(query).await?;
+    write_stream(&mut stream, args.format, args.outfile.as_deref()).await?;
 
     if args.show_stats {
-        // Collect while writing, then print the aggregate to stderr so it does not mix with
-        // the proxy output on stdout.
-        let found = write_stream_collect(stream, args.format, args.outfile.as_deref()).await?;
-        eprint!("\n{}", proxybroker::Stats::from_proxies(&found));
-        Ok(())
-    } else {
-        write_stream(stream, args.format, args.outfile.as_deref()).await
-    }
-}
-
-/// Like [`write_stream`] but also returns every proxy, for `--show-stats`.
-async fn write_stream_collect(
-    mut stream: proxybroker::ProxyStream,
-    format: Format,
-    outfile: Option<&std::path::Path>,
-) -> Result<Vec<Proxy>, Box<dyn std::error::Error>> {
-    let mut found = Vec::new();
-    if let Some(path) = outfile {
-        let mut file = tokio::fs::File::create(path).await?;
-        while let Some(proxy) = stream.next().await {
-            file.write_all(format.render(&proxy).as_bytes()).await?;
-            file.write_all(b"\n").await?;
-            found.push(proxy);
-        }
-        file.flush().await?;
-        eprintln!("wrote {} proxies to {}", found.len(), path.display());
-    } else {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        while let Some(proxy) = stream.next().await {
-            writeln!(lock, "{}", format.render(&proxy))?;
-            found.push(proxy);
+        // Stats come from the stream itself, which aggregated EVERY checked proxy (working or
+        // not) — not just the winners written above. Printed to stderr so it never mixes with
+        // the proxy output on stdout. `stats()` is complete now: the stream is fully drained,
+        // so all checks have finished and recorded.
+        if let Some(s) = stream.stats() {
+            eprint!("\n{s}");
         }
     }
-    Ok(found)
+    Ok(())
 }
 
-/// Drain a proxy stream to a file or stdout in the chosen format.
+/// Drain a proxy stream to a file or stdout in the chosen format. Takes `&mut` so the caller
+/// keeps the stream afterwards (e.g. to read `stats()`).
 async fn write_stream(
-    mut stream: proxybroker::ProxyStream,
+    stream: &mut proxybroker::ProxyStream,
     format: Format,
     outfile: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -40,6 +40,7 @@ use tokio_util::task::TaskTracker;
 use crate::geo::GeoDb;
 
 use crate::error::Error;
+use crate::stats::StatsCollector;
 
 /// The maximum number of providers fetched concurrently. `api.py:MAX_CONCURRENT_PROVIDERS`.
 const MAX_CONCURRENT_PROVIDERS: usize = 3;
@@ -130,6 +131,7 @@ impl Broker {
         ProxyStream {
             rx,
             _cancel_on_drop: None,
+            stats: None,
         }
     }
 
@@ -216,16 +218,21 @@ impl Broker {
         // Dropping the stream fires this token, aborting in-flight checks — no watcher task
         // (a watcher holding a Sender would keep the channel open and deadlock termination).
         let cancel = CancellationToken::new();
+        // Shared across every check task so stats cover ALL checked proxies, not just the
+        // working ones streamed out (design review F4).
+        let stats = Arc::new(std::sync::Mutex::new(StatsCollector::default()));
         let broker = self.clone();
         let task_cancel = cancel.clone();
+        let task_stats = stats.clone();
         tokio::spawn(async move {
             broker
-                .find_task(query, Arc::new(checker), tx, task_cancel)
+                .find_task(query, Arc::new(checker), tx, task_cancel, task_stats)
                 .await
         });
         Ok(ProxyStream {
             rx,
             _cancel_on_drop: Some(cancel.drop_guard()),
+            stats: Some(stats),
         })
     }
 
@@ -235,6 +242,7 @@ impl Broker {
         checker: Arc<Checker>,
         tx: mpsc::Sender<Proxy>,
         cancel: CancellationToken,
+        stats: Arc<std::sync::Mutex<StatsCollector>>,
     ) {
         let countries: Option<BTreeSet<String>> = query
             .countries
@@ -280,12 +288,16 @@ impl Broker {
                 let tx = tx.clone();
                 let sent = sent.clone();
                 let cancel = cancel.clone();
+                let stats = stats.clone();
                 let limit = query.limit;
                 tracker.spawn(async move {
                     let _permit = permit;
                     tokio::select! {
                         _ = cancel.cancelled() => {} // consumer gone — abort
                         working = checker.check(&mut proxy) => {
+                            // Record EVERY checked proxy (working or not) before it is sent or
+                            // dropped, so the stats reflect the whole checked set (review F4).
+                            stats.lock().unwrap().record(&proxy);
                             if working {
                                 // Reserve a slot atomically; emit only if under the limit.
                                 let n = sent.fetch_add(1, Ordering::SeqCst);
@@ -397,6 +409,18 @@ pub struct ProxyStream {
     /// For `find`: dropping the stream fires this token, aborting in-flight check tasks. For
     /// `grab` it is `None` — dropping the receiver already stops the single source task.
     _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
+    /// For `find`: the running aggregate over every checked proxy. `None` for `grab` (nothing
+    /// is checked). Read it after the stream has been fully drained — by then every check has
+    /// completed and recorded (the source task drains its `TaskTracker` before ending).
+    stats: Option<Arc<std::sync::Mutex<StatsCollector>>>,
+}
+
+impl ProxyStream {
+    /// Aggregate statistics over every proxy checked so far. `Some` only for `find`; call it
+    /// after the stream is drained for a complete picture. `None` for `grab`.
+    pub fn stats(&self) -> Option<crate::stats::Stats> {
+        self.stats.as_ref().map(|s| s.lock().unwrap().finish())
+    }
 }
 
 impl Stream for ProxyStream {

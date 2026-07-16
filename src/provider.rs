@@ -18,7 +18,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 
 /// A provider definition. Serializable, so the bundled registry and user configs share one
-/// shape. `kind` selects the fetch strategy; extraction is common to all.
+/// shape. Extraction (the whole-text scanner, or a custom `pattern`) is common to all.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderSpec {
     /// The page to fetch.
@@ -33,6 +33,11 @@ pub struct ProviderSpec {
     /// Request timeout, seconds.
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    /// proxybroker2's config `type` field (`simple` / `paginated` / `api`). Only `simple`
+    /// (the default) is supported; the loader warns and skips the others rather than loading
+    /// them as silently-broken simple GETs. `None`/`simple` both mean plain.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -56,6 +61,7 @@ impl ProviderSpec {
             protocols: protocols.to_vec(),
             pattern: None,
             timeout: default_timeout(),
+            kind: None,
         }
     }
 
@@ -110,12 +116,17 @@ pub fn bundled_registry() -> Vec<ProviderSpec> {
 /// -to-disable convention). Mirrors `provider_utils.load_provider_configs_from_directory`.
 ///
 /// A file that fails to parse is logged and skipped so one bad config does not sink the rest.
-/// Unknown fields (e.g. Python's `name`, `format`, `max_connections`) are ignored, so
-/// proxybroker2 config files load directly.
+/// Harmless unknown fields (Python's `name`, `format`, `max_connections`) are ignored, so a
+/// `type: simple` (or type-less) proxybroker2 config loads directly.
 ///
-/// **Deviation:** proxybroker2 also has `load_python_providers_from_directory`, which
-/// *executes* `.py` files. There is no safe Rust equivalent (we do not run arbitrary code),
-/// so only data files are loaded — which is also the safer default.
+/// **Deviation — only `type: simple` is supported.** proxybroker2 has `paginated` and `api`
+/// provider types with distinct fetch logic. This port implements neither; a config declaring
+/// one is **warned about and skipped** rather than loaded as a silently-broken plain GET (which
+/// would fetch the `?page={}` URL verbatim, or ignore `api_key`/`headers`, and yield nothing).
+///
+/// **Deviation — no Python execution.** proxybroker2's `load_python_providers_from_directory`
+/// *executes* `.py` files; there is no safe Rust equivalent (we do not run arbitrary code), so
+/// only data files are loaded — also the safer default.
 pub fn load_provider_dir(dir: &std::path::Path) -> Vec<ProviderSpec> {
     if !dir.is_dir() {
         tracing::warn!(dir = %dir.display(), "provider directory does not exist");
@@ -148,7 +159,17 @@ pub fn load_provider_dir(dir: &std::path::Path) -> Vec<ProviderSpec> {
         .filter_map(|p| match std::fs::read_to_string(&p) {
             Ok(text) => match serde_yaml_ng::from_str::<ProviderSpec>(&text) {
                 // serde_yaml_ng parses JSON too (JSON is a YAML subset), so one path covers both.
-                Ok(spec) => Some(spec),
+                Ok(spec) => match spec.kind.as_deref() {
+                    None | Some("simple") => Some(spec),
+                    Some(other) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            kind = other,
+                            "unsupported provider type (only 'simple' is supported) — skipping"
+                        );
+                        None
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(path = %p.display(), error = %e, "skipping invalid provider config");
                     None
@@ -342,5 +363,41 @@ mod tests {
     fn load_provider_dir_missing_dir_is_empty() {
         let dir = std::env::temp_dir().join("pb_prov_definitely_missing_xyz");
         assert!(load_provider_dir(&dir).is_empty());
+    }
+
+    #[test]
+    fn unsupported_provider_types_are_skipped_not_loaded_broken() {
+        // A paginated/api config would load as a silently-broken simple GET without the
+        // kind check; it must be skipped instead (review F1).
+        let dir = std::env::temp_dir().join(format!("pb_prov_kind_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ok.yaml"),
+            "type: simple\nurl: http://ok/\nprotocols: [HTTP]",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("paginated.yaml"),
+            "type: paginated\nurl: http://p/?page={}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("api.yaml"),
+            "type: api\nurl: http://a/\napi_key: secret",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("typeless.yaml"),
+            "url: http://t/\nprotocols: [HTTP]",
+        )
+        .unwrap();
+
+        let specs = load_provider_dir(&dir);
+        // Only 'simple' and type-less load; paginated and api are skipped.
+        let urls: Vec<_> = specs.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, vec!["http://ok/", "http://t/"], "{specs:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
