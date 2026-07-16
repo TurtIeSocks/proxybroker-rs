@@ -39,6 +39,7 @@ pub mod proxy;
 pub mod resolver;
 #[cfg(feature = "server")]
 pub mod server;
+pub mod stats;
 pub mod types;
 pub mod utils;
 
@@ -53,4 +54,5 @@ pub use proxy::{Country, Proxy};
 pub use resolver::Resolver;
 #[cfg(feature = "server")]
 pub use server::{serve, Pool, PoolConfig, ServerHandle};
+pub use stats::Stats;
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
