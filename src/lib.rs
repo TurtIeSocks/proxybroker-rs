@@ -49,6 +49,7 @@ pub use error::{Error, ProxyError};
 #[cfg(feature = "geo")]
 pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
+pub use parse::parse_proxy_lines;
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{Country, Proxy};
 pub use resolver::Resolver;

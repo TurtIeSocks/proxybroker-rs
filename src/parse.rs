@@ -11,7 +11,10 @@
 //! Pass 2 does the IP↔port pairing in code. Verified against a characterization oracle in
 //! `tests/ip_scan.rs`.
 
+use crate::proxy::Proxy;
+use crate::resolver::parse_ip_lenient;
 use regex::Regex;
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 /// proxybroker2's exact IPv4 pattern (`utils.py:IPPattern`), verbatim. No lookaround, so
@@ -81,4 +84,43 @@ pub fn find_addrs_global(text: &str) -> Vec<(String, String)> {
         search_from = after;
     }
     out
+}
+
+/// Parse `host:port` lines from user-supplied text into unchecked [`Proxy`]s, for the `check`
+/// verb (stdin / a file / a pasted list). Uses the same per-line scanner as the raw-data
+/// loader ([`find_addrs_line`]) and the same lenient IP parsing as the provider path
+/// ([`parse_ip_lenient`], which normalizes leading-zero IPv4). Non-IP lines and out-of-range
+/// ports are skipped. `expected_types` is left empty — the checker reads that as "unknown, so
+/// check all requested protocols" (`checker.rs`).
+pub fn parse_proxy_lines(text: &str) -> Vec<Proxy> {
+    find_addrs_line(text)
+        .into_iter()
+        .filter_map(|(ip_str, port_str)| {
+            let ip = parse_ip_lenient(&ip_str)?;
+            let port: u16 = port_str.parse().ok()?; // drops >65535
+            Some(Proxy::new(ip, port, BTreeSet::new()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_addr_lines_into_proxies() {
+        let text = "1.2.3.4:8080\n010.0.0.1:3128\ngarbage\n5.6.7.8:99999\n";
+        let proxies = parse_proxy_lines(text);
+        let addrs: Vec<String> = proxies.iter().map(|p| p.addr()).collect();
+        // 010.0.0.1 normalizes to 10.0.0.1 (decimal, not octal); junk and the >65535 port drop.
+        assert_eq!(addrs, ["1.2.3.4:8080", "10.0.0.1:3128"]);
+        // No expected_types → checker treats it as "check all requested".
+        assert!(proxies[0].expected_types.is_empty());
+    }
+
+    #[test]
+    fn empty_and_junk_input_yields_nothing() {
+        assert!(parse_proxy_lines("").is_empty());
+        assert!(parse_proxy_lines("no proxies here\njust text\n").is_empty());
+    }
 }

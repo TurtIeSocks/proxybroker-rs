@@ -303,7 +303,7 @@ impl Broker {
         let broker = self.clone();
         let mut seen: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
         let source = fetches
-            .flat_map(|cands| futures_util::stream::iter(cands))
+            .flat_map(futures_util::stream::iter)
             .filter_map(move |cand| {
                 let keep = match cand.host.parse::<IpAddr>() {
                     Ok(host) if seen.insert((host, cand.port)) => {
