@@ -12,7 +12,7 @@ use crate::judge::{Judge, JudgePool};
 use crate::negotiator::{negotiate, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
-use crate::types::{AnonLevel, JudgeScheme, Proto, TypeSpec};
+use crate::types::{AnonLevel, Caps, JudgeScheme, Proto, TypeSpec};
 use crate::utils::{fresh_marker, get_all_ip, get_status_code, request_headers};
 use rand::Rng;
 use std::collections::{BTreeMap, HashSet};
@@ -29,6 +29,7 @@ pub struct Checker {
     timeout: Duration,
     post: bool,
     strict: bool,
+    relaxed_validity: bool,
     /// DNS blocklist zones; empty disables the check. Kept with the resolver so `check` can
     /// reject a listed proxy before doing any real work.
     dnsbl: Vec<String>,
@@ -179,6 +180,9 @@ pub struct CheckerConfig {
     pub post: bool,
     /// Require the proxy's anonymity level to match exactly (`--strict`).
     pub strict: bool,
+    /// Relax response validity to marker + IP only, demoting Referer/Cookie from validity gates to
+    /// recorded capability signals (A4). Default `false` = parity (all four required).
+    pub relaxed_validity: bool,
     /// DNS blocklist zones (`--dnsbl`); a proxy whose IP is listed in any zone is rejected.
     pub dnsbl: Vec<String>,
     /// When the judge pool is empty, fall back to a plain liveness check against this URL instead
@@ -230,6 +234,7 @@ impl Checker {
             retry: cfg.retry,
             post: cfg.post,
             strict: cfg.strict,
+            relaxed_validity: cfg.relaxed_validity,
             dnsbl: cfg.dnsbl,
             resolver,
             mode,
@@ -321,9 +326,10 @@ impl Checker {
         for i in 0..self.retry.max_tries {
             let start = Instant::now();
             match self.attempt(proxy, proto, &probe, &target).await {
-                Ok(Attempt::Working(level)) => {
+                Ok(Attempt::Working(obs)) => {
                     proxy.record_attempt(Some(start.elapsed().as_secs_f64()), None);
-                    proxy.add_type(proto, level);
+                    proxy.add_type(proto, obs.level);
+                    proxy.record_caps(obs.caps);
                     return true;
                 }
                 Ok(Attempt::Invalid) => {
@@ -368,7 +374,7 @@ impl Checker {
 
         // CONNECT:25 has no test request — a granted tunnel is the whole check.
         if proto == Proto::Connect25 {
-            return Ok(Attempt::Working(None));
+            return Ok(Attempt::Working(Observation::default()));
         }
 
         // Build + send the request; the connect/negotiate/send/read/status handling is identical
@@ -393,12 +399,21 @@ impl Checker {
 
         match probe {
             // Liveness: a 200 through the proxy is the whole check; there is no judge to reflect
-            // markers/IPs, so anonymity is unclassifiable → level None.
-            Probe::Liveness(_) => Ok(Attempt::Working(None)),
+            // markers/IPs, so anonymity is unclassifiable → level None, no capability profile.
+            Probe::Liveness(_) => Ok(Attempt::Working(Observation::default())),
             Probe::Judged(judge) => {
                 let content = decompress(head, body);
                 let marker = marker.expect("judged mode always builds a marker");
-                if !response_is_valid(&content, &marker) {
+                let caps = caps_from_content(&content);
+                // Default (strict): Referer + Cookie are validity gates (parity). Relaxed: only
+                // marker + a non-empty IP set are required, and the echo flags become recorded
+                // capability signals that can vary per proxy (A4).
+                let valid = if self.relaxed_validity {
+                    content.contains(&marker) && !get_all_ip(&content).is_empty()
+                } else {
+                    response_is_valid(&content, &marker)
+                };
+                if !valid {
                     return Ok(Attempt::Invalid);
                 }
                 let level = if proto.checks_anon_level() {
@@ -406,7 +421,7 @@ impl Checker {
                 } else {
                     None
                 };
-                Ok(Attempt::Working(level))
+                Ok(Attempt::Working(Observation { level, caps }))
             }
         }
     }
@@ -516,10 +531,18 @@ impl Checker {
 
 /// Outcome of one connection attempt.
 enum Attempt {
-    /// The proxy works for this protocol; carries the anonymity level (HTTP only).
-    Working(Option<AnonLevel>),
+    /// The proxy works for this protocol; carries the classification [`Observation`].
+    Working(Observation),
     /// Connected and responded, but the response failed validation.
     Invalid,
+}
+
+/// What a working attempt observed about the proxy: its anonymity level (HTTP only) and the
+/// capability profile (A4). A6 extends this with a trust verdict.
+#[derive(Debug, Default)]
+struct Observation {
+    level: Option<AnonLevel>,
+    caps: Caps,
 }
 
 /// Read the whole response. We send `Connection: close`, so the judge closes the connection
@@ -594,14 +617,25 @@ fn dnsbl_query(ip: IpAddr, zone: &str) -> Option<String> {
     }
 }
 
+/// The capability signals in a judge response (A4): whether the proxy forwarded our constant
+/// Referer and Cookie header values through. Shared with [`response_is_valid`] so the marker
+/// literals live in one place.
+fn caps_from_content(content: &str) -> Caps {
+    Caps {
+        cookie_echo: content.contains("cookie=ok"),
+        referer_echo: content.contains("https://www.google.com/"),
+    }
+}
+
 /// A valid judge response echoes our marker, at least one IP, and the constant Referer and
 /// Cookie header values — proving the proxy forwarded our request intact.
 /// `checker.py:_check_test_response`. Case-sensitive (Python does not lowercase here).
 fn response_is_valid(content: &str, marker: &str) -> bool {
+    let caps = caps_from_content(content);
     content.contains(marker)
         && !get_all_ip(content).is_empty()
-        && content.contains("https://www.google.com/") // Referer
-        && content.contains("cookie=ok") // Cookie
+        && caps.referer_echo
+        && caps.cookie_echo
 }
 
 #[cfg(test)]
@@ -639,6 +673,29 @@ mod tests {
         assert!(!response_is_valid(no_cookie, "5555"));
         // missing marker
         assert!(!response_is_valid(good, "9999"));
+    }
+
+    #[test]
+    fn caps_extracted_from_content() {
+        let both = "REMOTE_ADDR=1.2.3.4 cookie=ok Referer=https://www.google.com/";
+        assert_eq!(
+            caps_from_content(both),
+            Caps {
+                cookie_echo: true,
+                referer_echo: true
+            }
+        );
+        // drop the cookie echo
+        let no_cookie = "REMOTE_ADDR=1.2.3.4 Referer=https://www.google.com/";
+        assert_eq!(
+            caps_from_content(no_cookie),
+            Caps {
+                cookie_echo: false,
+                referer_echo: true
+            }
+        );
+        // neither
+        assert_eq!(caps_from_content("nothing here"), Caps::default());
     }
 
     #[test]

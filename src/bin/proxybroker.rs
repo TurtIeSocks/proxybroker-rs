@@ -278,6 +278,24 @@ struct FindArgs {
     #[arg(long, default_value_t = 0)]
     backoff_ms: u64,
 
+    /// Accept proxies that forward the request (marker+IP) even if they strip Referer/Cookie,
+    /// recording what they pass through as capabilities.
+    #[arg(long)]
+    relaxed_validity: bool,
+
+    /// Keep only proxies that pass our Cookie header through (implies richer signal under
+    /// --relaxed-validity).
+    #[arg(long)]
+    require_cookie: bool,
+
+    /// Keep only proxies that pass our Referer header through.
+    #[arg(long)]
+    require_referer: bool,
+
+    /// Keep only proxies with a confirmed CONNECT:25 (SMTP) tunnel.
+    #[arg(long)]
+    require_connect25: bool,
+
     /// Print an aggregate summary (by protocol/anonymity/country) to stderr when done.
     #[arg(long)]
     show_stats: bool,
@@ -774,7 +792,12 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
     if !args.countries.is_empty() {
         builder = builder.countries(args.countries);
     }
-    let query = builder.build();
+    let mut query = builder.build();
+    // A4 capability flags (pub fields; no builder setter needed).
+    query.relaxed_validity = args.relaxed_validity;
+    query.require_cookie = args.require_cookie;
+    query.require_referer = args.require_referer;
+    query.require_connect25 = args.require_connect25;
 
     let mut stream = broker.find(query).await?;
     write_stream(
@@ -859,6 +882,10 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
         post: args.post,
         strict: args.strict,
         liveness_url: None, // --liveness-url is a find-only flag; check works from an explicit list
+        relaxed_validity: false, // A4 capability flags are find-only for now
+        require_cookie: false,
+        require_referer: false,
+        require_connect25: false,
     };
 
     let mut stream = broker

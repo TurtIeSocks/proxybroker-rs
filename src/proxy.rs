@@ -8,7 +8,7 @@
 //! (socket ownership) and `decisions.md`.
 
 use crate::error::ProxyError;
-use crate::types::{AnonLevel, Proto, Scheme};
+use crate::types::{AnonLevel, Caps, Proto, Scheme};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -75,6 +75,19 @@ pub struct Proxy {
     /// Upstream proxy credentials (B8), for a paid/authenticated proxy. `None` for scraped
     /// candidates; set only via BYO/URL loading. Never serialized.
     auth: Option<Credentials>,
+    /// Capability profile (A4), OR-accumulated across confirmed protocols. Not serialized (stays
+    /// out of the parity JSON); exposed via [`Proxy::caps`]/[`Proxy::capabilities`] + CLI filters.
+    caps: Caps,
+}
+
+/// A proxy's full capability profile (A4): the recorded [`Caps`] plus CONNECT:25 support derived
+/// from the confirmed types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub cookie_echo: bool,
+    pub referer_echo: bool,
+    /// A confirmed SMTP (CONNECT:25) tunnel.
+    pub connect25: bool,
 }
 
 /// `HTTP`-family protocols — a proxy supporting any of these can serve plain HTTP.
@@ -120,6 +133,7 @@ impl Proxy {
             errors: HashMap::new(),
             runtimes: Vec::new(),
             auth: None,
+            caps: Caps::default(),
         }
     }
 
@@ -164,6 +178,28 @@ impl Proxy {
     /// True once any protocol is confirmed. `proxy.py:is_working` (set when types is non-empty).
     pub fn is_working(&self) -> bool {
         !self.types.is_empty()
+    }
+
+    /// The recorded capability profile (A4), OR-accumulated across confirmed protocols.
+    pub fn caps(&self) -> Caps {
+        self.caps
+    }
+
+    /// Fold one working attempt's observed capabilities into the stored profile (OR): a proxy
+    /// keeps every capability it ever demonstrated, across protocols.
+    pub fn record_caps(&mut self, c: Caps) {
+        self.caps.cookie_echo |= c.cookie_echo;
+        self.caps.referer_echo |= c.referer_echo;
+    }
+
+    /// The full capability profile: the recorded [`Caps`] plus CONNECT:25 support, derived from
+    /// the confirmed types (a granted SMTP tunnel is already a confirmed `Connect25`).
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            cookie_echo: self.caps.cookie_echo,
+            referer_echo: self.caps.referer_echo,
+            connect25: self.types.contains_key(&Proto::Connect25),
+        }
     }
 
     /// Error rate in `0.0..=1.0`, rounded to 2 dp. `0.0` before any request. `proxy.py:error_rate`.
@@ -387,6 +423,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             errors: HashMap::new(),
             runtimes: Vec::new(),
             auth: None, // secrets are never serialized, so never deserialized either
+            caps: Caps::default(), // capabilities are not serialized; re-measured on a fresh check
         })
     }
 }
@@ -444,6 +481,35 @@ mod tests {
         assert_eq!(x.error_rate(), 0.0);
         assert_eq!(x.avg_resp_time(), 0.0);
         assert!(!x.is_working());
+    }
+
+    #[test]
+    fn record_caps_or_accumulates() {
+        let mut x = p();
+        x.record_caps(Caps {
+            cookie_echo: true,
+            referer_echo: false,
+        });
+        x.record_caps(Caps {
+            cookie_echo: false,
+            referer_echo: true,
+        });
+        // OR-fold: a proxy keeps every capability it ever demonstrated.
+        assert_eq!(
+            x.caps(),
+            Caps {
+                cookie_echo: true,
+                referer_echo: true
+            }
+        );
+    }
+
+    #[test]
+    fn capabilities_derives_connect25() {
+        let mut x = p();
+        assert!(!x.capabilities().connect25);
+        x.add_type(Proto::Connect25, None);
+        assert!(x.capabilities().connect25);
     }
 
     #[test]

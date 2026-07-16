@@ -240,6 +240,20 @@ impl TypeSpec {
     }
 }
 
+/// A proxy's capability profile (A4): which of our test-request headers it forwarded to the judge
+/// unmodified. CONNECT:25 support is *derived* from the confirmed types, not stored here.
+///
+/// Only meaningful under `--relaxed-validity`: in the default (strict) mode, forwarding Referer +
+/// Cookie is a *validity* requirement, so every working HTTP proxy has both flags set. Relaxing
+/// validity demotes them to recorded signals that can then vary per proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caps {
+    /// The proxy passed our `Cookie` header through to the judge unmodified.
+    pub cookie_echo: bool,
+    /// The proxy passed our `Referer` header through unmodified.
+    pub referer_echo: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,6 +85,14 @@ pub struct FindQuery {
     /// Fallback liveness URL: when no judge verifies, validate proxies with a 200 from this URL
     /// instead of failing. `None` keeps strict judge-required behavior (A2).
     pub liveness_url: Option<String>,
+    /// Relax validity to marker+IP, recording Referer/Cookie as capabilities instead (A4).
+    pub relaxed_validity: bool,
+    /// Keep only proxies that forwarded our Cookie header through (A4).
+    pub require_cookie: bool,
+    /// Keep only proxies that forwarded our Referer header through (A4).
+    pub require_referer: bool,
+    /// Keep only proxies with a confirmed CONNECT:25 (SMTP) tunnel (A4).
+    pub require_connect25: bool,
 }
 
 impl Default for FindQuery {
@@ -101,6 +109,10 @@ impl Default for FindQuery {
             post: false,
             strict: false,
             liveness_url: None,
+            relaxed_validity: false,
+            require_cookie: false,
+            require_referer: false,
+            require_connect25: false,
         }
     }
 }
@@ -230,6 +242,11 @@ impl FindQueryBuilder {
             post: self.post.unwrap_or(d.post),
             strict: self.strict.unwrap_or(d.strict),
             liveness_url: self.liveness_url.or(d.liveness_url),
+            // A4 capability flags have no builder setter (callers set the pub fields directly).
+            relaxed_validity: d.relaxed_validity,
+            require_cookie: d.require_cookie,
+            require_referer: d.require_referer,
+            require_connect25: d.require_connect25,
         }
     }
 }
@@ -361,6 +378,7 @@ impl Broker {
         let task_stats = stats.clone();
         let countries = uppercase_set(query.countries.clone());
         let (max_conn, limit) = (query.max_conn, query.limit);
+        let caps = CapsFilter::from_query(&query);
         tokio::spawn(async move {
             // Attach geo + apply the country filter before checking, mirroring find's source.
             let source = proxies.filter_map(move |mut proxy| {
@@ -373,6 +391,7 @@ impl Broker {
                 checker,
                 max_conn,
                 limit,
+                caps,
                 tx,
                 task_cancel,
                 task_stats,
@@ -403,6 +422,7 @@ impl Broker {
                 retry: query.retry.clone(),
                 post: query.post,
                 strict: query.strict,
+                relaxed_validity: query.relaxed_validity,
                 dnsbl: query.dnsbl.clone(),
                 liveness_url: query.liveness_url.clone(),
             },
@@ -455,6 +475,7 @@ impl Broker {
             checker,
             query.max_conn,
             query.limit,
+            CapsFilter::from_query(&query),
             tx,
             cancel,
             stats,
@@ -504,11 +525,15 @@ fn uppercase_set(countries: Option<Vec<String>>) -> Option<BTreeSet<String>> {
 /// cap, a [`TaskTracker`] wait-group drained before the stream ends, atomic limit accounting,
 /// per-check `stats.record`, and cancel-on-drop. Source-agnostic — `find` feeds provider
 /// candidates, `check` feeds user input.
+// Internal check driver: all eight parameters are distinct run state (source, checker, flow
+// control, filter, and the tx/cancel/stats plumbing). Bundling them would only add indirection.
+#[allow(clippy::too_many_arguments)]
 async fn check_stream<S>(
     source: S,
     checker: Arc<Checker>,
     max_conn: usize,
     limit: Option<usize>,
+    caps: CapsFilter,
     tx: mpsc::Sender<Proxy>,
     cancel: CancellationToken,
     stats: Arc<std::sync::Mutex<StatsCollector>>,
@@ -542,7 +567,9 @@ async fn check_stream<S>(
                     // Record EVERY checked proxy (working or not) before it is sent or dropped,
                     // so the stats reflect the whole checked set (review F4).
                     stats.lock().unwrap().record(&proxy);
-                    if working {
+                    // A working proxy is still dropped if it fails the capability filter (A4);
+                    // it stays counted in stats (it *is* working), it just isn't emitted.
+                    if working && caps.passes(&proxy) {
                         // Reserve a slot atomically; emit only if under the limit.
                         let n = sent.fetch_add(1, Ordering::SeqCst);
                         match limit {
@@ -563,6 +590,32 @@ async fn check_stream<S>(
     // Wait-group: drain every spawned check before dropping tx and ending the stream.
     tracker.close();
     tracker.wait().await;
+}
+
+/// The post-check capability filter (A4): a working proxy is kept only if it satisfies every
+/// requested capability. All-false (the default) is a no-op.
+#[derive(Clone, Copy, Default)]
+struct CapsFilter {
+    cookie: bool,
+    referer: bool,
+    connect25: bool,
+}
+
+impl CapsFilter {
+    fn from_query(q: &FindQuery) -> Self {
+        CapsFilter {
+            cookie: q.require_cookie,
+            referer: q.require_referer,
+            connect25: q.require_connect25,
+        }
+    }
+
+    fn passes(&self, p: &Proxy) -> bool {
+        let c = p.capabilities();
+        (!self.cookie || c.cookie_echo)
+            && (!self.referer || c.referer_echo)
+            && (!self.connect25 || c.connect25)
+    }
 }
 
 /// A country filter that is a no-op when no countries are requested. Matches `api.py`'s
@@ -745,6 +798,10 @@ mod tests {
                 post: true,
                 strict: true,
                 liveness_url: None,
+                relaxed_validity: false,
+                require_cookie: false,
+                require_referer: false,
+                require_connect25: false,
             }
         );
     }
