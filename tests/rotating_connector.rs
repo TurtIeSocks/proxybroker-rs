@@ -111,6 +111,33 @@ async fn ejects_failing_proxy_and_retries() {
 }
 
 #[tokio::test]
+async fn https_only_proxy_is_not_used_for_https_target() {
+    // Security: an HTTPS-typed proxy would negotiate via Proto::Https, which terminates TLS to the
+    // target with the checker's accept-all verifier — a MITM hole. The connector must refuse it (no
+    // safe raw tunnel), returning an error rather than a silently-unverified TLS stream.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (up, _h) = mock_upstream("should-not-be-reached", hits.clone()).await;
+    let mut proxy = Proxy::new(up.ip(), up.port(), BTreeSet::from([Proto::Https]));
+    proxy.add_type(Proto::Https, None); // HTTPS only — no SOCKS/CONNECT tunnel
+    let pool = Pool::from_proxies(vec![proxy], PoolConfig::default());
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let connector = RotatingProxyConnector::from_pool(pool, resolver, RotateConfig::default());
+
+    let outcome = client(connector)
+        .get(Uri::from_static("https://secure.example/"))
+        .await;
+    assert!(
+        outcome.is_err(),
+        "an HTTPS-only proxy must not serve an https target via accept-all TLS termination"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no tunnel should have been dialed"
+    );
+}
+
+#[tokio::test]
 async fn empty_pool_is_an_error_not_a_hang() {
     let pool = Pool::from_proxies(vec![], PoolConfig::default());
     let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());

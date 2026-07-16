@@ -1061,10 +1061,7 @@ fn header_value(raw: &[u8], name: &str) -> Option<String> {
 
 /// Which proxy protocol to use for the client's scheme. `server.py:_choice_proto`: for an
 /// HTTPS (CONNECT) client, prefer a tunnelling protocol; for HTTP, a plain one.
-/// Pick the wire protocol to negotiate for `proxy` serving `scheme`, preferring a native match then
-/// falling back through SOCKS/CONNECT. `pub(crate)` so the E1 rotating connector reuses the exact
-/// server selection instead of forking it.
-pub(crate) fn choose_proto(proxy: &Proxy, scheme: Scheme) -> Proto {
+fn choose_proto(proxy: &Proxy, scheme: Scheme) -> Proto {
     let types: Vec<Proto> = proxy.types().keys().copied().collect();
     let pick = |candidates: &[Proto]| candidates.iter().find(|c| types.contains(c)).copied();
     match scheme {
