@@ -19,6 +19,8 @@ pub mod parse;
 pub mod provider;
 pub mod proxy;
 pub mod resolver;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod types;
 pub mod utils;
 
@@ -31,4 +33,6 @@ pub use negotiator::{Stream, Target};
 pub use provider::{Candidate, ProviderSpec};
 pub use proxy::{Country, Proxy};
 pub use resolver::Resolver;
+#[cfg(feature = "server")]
+pub use server::{serve, Pool, PoolConfig, ServerHandle};
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};

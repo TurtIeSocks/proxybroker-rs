@@ -27,7 +27,7 @@ geo = ["dep:maxminddb"]
 geo-bundled = ["geo"]
 
 [dependencies]
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros", "fs"] }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros", "fs", "signal"] }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1.12"

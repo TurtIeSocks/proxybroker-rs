@@ -56,6 +56,45 @@ enum Command {
     Grab(GrabArgs),
     /// Gather proxies and check that they work, classifying anonymity.
     Find(FindArgs),
+    /// Run a local proxy server that rotates through working proxies.
+    #[cfg(feature = "server")]
+    Serve(ServeArgs),
+}
+
+#[cfg(feature = "server")]
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = "127.0.0.1:8888")]
+    host: String,
+
+    /// Protocols to find for the pool (required).
+    #[arg(long, num_args = 1.., required = true, value_name = "TYPE", value_parser = parse_proto)]
+    types: Vec<Proto>,
+
+    /// Keep the pool topped up to this many working proxies.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+
+    /// Keep only proxies located in these ISO country codes.
+    #[arg(long, num_args = 1.., value_name = "CC")]
+    countries: Vec<String>,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 8)]
+    timeout: u64,
+
+    /// Drop a proxy once its error rate exceeds this (0.0–1.0).
+    #[arg(long, default_value_t = 0.5)]
+    max_error_rate: f64,
+
+    /// Drop a proxy once its average response time (seconds) exceeds this.
+    #[arg(long, default_value_t = 8.0)]
+    max_resp_time: f64,
+
+    /// Attempts (with different proxies) per client request.
+    #[arg(long, default_value_t = 3)]
+    max_tries: usize,
 }
 
 #[derive(clap::Args)]
@@ -181,7 +220,52 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Grab(args) => grab(broker, args).await,
         Command::Find(args) => find(broker, args).await,
+        #[cfg(feature = "server")]
+        Command::Serve(args) => serve_cmd(broker, args).await,
     }
+}
+
+#[cfg(feature = "server")]
+async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use proxybroker::resolver::Resolver;
+    use proxybroker::server::{serve, Pool, PoolConfig};
+    use std::sync::Arc;
+
+    let addr: std::net::SocketAddr = args.host.parse()?;
+    let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
+
+    // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
+    // would grab forever), matching api.py's `if limit <= 0: raise ValueError`.
+    let stream = broker
+        .find(FindQuery {
+            types,
+            countries: (!args.countries.is_empty()).then_some(args.countries),
+            limit: Some(args.limit.max(1)),
+            timeout: Duration::from_secs(args.timeout),
+            ..Default::default()
+        })
+        .await?;
+
+    let pool = Pool::spawn(
+        stream,
+        PoolConfig {
+            max_tries: args.max_tries,
+            max_error_rate: args.max_error_rate,
+            max_resp_time: args.max_resp_time,
+            ..Default::default()
+        },
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
+    let handle = serve(addr, pool, resolver, Duration::from_secs(args.timeout)).await?;
+    eprintln!(
+        "proxybroker serving on {} — Ctrl-C to stop",
+        handle.local_addr()
+    );
+
+    tokio::signal::ctrl_c().await?;
+    handle.shutdown();
+    eprintln!("shutting down");
+    Ok(())
 }
 
 async fn grab(broker: Broker, args: GrabArgs) -> Result<(), Box<dyn std::error::Error>> {
