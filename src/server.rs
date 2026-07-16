@@ -761,12 +761,18 @@ async fn handle_client(
         port: req.port,
     };
 
-    for _ in 0..max_tries {
+    for attempt in 0..max_tries {
         let Some(mut proxy) = pool.get(req.scheme, &key).await else {
             // No proxy available and the source is exhausted — tell the client in its own protocol.
             let _ = client.write_all(terminal_failure(req.frontend)).await;
             return Ok(());
         };
+        // F1: reaching attempt > 0 means the previous attempt failed and benched its proxy, and
+        // this `get` acquired a *different* one — that is the rotation. Counting at the failure
+        // instead would over-count the final failure before a 502 (no actual switch follows it).
+        if attempt > 0 {
+            pool.rotations.fetch_add(1, Ordering::Relaxed);
+        }
         let proto = choose_proto(&proxy, req.scheme);
 
         match relay(
@@ -793,8 +799,7 @@ async fn handle_client(
             }
             RelayOutcome::RetryableFailure(e) => {
                 proxy.record_attempt(None, Some(e));
-                pool.put_failed(proxy); // bench it, then try the next proxy
-                pool.rotations.fetch_add(1, Ordering::Relaxed); // F1: one rotation per retry
+                pool.put_failed(proxy); // bench it, then try the next proxy (counted on next get)
             }
             RelayOutcome::ClientCommitted(e) => {
                 // The client already saw an ack or bytes — a retry would corrupt it. Record the

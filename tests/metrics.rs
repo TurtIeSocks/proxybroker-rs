@@ -138,5 +138,11 @@ async fn rotations_counter_increments() {
         .expect("read should not time out")
         .unwrap();
 
-    assert!(pool_ref.rotations() >= 1, "expected at least one rotation");
+    // Two dead proxies, max_tries 2 → exactly ONE rotation (A→B); the final failure before the
+    // 502 is not a rotation to a different proxy.
+    assert_eq!(
+        pool_ref.rotations(),
+        1,
+        "one A→B rotation, not two (the last failure isn't a rotation)"
+    );
 }
