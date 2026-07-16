@@ -5,7 +5,7 @@
 //! the useful aggregate: counts by protocol, anonymity level, and country, the error
 //! histogram, and the mean response time.
 
-use crate::proxy::Proxy;
+use crate::proxy::{percentile, Proxy};
 use crate::types::{AnonLevel, Proto};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,6 +27,12 @@ pub struct Stats {
     pub errors: BTreeMap<&'static str, u32>,
     /// Mean response time over proxies that recorded one, seconds.
     pub avg_resp_time: f64,
+    /// Median (p50) response time over the same per-proxy population, seconds.
+    pub p50_resp_time: f64,
+    /// 90th-percentile response time, seconds.
+    pub p90_resp_time: f64,
+    /// 95th-percentile response time, seconds.
+    pub p95_resp_time: f64,
 }
 
 impl Stats {
@@ -53,8 +59,9 @@ pub struct StatsCollector {
     by_anonymity: BTreeMap<AnonLevel, usize>,
     by_country: BTreeMap<String, usize>,
     errors: BTreeMap<&'static str, u32>,
-    rt_sum: f64,
-    rt_n: usize,
+    /// Per-proxy mean response times (one entry per proxy that recorded any timing). Feeds both
+    /// the aggregate mean and the percentiles, so they cover the same population.
+    resp_times: Vec<f64>,
 }
 
 impl StatsCollector {
@@ -86,8 +93,7 @@ impl StatsCollector {
         }
         let art = p.avg_resp_time();
         if art > 0.0 {
-            self.rt_sum += art;
-            self.rt_n += 1;
+            self.resp_times.push(art);
         }
     }
 
@@ -100,13 +106,19 @@ impl StatsCollector {
             by_anonymity: self.by_anonymity.clone(),
             by_country: self.by_country.clone(),
             errors: self.errors.clone(),
-            avg_resp_time: if self.rt_n > 0 {
-                format!("{:.2}", self.rt_sum / self.rt_n as f64)
-                    .parse()
-                    .unwrap()
-            } else {
+            avg_resp_time: if self.resp_times.is_empty() {
                 0.0
+            } else {
+                format!(
+                    "{:.2}",
+                    self.resp_times.iter().sum::<f64>() / self.resp_times.len() as f64
+                )
+                .parse()
+                .unwrap()
             },
+            p50_resp_time: percentile(&self.resp_times, 0.50),
+            p90_resp_time: percentile(&self.resp_times, 0.90),
+            p95_resp_time: percentile(&self.resp_times, 0.95),
         }
     }
 }
@@ -150,6 +162,14 @@ impl fmt::Display for Stats {
             writeln!(f, "  By country: {top}")?;
         }
         writeln!(f, "  Avg response time: {:.2}s", self.avg_resp_time)?;
+        // Only meaningful once some timing was recorded; avoid a line of zeros for an unchecked set.
+        if self.p50_resp_time > 0.0 {
+            writeln!(
+                f,
+                "  Response time p50/p90/p95: {:.2}s / {:.2}s / {:.2}s",
+                self.p50_resp_time, self.p90_resp_time, self.p95_resp_time
+            )?;
+        }
         if !self.errors.is_empty() {
             let errs = self
                 .errors
@@ -264,6 +284,23 @@ mod tests {
         assert_eq!(v["by_anonymity"]["High"], 1);
         assert_eq!(v["by_country"]["US"], 1);
         assert!(v["avg_resp_time"].is_number());
+    }
+
+    #[test]
+    fn percentiles_over_per_proxy_means() {
+        // Three proxies, each with a single runtime → per-proxy mean == that runtime. The aggregate
+        // percentiles are taken over the population {0.1, 0.2, 0.3} (the same one avg uses).
+        let mut ps = Vec::new();
+        for rt in [0.1, 0.2, 0.3] {
+            let mut p = proxy("1.1.1.1", &[(Proto::Http, None)], None);
+            p.record_attempt(Some(rt), None);
+            ps.push(p);
+        }
+        let s = Stats::from_proxies(&ps);
+        assert_eq!(s.avg_resp_time, 0.2); // (0.1+0.2+0.3)/3, unchanged behavior
+        assert_eq!(s.p50_resp_time, 0.2); // rank 1.0
+        assert_eq!(s.p90_resp_time, 0.28); // rank 1.8 → 0.2 + .8*(0.3-0.2)
+        assert_eq!(s.p95_resp_time, 0.29); // rank 1.9 → 0.2 + .9*0.1
     }
 
     #[test]

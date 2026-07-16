@@ -91,6 +91,23 @@ fn round2(x: f64) -> f64 {
     format!("{x:.2}").parse().unwrap()
 }
 
+/// The `q`-quantile (`q` in `0.0..=1.0`) of `data` by linear interpolation between closest ranks
+/// (numpy "linear" / type-7), rounded to 2 dp. Empty → `0.0`. Does not require sorted input.
+///
+/// Linear (not nearest-rank) so `p50` is the true median: `percentile(&[1.0, 2.0], 0.5) == 1.5`.
+pub fn percentile(data: &[f64], q: f64) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = data.to_vec();
+    sorted.sort_by(f64::total_cmp); // the crate's tie-safe ordering (cf. `priority`)
+    let rank = q * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    round2(sorted[lo] + frac * (sorted[hi] - sorted[lo]))
+}
+
 impl Proxy {
     pub fn new(host: IpAddr, port: u16, expected_types: BTreeSet<Proto>) -> Self {
         Proxy {
@@ -164,6 +181,11 @@ impl Proxy {
             return 0.0;
         }
         round2(self.runtimes.iter().sum::<f64>() / self.runtimes.len() as f64)
+    }
+
+    /// The `q`-quantile of this proxy's successful round-trip times, seconds, 2 dp. `0.0` if none.
+    pub fn percentile(&self, q: f64) -> f64 {
+        percentile(&self.runtimes, q)
     }
 
     /// Pool-ordering key `(error_rate, avg_resp_time)`, lower is better. `proxy.py:priority`.
@@ -422,6 +444,38 @@ mod tests {
         assert_eq!(x.error_rate(), 0.0);
         assert_eq!(x.avg_resp_time(), 0.0);
         assert!(!x.is_working());
+    }
+
+    #[test]
+    fn percentile_linear_interpolation() {
+        // numpy "linear" (type-7): rank = q*(n-1), interpolate between the bracketing ranks.
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.5), 2.5); // rank 1.5 → 2 + .5*(3-2)
+        assert_eq!(percentile(&[], 0.5), 0.0); // empty
+        assert_eq!(percentile(&[5.0], 0.9), 5.0); // single element
+                                                  // 1..=10, cross-checked against numpy.percentile(interpolation="linear"):
+                                                  //   p90 → rank 8.1 → 9 + .1*(10-9) = 9.1 ; p95 → rank 8.55 → 9 + .55 = 9.55
+        assert_eq!(
+            percentile(&(1..=10).map(f64::from).collect::<Vec<_>>(), 0.90),
+            9.1
+        );
+        assert_eq!(
+            percentile(&(1..=10).map(f64::from).collect::<Vec<_>>(), 0.95),
+            9.55
+        );
+        // Unsorted input must not matter.
+        assert_eq!(percentile(&[4.0, 1.0, 3.0, 2.0], 0.5), 2.5);
+    }
+
+    #[test]
+    fn proxy_percentile_uses_runtimes() {
+        let mut x = p();
+        for rt in [0.1, 0.2, 0.3, 0.4] {
+            x.record_attempt(Some(rt), None);
+        }
+        // A timeout carries a runtime but is excluded from the population (like avg_resp_time).
+        x.record_attempt(Some(9.9), Some(ProxyError::Timeout));
+        assert_eq!(x.percentile(0.5), 0.25); // median of [.1,.2,.3,.4]
+        assert_eq!(p().percentile(0.5), 0.0); // no runtimes → 0.0
     }
 
     #[test]
