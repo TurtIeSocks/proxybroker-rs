@@ -10,10 +10,12 @@
 
 pub mod error;
 pub mod parse;
+pub mod proxy;
 pub mod types;
 pub mod utils;
 
 pub use error::{Error, ProxyError};
+pub use proxy::{Country, Proxy};
 pub use types::{AnonLevel, JudgeScheme, ParseProtoError, Proto, Scheme, TypeSpec};
 
 /// Country lookup against a MaxMind-format database.
