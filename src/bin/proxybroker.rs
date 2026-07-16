@@ -183,6 +183,11 @@ struct ServeArgs {
     #[arg(long, default_value_t = 1024)]
     backlog: u32,
 
+    /// Require clients to authenticate with `Proxy-Authorization: Basic base64(user:pass)` (also
+    /// gates the SOCKS5 front-end via RFC 1929). Absent = open server.
+    #[arg(long, value_name = "USER:PASS")]
+    auth: Option<String>,
+
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
@@ -466,6 +471,7 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         Duration::from_secs(args.timeout),
         args.min_queue,
         args.backlog,
+        args.auth,
     )
     .await?;
     eprintln!(

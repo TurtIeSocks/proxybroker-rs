@@ -207,7 +207,9 @@ impl Checker {
             .map_err(|_| ProxyError::Timeout)?
             .map_err(|_| ProxyError::ConnFailed)?;
 
-        let mut stream = negotiate(proto, tcp, target, self.timeout).await?;
+        // The checker probes public candidates; it has no upstream credentials (B8 auth is inert
+        // on the check path).
+        let mut stream = negotiate(proto, tcp, target, self.timeout, None).await?;
 
         // CONNECT:25 has no test request — a granted tunnel is the whole check.
         if proto == Proto::Connect25 {

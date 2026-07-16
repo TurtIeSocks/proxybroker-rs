@@ -16,8 +16,9 @@
 //!   TLS connector consumes the stream and returns a differently-typed one.
 
 use crate::error::ProxyError;
+use crate::proxy::Credentials;
 use crate::types::Proto;
-use crate::utils::get_status_code;
+use crate::utils::{base64_encode, get_status_code};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -102,21 +103,23 @@ pub async fn negotiate(
     tcp: TcpStream,
     target: &Target,
     deadline: Duration,
+    creds: Option<&Credentials>,
 ) -> Result<Stream, ProxyError> {
     match proto {
         // HTTP: nothing to negotiate. The checker sends an absolute-URI request to the proxy.
         Proto::Http => Ok(Stream::Plain(tcp)),
+        // SOCKS4 has no username/password auth (RFC), so credentials are ignored here.
         Proto::Socks4 => socks4(tcp, target, deadline).await,
-        Proto::Socks5 => socks5(tcp, target, deadline).await,
+        Proto::Socks5 => socks5(tcp, target, deadline, creds).await,
         Proto::Connect80 | Proto::Connect25 => {
-            let mut tcp = http_connect(tcp, target, deadline).await?;
+            let mut tcp = http_connect(tcp, target, deadline, creds).await?;
             if proto == Proto::Connect25 {
                 read_smtp_banner(&mut tcp, deadline).await?;
             }
             Ok(Stream::Plain(tcp))
         }
         Proto::Https => {
-            let tcp = http_connect(tcp, target, deadline).await?;
+            let tcp = http_connect(tcp, target, deadline, creds).await?;
             tls_upgrade(tcp, &target.host, deadline).await
         }
     }
@@ -136,17 +139,36 @@ async fn socks4(tcp: TcpStream, target: &Target, deadline: Duration) -> Result<S
     Ok(Stream::Plain(s.into_inner()))
 }
 
-async fn socks5(tcp: TcpStream, target: &Target, deadline: Duration) -> Result<Stream, ProxyError> {
-    // SOCKS5 supports IPv4/IPv6/domain; prefer the resolved IP, fall back to the name.
+async fn socks5(
+    tcp: TcpStream,
+    target: &Target,
+    deadline: Duration,
+    creds: Option<&Credentials>,
+) -> Result<Stream, ProxyError> {
+    use tokio_socks::tcp::Socks5Stream;
+    // SOCKS5 supports IPv4/IPv6/domain; prefer the resolved IP, fall back to the name. With creds,
+    // do the RFC 1929 username/password exchange (`connect_with_password_*`).
     let fut = async {
-        match target.ip {
-            Some(ip) => {
-                tokio_socks::tcp::Socks5Stream::connect_with_socket(tcp, (ip, target.port)).await
+        match (target.ip, creds) {
+            (Some(ip), None) => Socks5Stream::connect_with_socket(tcp, (ip, target.port)).await,
+            (None, None) => {
+                Socks5Stream::connect_with_socket(tcp, (target.host.as_str(), target.port)).await
             }
-            None => {
-                tokio_socks::tcp::Socks5Stream::connect_with_socket(
+            (Some(ip), Some(c)) => {
+                Socks5Stream::connect_with_password_and_socket(
+                    tcp,
+                    (ip, target.port),
+                    &c.username,
+                    &c.password,
+                )
+                .await
+            }
+            (None, Some(c)) => {
+                Socks5Stream::connect_with_password_and_socket(
                     tcp,
                     (target.host.as_str(), target.port),
+                    &c.username,
+                    &c.password,
                 )
                 .await
             }
@@ -164,8 +186,9 @@ async fn http_connect(
     mut tcp: TcpStream,
     target: &Target,
     deadline: Duration,
+    creds: Option<&Credentials>,
 ) -> Result<TcpStream, ProxyError> {
-    let req = connect_request(&target.host, target.port);
+    let req = connect_request(&target.host, target.port, creds);
     tokio::time::timeout(deadline, tcp.write_all(&req))
         .await
         .map_err(|_| ProxyError::Timeout)?
@@ -247,7 +270,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 /// The bytes of a `CONNECT host:port HTTP/1.1` request, with IPv6 authority/Host bracketing
 /// per RFC 3986. Mirrors `negotiators.py:_CONNECT_request`, including not double-bracketing a
 /// caller-supplied `[v6]`. Pinned by the byte-level tests below.
-pub fn connect_request(host: &str, port: u16) -> Vec<u8> {
+pub fn connect_request(host: &str, port: u16, creds: Option<&Credentials>) -> Vec<u8> {
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -257,9 +280,17 @@ pub fn connect_request(host: &str, port: u16) -> Vec<u8> {
     } else {
         (format!("{bare}:{port}"), bare.to_owned())
     };
+    // Upstream Proxy-Authorization (B8), only when the proxy carries credentials.
+    let auth = match creds {
+        Some(c) => format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64_encode(format!("{}:{}", c.username, c.password).as_bytes())
+        ),
+        None => String::new(),
+    };
     format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {host_hdr}\r\n\
-         User-Agent: PxBroker/{}/\r\nConnection: keep-alive\r\n\r\n",
+         User-Agent: PxBroker/{}/\r\n{auth}Connection: keep-alive\r\n\r\n",
         env!("CARGO_PKG_VERSION"),
     )
     .into_bytes()
@@ -323,7 +354,7 @@ mod tests {
 
     #[test]
     fn connect_request_ipv4_unbracketed() {
-        let req = String::from_utf8(connect_request("198.51.100.1", 443)).unwrap();
+        let req = String::from_utf8(connect_request("198.51.100.1", 443, None)).unwrap();
         assert!(
             req.starts_with("CONNECT 198.51.100.1:443 HTTP/1.1\r\n"),
             "{req}"
@@ -333,7 +364,7 @@ mod tests {
 
     #[test]
     fn connect_request_ipv6_brackets_authority_and_host() {
-        let req = String::from_utf8(connect_request("2001:db8::1", 443)).unwrap();
+        let req = String::from_utf8(connect_request("2001:db8::1", 443, None)).unwrap();
         assert!(
             req.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"),
             "{req}"
@@ -343,7 +374,7 @@ mod tests {
 
     #[test]
     fn connect_request_does_not_double_bracket() {
-        let req = String::from_utf8(connect_request("[2001:db8::1]", 443)).unwrap();
+        let req = String::from_utf8(connect_request("[2001:db8::1]", 443, None)).unwrap();
         assert!(
             req.contains("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"),
             "{req}"
@@ -356,11 +387,28 @@ mod tests {
     #[test]
     fn connect_request_ports_25_80_443() {
         for port in [25u16, 80, 443] {
-            let req = String::from_utf8(connect_request("fe80::abcd", port)).unwrap();
+            let req = String::from_utf8(connect_request("fe80::abcd", port, None)).unwrap();
             assert!(
                 req.contains(&format!("CONNECT [fe80::abcd]:{port} HTTP/1.1\r\n")),
                 "{req}"
             );
         }
+    }
+
+    #[test]
+    fn connect_request_includes_proxy_authorization() {
+        // With creds, a `Proxy-Authorization: Basic base64(user:pass)` header is present; without,
+        // it is absent (byte-identical to before B8).
+        let creds = Credentials {
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        let with = String::from_utf8(connect_request("h", 443, Some(&creds))).unwrap();
+        assert!(
+            with.contains("\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n"),
+            "{with}"
+        );
+        let without = String::from_utf8(connect_request("h", 443, None)).unwrap();
+        assert!(!without.contains("Proxy-Authorization"), "{without}");
     }
 }
