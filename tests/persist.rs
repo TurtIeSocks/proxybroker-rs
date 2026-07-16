@@ -80,6 +80,32 @@ fn ewma_folds_across_two_runs() {
 }
 
 #[test]
+fn failing_recheck_preserves_confirmed_types() {
+    // A later failing check upserts an empty type set; it must NOT erase the stored confirmed
+    // types (the failure sample still feeds ewma/requests), or the proxy loads unselectable.
+    let path = tmp_db();
+    {
+        let store = Store::open(&path).unwrap();
+        store.upsert(&working_http("4.4.4.4")).unwrap(); // Http@High, working
+    }
+    {
+        let store = Store::open(&path).unwrap();
+        let mut bad = Proxy::new("4.4.4.4".parse().unwrap(), 8080, BTreeSet::new());
+        bad.record_attempt(None, Some(ProxyError::Timeout)); // no confirmed types
+        store.upsert(&bad).unwrap();
+    }
+    let loaded = Store::open(&path).unwrap().load().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded[0].types().get(&Proto::Http),
+        Some(&Some(AnonLevel::High)),
+        "confirmed types survive a failing re-check"
+    );
+    assert!(loaded[0].is_working());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn requests_and_errors_accumulate() {
     let path = tmp_db();
     {

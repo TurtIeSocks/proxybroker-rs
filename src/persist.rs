@@ -53,7 +53,11 @@ impl Store {
                   first_seen, last_seen, uptime_checks)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
              ON CONFLICT(host, port) DO UPDATE SET
-                 types        = excluded.types,
+                 -- Keep the prior confirmed types on a failing re-check (empty sample), just as
+                 -- avg_latency below keeps the prior value on a zero sample — otherwise a transient
+                 -- failure would erase a proxy's types and make it unselectable on warm start.
+                 types        = CASE WHEN excluded.types <> '[]'
+                                     THEN excluded.types ELSE proxies.types END,
                  requests     = proxies.requests + excluded.requests,
                  errors       = proxies.errors + excluded.errors,
                  ewma_success = 0.3 * excluded.ewma_success + 0.7 * proxies.ewma_success,
