@@ -60,7 +60,7 @@ pub struct GrabQuery {
 }
 
 /// What to find and check. `types` is required (empty is [`Error::NoTypes`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FindQuery {
     /// Protocols (and optional anonymity levels) a proxy must support.
     pub types: Vec<TypeSpec>,
@@ -97,6 +97,112 @@ impl Default for FindQuery {
             max_tries: 3,
             post: false,
             strict: false,
+        }
+    }
+}
+
+impl FindQuery {
+    /// Start building a [`FindQuery`]. Consuming setters, unset fields fall back to
+    /// [`FindQuery::default`] — the same shape as [`BrokerBuilder`].
+    pub fn builder() -> FindQueryBuilder {
+        FindQueryBuilder::default()
+    }
+}
+
+/// Builds a [`FindQuery`]. `build()` is infallible — `find`/`check` own the [`Error::NoTypes`]
+/// guard, so the builder must not duplicate it (a builder that can't fail is more composable).
+#[derive(Default)]
+pub struct FindQueryBuilder {
+    types: Option<Vec<TypeSpec>>,
+    countries: Option<Vec<String>>,
+    limit: Option<usize>,
+    judges: Option<Vec<String>>,
+    dnsbl: Option<Vec<String>>,
+    timeout: Option<Duration>,
+    max_conn: Option<usize>,
+    max_tries: Option<usize>,
+    post: Option<bool>,
+    strict: Option<bool>,
+}
+
+impl FindQueryBuilder {
+    /// Protocols (and optional anonymity levels) a proxy must support. Required by `find`/`check`.
+    pub fn types(mut self, types: Vec<TypeSpec>) -> Self {
+        self.types = Some(types);
+        self
+    }
+
+    /// Keep only proxies in these ISO country codes.
+    pub fn countries(mut self, countries: Vec<String>) -> Self {
+        self.countries = Some(countries);
+        self
+    }
+
+    /// Stop after this many working proxies. `0` maps to unlimited — the one home for the CLI's
+    /// "`--limit 0` = unlimited" convention.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = (limit > 0).then_some(limit);
+        self
+    }
+
+    /// Judge URLs to probe. Empty defers to the bundled defaults.
+    pub fn judges(mut self, judges: Vec<String>) -> Self {
+        self.judges = Some(judges);
+        self
+    }
+
+    /// DNS blocklist zones; a proxy listed in any is rejected.
+    pub fn dnsbl(mut self, dnsbl: Vec<String>) -> Self {
+        self.dnsbl = Some(dnsbl);
+        self
+    }
+
+    /// Per-request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Max concurrent checks in flight.
+    pub fn max_conn(mut self, max_conn: usize) -> Self {
+        self.max_conn = Some(max_conn);
+        self
+    }
+
+    /// Attempts per protocol before giving up.
+    pub fn max_tries(mut self, max_tries: usize) -> Self {
+        self.max_tries = Some(max_tries);
+        self
+    }
+
+    /// Use `POST` for the test request.
+    pub fn post(mut self, post: bool) -> Self {
+        self.post = Some(post);
+        self
+    }
+
+    /// Require the anonymity level to match exactly.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
+    /// Finalize. Unset fields take their [`FindQuery::default`] values. Note `limit` was already
+    /// normalized by [`limit`](Self::limit) (0 → `None`), so `None` here means "unset", which
+    /// `Default` also renders as unlimited.
+    pub fn build(self) -> FindQuery {
+        let d = FindQuery::default();
+        FindQuery {
+            types: self.types.unwrap_or(d.types),
+            countries: self.countries.or(d.countries),
+            limit: self.limit.or(d.limit),
+            judges: self.judges.unwrap_or(d.judges),
+            dnsbl: self.dnsbl.unwrap_or(d.dnsbl),
+            timeout: self.timeout.unwrap_or(d.timeout),
+            max_conn: self.max_conn.unwrap_or(d.max_conn),
+            max_tries: self.max_tries.unwrap_or(d.max_tries),
+            post: self.post.unwrap_or(d.post),
+            strict: self.strict.unwrap_or(d.strict),
         }
     }
 }
@@ -553,5 +659,63 @@ impl std::fmt::Debug for Broker {
         f.debug_struct("Broker")
             .field("providers", &self.providers.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Proto, TypeSpec};
+
+    #[test]
+    fn find_query_builder_matches_default() {
+        let built = FindQuery::builder()
+            .types(vec![TypeSpec::any(Proto::Http)])
+            .limit(10)
+            .build();
+        let hand = FindQuery {
+            types: vec![TypeSpec::any(Proto::Http)],
+            limit: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(built, hand);
+    }
+
+    #[test]
+    fn find_query_builder_limit_zero_is_unlimited() {
+        // The CLI's "0 = unlimited" convention lives here, so callers never hand find() a
+        // take(0) that would yield nothing.
+        assert_eq!(FindQuery::builder().limit(0).build().limit, None);
+    }
+
+    #[test]
+    fn find_query_builder_sets_every_field() {
+        let q = FindQuery::builder()
+            .types(vec![TypeSpec::any(Proto::Socks5)])
+            .countries(vec!["US".into()])
+            .limit(5)
+            .judges(vec!["http://j/".into()])
+            .dnsbl(vec!["zen.example.org".into()])
+            .timeout(Duration::from_secs(3))
+            .max_conn(7)
+            .max_tries(2)
+            .post(true)
+            .strict(true)
+            .build();
+        assert_eq!(
+            q,
+            FindQuery {
+                types: vec![TypeSpec::any(Proto::Socks5)],
+                countries: Some(vec!["US".into()]),
+                limit: Some(5),
+                judges: vec!["http://j/".into()],
+                dnsbl: vec!["zen.example.org".into()],
+                timeout: Duration::from_secs(3),
+                max_conn: 7,
+                max_tries: 2,
+                post: true,
+                strict: true,
+            }
+        );
     }
 }

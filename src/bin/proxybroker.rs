@@ -371,16 +371,16 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     } else {
         let types: Vec<TypeSpec> = args.types.into_iter().map(TypeSpec::any).collect();
         // Find proxies to fill the pool. `serve` requires a positive limit (an unbounded pool
-        // would grab forever), matching api.py's `if limit <= 0: raise ValueError`.
-        let stream = broker
-            .find(FindQuery {
-                types,
-                countries: (!args.countries.is_empty()).then_some(args.countries),
-                limit: Some(args.limit.max(1)),
-                timeout: Duration::from_secs(args.timeout),
-                ..Default::default()
-            })
-            .await?;
+        // would grab forever), matching api.py's `if limit <= 0: raise ValueError` — so
+        // `.limit(max(1))` here can never resolve to the builder's unlimited (None).
+        let mut fq = FindQuery::builder()
+            .types(types)
+            .limit(args.limit.max(1))
+            .timeout(Duration::from_secs(args.timeout));
+        if !args.countries.is_empty() {
+            fq = fq.countries(args.countries);
+        }
+        let stream = broker.find(fq.build()).await?;
         Pool::spawn(stream, pool_config)
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
@@ -421,20 +421,20 @@ fn types_from(protos: Vec<Proto>, lvl: Vec<AnonLevel>) -> Vec<TypeSpec> {
 }
 
 async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let types = types_from(args.types, args.lvl);
-
-    let query = FindQuery {
-        types,
-        countries: (!args.countries.is_empty()).then_some(args.countries),
-        limit: (args.limit > 0).then_some(args.limit),
-        judges: args.judges,
-        dnsbl: args.dnsbl,
-        timeout: Duration::from_secs(args.timeout),
-        max_conn: args.max_conn,
-        max_tries: args.max_tries,
-        post: args.post,
-        strict: args.strict,
-    };
+    let mut builder = FindQuery::builder()
+        .types(types_from(args.types, args.lvl))
+        .limit(args.limit)
+        .judges(args.judges)
+        .dnsbl(args.dnsbl)
+        .timeout(Duration::from_secs(args.timeout))
+        .max_conn(args.max_conn)
+        .max_tries(args.max_tries)
+        .post(args.post)
+        .strict(args.strict);
+    if !args.countries.is_empty() {
+        builder = builder.countries(args.countries);
+    }
+    let query = builder.build();
 
     let mut stream = broker.find(query).await?;
     write_stream(
