@@ -299,6 +299,15 @@ impl Pool {
         self.len() == 0
     }
 
+    /// Drop every proxy matching `(host, port)` from the pool (the `proxycontrol` remove API, B6).
+    /// Returns whether any were removed.
+    pub fn remove(&self, host: IpAddr, port: u16) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let before = state.len();
+        state.retain(|p| !(p.proxy.host == host && p.proxy.port == port));
+        before != state.len()
+    }
+
     /// Wait until at least `n` proxies are pooled, or the source is exhausted — so a too-small
     /// source can never hang startup forever (B13's `--min-queue`). Reuses the importer's
     /// [`Notify`] exactly as `get` does. Returns immediately when `n == 0`.
@@ -496,6 +505,8 @@ pub async fn serve(
     let expected: Option<Arc<str>> = auth.map(|up| {
         Arc::from(format!("Basic {}", crate::utils::base64_encode(up.as_bytes())).as_str())
     });
+    // The `proxycontrol` history map, shared across all connections (B6).
+    let history = Arc::new(History::new());
 
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -517,6 +528,7 @@ pub async fn serve(
             let pool = pool.clone();
             let resolver = resolver.clone();
             let expected = expected.clone();
+            let history = history.clone();
             tokio::spawn(async move {
                 let _ = handle_client(
                     client,
@@ -526,6 +538,7 @@ pub async fn serve(
                     timeout,
                     max_tries,
                     expected,
+                    history,
                 )
                 .await;
             });
@@ -562,6 +575,8 @@ struct ClientRequest {
     raw: Vec<u8>,
     /// The client's `Proxy-Authorization` header value, if present (B9 client auth).
     proxy_auth: Option<String>,
+    /// The request-target token (B6): the history key uses it, and `proxycontrol` parses it.
+    path: String,
 }
 
 async fn handle_client(
@@ -572,12 +587,15 @@ async fn handle_client(
     timeout: Duration,
     max_tries: usize,
     expected_auth: Option<Arc<str>>,
+    history: Arc<History>,
 ) -> std::io::Result<()> {
     let Some(req) = parse_client_request(&mut client, timeout).await else {
         return Ok(());
     };
     // B9: gate on client credentials before consuming any pool proxy. A plain `==` is fine — the
     // secret is a shared static string, not a per-user hash, so constant-time compare is overkill.
+    // Auth is checked BEFORE the control API (a deliberate deviation from Python), so introspection
+    // cannot reveal pool membership on an authenticated server.
     if let Some(expected) = &expected_auth {
         if req.proxy_auth.as_deref() != Some(expected.as_ref()) {
             let _ = client
@@ -588,6 +606,10 @@ async fn handle_client(
                 .await;
             return Ok(());
         }
+    }
+    // B6: `proxycontrol` requests are handled locally and never consume a pool proxy.
+    if req.host == "proxycontrol" {
+        return serve_control(&mut client, &req, &pool, &history, peer_ip).await;
     }
     let key = client_key(&pool.config, peer_ip, &req);
     let ip = resolver.resolve(&req.host).await.ok();
@@ -618,6 +640,12 @@ async fn handle_client(
         {
             RelayOutcome::Ok => {
                 proxy.record_attempt(Some(0.0), None);
+                // B6: record which upstream served this request-target for this client. The addr is
+                // v6-unbracketed to match Python's control-API format.
+                history.record(
+                    format!("{peer_ip}-{}", req.path),
+                    format!("{}:{}", proxy.host, proxy.port),
+                );
                 pool.put_ok(proxy);
                 return Ok(());
             }
@@ -657,6 +685,82 @@ fn client_key(config: &PoolConfig, peer_ip: IpAddr, req: &ClientRequest) -> Clie
         }
     }
     ClientKey::Ip(peer_ip)
+}
+
+/// Per-client record of which upstream last served a request-target — the `proxycontrol` history
+/// API (B6). Bounded by a hard cap and cleared wholesale when exceeded (no time-based TTL — an
+/// "ephemeral by design" deviation from Python's `TTLCache`; see `decisions.md`).
+struct History {
+    map: Mutex<HashMap<String, String>>,
+}
+
+impl History {
+    const CAP: usize = 10_000;
+
+    fn new() -> Self {
+        History {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn record(&self, key: String, proxy: String) {
+        let mut m = self.map.lock().unwrap();
+        if m.len() >= Self::CAP && !m.contains_key(&key) {
+            m.clear(); // hard cap, drop-all — ephemeral by design
+        }
+        m.insert(key, proxy);
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.map.lock().unwrap().get(key).cloned()
+    }
+}
+
+/// Handle a `Host: proxycontrol` request: introspect/steer the live server without a pool proxy.
+/// `GET .../api/remove/<ip:port>` evicts a proxy (always 204); `GET .../api/history/url:<url>`
+/// reports the upstream that last served `<url>` for this client (200 + JSON, or 204 on a miss).
+/// Mirrors `server.py:320`.
+async fn serve_control(
+    client: &mut TcpStream,
+    req: &ClientRequest,
+    pool: &Pool,
+    history: &History,
+    peer_ip: IpAddr,
+) -> std::io::Result<()> {
+    // path is `http://proxycontrol/api/<operation>/<params>`; strip the authority, split the rest.
+    let rest = req
+        .path
+        .strip_prefix("http://proxycontrol")
+        .unwrap_or(&req.path)
+        .trim_start_matches('/');
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [_api, "remove", params] => {
+            let (h, p) = split_host_port(params, 0);
+            if let Ok(ip) = h.parse::<IpAddr>() {
+                pool.remove(ip, p);
+            }
+            // Parity: always 204, regardless of whether anything matched.
+            client.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await
+        }
+        [_api, "history", params] => {
+            let url = params.strip_prefix("url:").unwrap_or("");
+            match history.get(&format!("{peer_ip}-{url}")) {
+                Some(proxy) => {
+                    let body = format!("{{\"proxy\": \"{proxy}\"}}\r\n");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\
+                         Access-Control-Allow-Credentials: true\r\n\r\n{body}",
+                        body.len()
+                    );
+                    client.write_all(resp.as_bytes()).await
+                }
+                None => client.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await,
+            }
+        }
+        _ => client.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await,
+    }
 }
 
 /// Insert `header_line` (which must end with CRLF) right after the request/status line — i.e. after
@@ -913,6 +1017,9 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
     let mut parts = first.split_whitespace();
     let method = parts.next()?;
     let uri = parts.next()?;
+    // Own the request-target now (B6): the HTTP branch moves `buf` into `raw`, after which `uri`
+    // (a borrow of `buf`) would be invalid.
+    let path = uri.to_string();
 
     // The client's Proxy-Authorization header (B9), present on either method.
     let proxy_auth = header_value(&buf, "Proxy-Authorization");
@@ -927,6 +1034,7 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
             port,
             raw: Vec::new(),
             proxy_auth,
+            path,
         })
     } else {
         // Plain HTTP: target host comes from the absolute URI or the Host header.
@@ -947,6 +1055,7 @@ async fn parse_client_request(client: &mut TcpStream, timeout: Duration) -> Opti
             port,
             raw: buf,
             proxy_auth,
+            path,
         })
     }
 }
@@ -1154,6 +1263,25 @@ mod tests {
         );
         assert_eq!(parse_http_status(b"garbage"), 0); // unparseable → 0 (in no allow-list)
         assert_eq!(parse_http_status(b"HTTP/1.1 \r\n"), 0);
+    }
+
+    #[test]
+    fn pool_remove_drops_matching() {
+        let mk = |ip: &str| Proxy::new(ip.parse().unwrap(), 80, BTreeSet::new());
+        let pool = Pool::from_proxies(
+            vec![mk("1.1.1.1"), mk("2.2.2.2"), mk("3.3.3.3")],
+            PoolConfig::default(),
+        );
+        assert!(
+            pool.remove("2.2.2.2".parse().unwrap(), 80),
+            "should remove a match"
+        );
+        assert_eq!(pool.len(), 2);
+        assert!(
+            !pool.remove("9.9.9.9".parse().unwrap(), 80),
+            "no match → false"
+        );
+        assert_eq!(pool.len(), 2);
     }
 
     #[test]
