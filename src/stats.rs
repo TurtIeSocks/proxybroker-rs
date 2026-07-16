@@ -21,7 +21,7 @@ pub struct Stats {
     pub by_protocol: BTreeMap<Proto, usize>,
     /// Count of HTTP proxies per anonymity level.
     pub by_anonymity: BTreeMap<AnonLevel, usize>,
-    /// Count per ISO country code (`??` when geo is unknown).
+    /// Count per ISO country code (`--` when geo is unknown).
     pub by_country: BTreeMap<String, usize>,
     /// Error histogram, keyed by the stats `errmsg` strings.
     pub errors: BTreeMap<&'static str, u32>,
