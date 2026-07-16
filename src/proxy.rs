@@ -22,7 +22,13 @@ pub struct Country {
 }
 
 /// A proxy: where it is, what it can do, and how well it has done it.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (not `Eq` — the `runtimes: Vec<f64>` field blocks it) lets a save/load round-trip
+/// be asserted. The round-trip is **lossy on stats by design**: `Serialize` emits the computed
+/// `avg_resp_time`/`error_rate` for humans, but `Deserialize` restores only the persistent
+/// identity (host, port, geo, confirmed types) with `requests`/`errors`/`runtimes` empty — a
+/// loaded proxy's timing history restarts.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Proxy {
     pub host: IpAddr,
     pub port: u16,
@@ -215,6 +221,76 @@ impl Serialize for Proxy {
     }
 }
 
+/// Read a `Proxy` back from the JSON its [`Serialize`] emits, so a saved pool reloads without
+/// re-checking (Wave 1 C2). Restores the persistent identity — host, port, geo, confirmed
+/// types — and leaves `expected_types`/`requests`/`errors`/`runtimes` empty (they are not
+/// serialized; the computed `avg_resp_time`/`error_rate` fields are read and discarded).
+impl<'de> serde::Deserialize<'de> for Proxy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        #[derive(serde::Deserialize, Default)]
+        struct RawCountry {
+            #[serde(default)]
+            code: String,
+            #[serde(default)]
+            name: String,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct RawGeo {
+            #[serde(default)]
+            country: RawCountry,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawType {
+            #[serde(rename = "type")]
+            proto: String,
+            #[serde(default)]
+            level: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            host: String,
+            port: u16,
+            #[serde(default)]
+            geo: RawGeo,
+            #[serde(default)]
+            types: Vec<RawType>,
+            // avg_resp_time / error_rate are present in the JSON but computed, not stored —
+            // serde ignores them (no field here).
+        }
+
+        let raw = Raw::deserialize(d)?;
+        let host: IpAddr = raw.host.parse().map_err(D::Error::custom)?;
+        // Serialize emits an empty code for "no geo"; map that back to None.
+        let geo = (!raw.geo.country.code.is_empty()).then(|| Country {
+            code: raw.geo.country.code,
+            name: raw.geo.country.name,
+        });
+        let mut types = BTreeMap::new();
+        for t in raw.types {
+            let proto: Proto = t.proto.parse().map_err(D::Error::custom)?;
+            let level = if t.level.is_empty() {
+                None
+            } else {
+                Some(t.level.parse::<AnonLevel>().map_err(D::Error::custom)?)
+            };
+            types.insert(proto, level);
+        }
+
+        Ok(Proxy {
+            host,
+            port: raw.port,
+            expected_types: BTreeSet::new(),
+            geo,
+            types,
+            requests: 0,
+            errors: HashMap::new(),
+            runtimes: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +316,46 @@ mod tests {
         assert_eq!(x.error_rate(), 0.0);
         assert_eq!(x.avg_resp_time(), 0.0);
         assert!(!x.is_working());
+    }
+
+    #[test]
+    fn deserialize_round_trips_serialized_fields() {
+        // A proxy with no recorded attempts (empty stats) round-trips exactly: identity fields
+        // (host/port/geo/types) survive; the lossy stats fields are empty on both sides.
+        let mut x = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        x.geo = Some(Country {
+            code: "US".into(),
+            name: "United States".into(),
+        });
+        x.add_type(Proto::Http, Some(AnonLevel::High));
+        x.add_type(Proto::Connect80, None);
+
+        let json = serde_json::to_string(&x).unwrap();
+        let back: Proxy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn no_geo_round_trips_to_none() {
+        // Serialize emits an empty country code for no-geo; Deserialize must map it back to None.
+        let mut x = Proxy::new("9.9.9.9".parse().unwrap(), 53, BTreeSet::new());
+        x.add_type(Proto::Socks5, None);
+        let back: Proxy = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+        assert_eq!(back.geo, None);
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn deserialize_ignores_computed_stat_fields() {
+        // avg_resp_time/error_rate are present in the JSON (from a checked proxy) but are not
+        // restored — the loaded proxy's timing history starts empty.
+        let json = r#"{"host":"1.2.3.4","port":80,
+            "geo":{"country":{"code":"US","name":"United States"},"region":{"code":"","name":""},"city":null},
+            "types":[{"type":"HTTP","level":"High"}],"avg_resp_time":0.42,"error_rate":0.1}"#;
+        let p: Proxy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.avg_resp_time(), 0.0); // not restored
+        assert_eq!(p.error_rate(), 0.0);
+        assert_eq!(p.types().get(&Proto::Http), Some(&Some(AnonLevel::High)));
     }
 
     #[test]
