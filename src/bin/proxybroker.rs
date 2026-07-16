@@ -844,6 +844,16 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     } else {
         None
     };
+    // These flags are always present (clap mishandles #[cfg]-gated fields), so warn — rather than
+    // silently no-op — when the build lacks the backing feature, matching --state's behavior.
+    #[cfg(not(feature = "store-sqlite"))]
+    if args.recheck {
+        eprintln!("--recheck requires a store backend; rebuild with --features store-sqlite");
+    }
+    #[cfg(not(feature = "watch"))]
+    if args.watch {
+        eprintln!("--watch requires the watch feature; rebuild with --features watch");
+    }
     let handle = serve(
         addr,
         pool,
