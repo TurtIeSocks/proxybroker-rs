@@ -139,6 +139,14 @@ pub enum AnonLevel {
     High,
 }
 
+impl serde::Serialize for AnonLevel {
+    /// Serialize as the wire name (`High`, …), so it is a valid string map key in `Stats`
+    /// (`by_anonymity`) and matches `Proto`'s scheme. (C5.)
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 impl AnonLevel {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -243,6 +251,15 @@ mod tests {
         }
         assert_eq!("connect:80".parse::<Proto>().unwrap(), Proto::Connect80);
         assert!("NOPE".parse::<Proto>().is_err());
+    }
+
+    #[test]
+    fn anon_level_serializes_as_wire_name() {
+        assert_eq!(serde_json::to_string(&AnonLevel::High).unwrap(), "\"High\"");
+        assert_eq!(
+            serde_json::to_string(&AnonLevel::Transparent).unwrap(),
+            "\"Transparent\""
+        );
     }
 
     #[test]

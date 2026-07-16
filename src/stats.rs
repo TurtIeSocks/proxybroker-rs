@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// A summary over a batch of proxies.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Stats {
     /// Total proxies seen.
     pub total: usize,
@@ -243,6 +243,26 @@ mod tests {
         let s = Stats::from_proxies(&[p]);
         assert_eq!(s.errors["connection_timeout"], 1);
         assert_eq!(s.avg_resp_time, 0.4);
+    }
+
+    #[test]
+    fn stats_serializes_to_json() {
+        let proxies = vec![
+            proxy(
+                "1.1.1.1",
+                &[(Proto::Http, Some(AnonLevel::High))],
+                Some("US"),
+            ),
+            proxy("2.2.2.2", &[(Proto::Socks5, None)], Some("DE")),
+        ];
+        let v = serde_json::to_value(Stats::from_proxies(&proxies)).unwrap();
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["working"], 2);
+        // Map keys are the wire names (HTTP / High), not serde's default enum spelling.
+        assert_eq!(v["by_protocol"]["HTTP"], 1);
+        assert_eq!(v["by_anonymity"]["High"], 1);
+        assert_eq!(v["by_country"]["US"], 1);
+        assert!(v["avg_resp_time"].is_number());
     }
 
     #[test]

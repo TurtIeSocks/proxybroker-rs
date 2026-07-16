@@ -268,6 +268,11 @@ struct FindArgs {
     #[arg(long)]
     show_stats: bool,
 
+    /// Format for the --show-stats summary (stderr): text (default) or json. Inert without
+    /// --show-stats.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Text)]
+    stats_format: StatsFormat,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Default)]
     format: Format,
@@ -347,6 +352,11 @@ struct CheckArgs {
     #[arg(long)]
     show_stats: bool,
 
+    /// Format for the --show-stats summary (stderr): text (default) or json. Inert without
+    /// --show-stats.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Text)]
+    stats_format: StatsFormat,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Default)]
     format: Format,
@@ -365,6 +375,16 @@ struct CheckArgs {
     /// of --format/--outfile.
     #[arg(long, value_name = "PATH")]
     save: Option<PathBuf>,
+}
+
+/// Format for the `--show-stats` summary (which always goes to stderr, orthogonal to `--format`).
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum StatsFormat {
+    /// The human-readable summary (unchanged).
+    #[default]
+    Text,
+    /// A single JSON object.
+    Json,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -715,7 +735,10 @@ async fn find(broker: Broker, args: FindArgs) -> Result<(), Box<dyn std::error::
         // the proxy output on stdout. `stats()` is complete now: the stream is fully drained,
         // so all checks have finished and recorded.
         if let Some(s) = stream.stats() {
-            eprint!("\n{s}");
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
         }
     }
     Ok(())
@@ -781,7 +804,10 @@ async fn check(broker: Broker, args: CheckArgs) -> Result<(), Box<dyn std::error
 
     if args.show_stats {
         if let Some(s) = stream.stats() {
-            eprint!("\n{s}");
+            match args.stats_format {
+                StatsFormat::Text => eprint!("\n{s}"),
+                StatsFormat::Json => eprintln!("{}", serde_json::to_string(&s)?),
+            }
         }
     }
     Ok(())
