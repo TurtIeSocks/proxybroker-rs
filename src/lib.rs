@@ -54,7 +54,9 @@ pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
 pub use parse::parse_proxy_lines;
 #[cfg(feature = "persist")]
-pub use persist::{Store, SCHEMA_VERSION};
+pub use persist::Store;
+#[cfg(feature = "store-sqlite")]
+pub use persist::{SqliteStore, SCHEMA_VERSION};
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
 pub use proxy::{read_ndjson, write_ndjson, Capabilities, Country, Credentials, Proxy};
 pub use resolver::Resolver;

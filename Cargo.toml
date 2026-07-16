@@ -32,8 +32,13 @@ metrics = ["server"]
 # Live progress bar during `find` (F2). Pulls in indicatif; off by default so the default binary
 # stays lean.
 progress = ["cli", "dep:indicatif"]
-# Durable cross-run state in a SQLite DB (D2). Off by default so pure-library users stay zero-dep.
-persist = ["dep:rusqlite"]
+# Persistence CONTRACT (D2): the `Store` trait + observer machinery, no backend dependency. A
+# pure-library user can impl `Store` for any backend; a backend feature provides a concrete one.
+persist = []
+# SQLite backend for `--state` (D2). Bundled SQLite: static link, no system libsqlite3.
+store-sqlite = ["persist", "dep:rusqlite"]
+# store-redis (deferred to Wave 9): store-redis = ["persist", "dep:redis"] — an atomic EWMA upsert
+# needs a Lua EVAL / WATCH-MULTI (no SQL ON CONFLICT), plus an async client + test infra.
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.

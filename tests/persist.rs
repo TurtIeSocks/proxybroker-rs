@@ -1,11 +1,12 @@
-//! D2 — the SQLite store round-trips proxy history across runs. All against a temp-dir DB, zero
-//! network (constraint C5). Raw-column assertions use rusqlite directly (a `persist`-feature dep).
-#![cfg(feature = "persist")]
+//! D2 — the SQLite `Store` backend round-trips proxy history across runs. All against a temp-dir DB,
+//! zero network (constraint C5). Raw-column assertions use rusqlite directly (a `store-sqlite` dep).
+#![cfg(feature = "store-sqlite")]
 
-use proxybroker::persist::{Store, SCHEMA_VERSION};
+use proxybroker::persist::{SqliteStore, SCHEMA_VERSION};
 use proxybroker::proxy::Proxy;
 use proxybroker::types::{AnonLevel, Proto};
 use proxybroker::ProxyError;
+use proxybroker::Store; // the trait: upsert/load
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,10 +28,10 @@ fn working_http(ip: &str) -> Proxy {
 fn upsert_then_load_roundtrips_a_proxy() {
     let path = tmp_db();
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         store.upsert(&working_http("1.2.3.4")).unwrap();
     } // drop → close
-    let store = Store::open(&path).unwrap(); // reopen: history survives
+    let store = SqliteStore::open(&path).unwrap(); // reopen: history survives
     let loaded = store.load().unwrap();
     assert_eq!(loaded.len(), 1);
     let p = &loaded[0];
@@ -44,7 +45,7 @@ fn upsert_then_load_roundtrips_a_proxy() {
 #[test]
 fn user_version_is_set_on_open() {
     let path = tmp_db();
-    let _store = Store::open(&path).unwrap();
+    let _store = SqliteStore::open(&path).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -57,11 +58,11 @@ fn user_version_is_set_on_open() {
 fn ewma_folds_across_two_runs() {
     let path = tmp_db();
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         store.upsert(&working_http("2.2.2.2")).unwrap(); // sample 1.0 → ewma 1.0 on insert
     }
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         let mut bad = Proxy::new("2.2.2.2".parse().unwrap(), 8080, BTreeSet::new());
         bad.record_attempt(None, Some(ProxyError::Timeout)); // no confirmed type → not working (0.0)
         store.upsert(&bad).unwrap();
@@ -85,16 +86,16 @@ fn failing_recheck_preserves_confirmed_types() {
     // types (the failure sample still feeds ewma/requests), or the proxy loads unselectable.
     let path = tmp_db();
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         store.upsert(&working_http("4.4.4.4")).unwrap(); // Http@High, working
     }
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         let mut bad = Proxy::new("4.4.4.4".parse().unwrap(), 8080, BTreeSet::new());
         bad.record_attempt(None, Some(ProxyError::Timeout)); // no confirmed types
         store.upsert(&bad).unwrap();
     }
-    let loaded = Store::open(&path).unwrap().load().unwrap();
+    let loaded = SqliteStore::open(&path).unwrap().load().unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(
         loaded[0].types().get(&Proto::Http),
@@ -109,7 +110,7 @@ fn failing_recheck_preserves_confirmed_types() {
 fn requests_and_errors_accumulate() {
     let path = tmp_db();
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         let mut p = Proxy::new("3.3.3.3".parse().unwrap(), 80, BTreeSet::new());
         p.add_type(Proto::Http, None);
         p.record_attempt(Some(0.1), None); // req 1, err 0
@@ -117,7 +118,7 @@ fn requests_and_errors_accumulate() {
         store.upsert(&p).unwrap();
     }
     {
-        let store = Store::open(&path).unwrap();
+        let store = SqliteStore::open(&path).unwrap();
         let mut p = Proxy::new("3.3.3.3".parse().unwrap(), 80, BTreeSet::new());
         p.add_type(Proto::Http, None);
         p.record_attempt(None, Some(ProxyError::Timeout)); // req 1, err 1
@@ -139,7 +140,7 @@ fn requests_and_errors_accumulate() {
 #[test]
 fn migration_from_v0_creates_table() {
     let path = tmp_db();
-    let store = Store::open(&path).unwrap(); // fresh path: version 0 → migrate → 1
+    let store = SqliteStore::open(&path).unwrap(); // fresh path: version 0 → migrate → 1
     assert!(store.load().unwrap().is_empty());
     let conn = rusqlite::Connection::open(&path).unwrap();
     let v: i64 = conn

@@ -203,7 +203,7 @@ struct ServeArgs {
     metrics: Option<std::net::SocketAddr>,
 
     /// Remember proxies across runs in a SQLite DB at this path — warm-starts the pool from stored
-    /// history and folds each fresh check back in (D2; requires the `persist` build feature).
+    /// history and folds each fresh check back in (D2; requires the `store-sqlite` build feature).
     #[arg(long, value_name = "PATH")]
     state: Option<PathBuf>,
 }
@@ -354,7 +354,7 @@ struct FindArgs {
     progress: bool,
 
     /// Remember proxies across runs in a SQLite DB at this path — each checked proxy is folded into
-    /// its durable history (D2; requires the `persist` build feature).
+    /// its durable history (D2; requires the `store-sqlite` build feature).
     #[arg(long, value_name = "PATH")]
     state: Option<PathBuf>,
 }
@@ -841,17 +841,21 @@ fn types_from(protos: Vec<Proto>, lvl: Vec<AnonLevel>) -> Vec<TypeSpec> {
 /// Open the `--state` store (D2): return the broker with an upsert observer installed (every checked
 /// proxy is folded into its durable row) plus the warm-start history read from the DB. A no-op
 /// returning empty history when `--state` is unset or the `persist` feature is off.
-#[cfg(feature = "persist")]
+#[cfg(feature = "store-sqlite")]
 fn open_state(
     broker: Broker,
     path: Option<&std::path::Path>,
 ) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
     match path {
         Some(p) => {
-            let store = std::sync::Arc::new(proxybroker::Store::open(p)?);
+            // Behind the trait so a future backend (store-redis, Wave 9) is a construction swap
+            // — e.g. dispatch by URL scheme — with no change to the wiring below.
+            let store: std::sync::Arc<dyn proxybroker::Store> =
+                std::sync::Arc::new(proxybroker::SqliteStore::open(p)?);
             let history = store.load()?;
+            let writer = store.clone();
             let obs: proxybroker::broker::CheckObserver = std::sync::Arc::new(move |px: &Proxy| {
-                if let Err(e) = store.upsert(px) {
+                if let Err(e) = writer.upsert(px) {
                     tracing::warn!(error = %e, "state upsert failed");
                 }
             });
@@ -860,13 +864,13 @@ fn open_state(
         None => Ok((broker, Vec::new())),
     }
 }
-#[cfg(not(feature = "persist"))]
+#[cfg(not(feature = "store-sqlite"))]
 fn open_state(
     broker: Broker,
     path: Option<&std::path::Path>,
 ) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
     if path.is_some() {
-        eprintln!("--state requires the `persist` build feature; ignoring");
+        eprintln!("--state requires a store backend; rebuild with --features store-sqlite");
     }
     Ok((broker, Vec::new()))
 }
