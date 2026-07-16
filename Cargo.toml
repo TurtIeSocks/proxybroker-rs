@@ -32,6 +32,13 @@ metrics = ["server"]
 # Live progress bar during `find` (F2). Pulls in indicatif; off by default so the default binary
 # stays lean.
 progress = ["cli", "dep:indicatif"]
+# Persistence CONTRACT (D2): the `Store` trait + observer machinery, no backend dependency. A
+# pure-library user can impl `Store` for any backend; a backend feature provides a concrete one.
+persist = []
+# SQLite backend for `--state` (D2). Bundled SQLite: static link, no system libsqlite3.
+store-sqlite = ["persist", "dep:rusqlite"]
+# store-redis (deferred to Wave 9): store-redis = ["persist", "dep:redis"] — an atomic EWMA upsert
+# needs a Lua EVAL / WATCH-MULTI (no SQL ON CONFLICT), plus an async client + test infra.
 # Country-lookup CODE.
 geo = ["dep:maxminddb"]
 # Country-lookup DATA — DB-IP Country Lite, CC BY 4.0. Requires attribution.
@@ -74,6 +81,8 @@ maxminddb = { version = "0.29", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 indicatif = { version = "0.18", optional = true }
+# `bundled` compiles SQLite from source: no system libsqlite3, static link (matches the musl goal).
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -141,6 +141,47 @@ impl Proxy {
         }
     }
 
+    /// Rebuild a proxy from persisted aggregates (D2 warm start) so `priority()` / `error_rate()` /
+    /// `avg_resp_time()` reflect its stored history. Seeds the private stat fields directly — the
+    /// only mutating constructor beyond [`Proxy::new`], used only by the `persist` store.
+    ///
+    /// The reconstruction is **lossy on the error histogram, faithful on the error rate**:
+    /// `errors_total` is seeded under a single bucket, so per-bucket breakdowns are gone but
+    /// `error_rate()` is exact. `avg_resp_time` is seeded as one runtime sample so `avg_resp_time()`
+    /// returns it. Warm start only needs `priority()`, never the per-bucket breakdown (a
+    /// fresh-session stat). Recorded in `decisions.md`.
+    pub fn restored(
+        host: IpAddr,
+        port: u16,
+        types: BTreeMap<Proto, Option<AnonLevel>>,
+        requests: u32,
+        errors_total: u32,
+        avg_resp_time: f64,
+    ) -> Proxy {
+        let runtimes = if avg_resp_time > 0.0 {
+            vec![avg_resp_time]
+        } else {
+            Vec::new()
+        };
+        let mut errors = HashMap::new();
+        if errors_total > 0 {
+            errors.insert(ProxyError::BadResponse, errors_total);
+        }
+        Proxy {
+            host,
+            port,
+            expected_types: BTreeSet::new(),
+            geo: None,
+            types,
+            requests,
+            errors,
+            runtimes,
+            auth: None,
+            caps: Caps::default(),
+            trust: TrustReport::default(),
+        }
+    }
+
     /// Attach upstream credentials (builder-style). `scheme://user:pass@host:port` loading sets
     /// these; scraped proxies never carry them.
     pub fn with_auth(mut self, creds: Credentials) -> Self {

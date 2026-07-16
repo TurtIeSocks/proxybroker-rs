@@ -76,6 +76,41 @@ fn query(judge: std::net::SocketAddr, limit: Option<usize>) -> FindQuery {
 }
 
 #[tokio::test]
+async fn check_fires_the_observer_per_checked_proxy() {
+    // D2 seam: the broker's per-checked-proxy observer (the persist upsert hook) fires once for
+    // every checked proxy, working or not.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (judge, _j) = echo_server(JUDGE_PAGE).await;
+    let (p1, _a) = echo_server(HIGH_PAGE).await;
+    let (p2, _b) = echo_server(HIGH_PAGE).await;
+    let (resolver, _ext) = stubbed_resolver().await;
+
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let obs: proxybroker::broker::CheckObserver = std::sync::Arc::new(move |_p| {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+    let broker = Broker::builder()
+        .providers(vec![])
+        .resolver(resolver)
+        .build()
+        .with_observer(Some(obs));
+
+    let input = futures_util::stream::iter(vec![http_proxy(p1), http_proxy(p2)]);
+    let _out: Vec<_> = broker
+        .check(input, query(judge, None))
+        .await
+        .expect("check should start")
+        .collect()
+        .await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "observer fires once per checked proxy"
+    );
+}
+
+#[tokio::test]
 async fn check_streams_working_proxies() {
     let (judge, _j) = echo_server(JUDGE_PAGE).await;
     let (p1, _a) = echo_server(HIGH_PAGE).await;
