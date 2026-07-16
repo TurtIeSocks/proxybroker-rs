@@ -18,7 +18,13 @@ statement of changes.
 proxybroker grab --limit 10                      # scrape providers, no checking
 proxybroker find --types HTTP HTTPS --limit 10   # scrape + check + classify anonymity
 proxybroker find --types SOCKS5 --format json    # machine-readable output
-proxybroker serve --types HTTP --host 127.0.0.1:8888   # local rotating proxy server
+proxybroker find --types HTTP --show-stats       # + an aggregate summary on stderr
+proxybroker find --types HTTP --dnsbl zen.spamhaus.org   # reject blocklisted IPs
+proxybroker serve --types HTTP --host 127.0.0.1:8888     # local rotating proxy server
+
+# bring your own providers (YAML/JSON configs, one provider per file):
+proxybroker --provider-dir ./my-providers find --types HTTP
+proxybroker --provider-dir ./my-providers --providers-only grab   # ignore the bundled set
 ```
 
 As a library:
