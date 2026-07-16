@@ -33,7 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = Pool::spawn(stream, PoolConfig::default());
     let resolver = Arc::new(Resolver::new(timeout)?);
-    let handle = serve("127.0.0.1:8888".parse()?, pool, resolver, timeout).await?;
+    // min_queue 0 (serve as soon as a proxy arrives) and the default 1024 listen backlog.
+    let handle = serve("127.0.0.1:8888".parse()?, pool, resolver, timeout, 0, 1024).await?;
     println!("serving on {}", handle.local_addr());
 
     // Use it: fetch a page through the local proxy, exactly as any client would.

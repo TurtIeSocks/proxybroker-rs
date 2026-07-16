@@ -84,6 +84,8 @@ async fn server_relays_http_request_through_a_pool_proxy() {
         pool,
         resolver,
         Duration::from_secs(3),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -185,6 +187,8 @@ async fn retries_next_proxy_when_first_connect_fails() {
         pool,
         resolver,
         Duration::from_secs(3),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -224,6 +228,8 @@ async fn emits_502_after_max_tries_all_fail() {
         pool,
         resolver,
         Duration::from_secs(2),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -247,6 +253,8 @@ async fn serve_get(pool: Arc<Pool>) -> String {
         pool,
         resolver,
         Duration::from_secs(3),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -310,6 +318,87 @@ async fn none_allowed_codes_accepts_any() {
         "500 should be forwarded when no allow-list: {body:?}"
     );
     assert!(body.contains("ERRBODY"));
+}
+
+#[tokio::test]
+async fn wait_ready_returns_on_exhaustion() {
+    // A too-small source must not hang startup: from_proxies is exhausted immediately, so
+    // wait_ready(n) returns even though n is never met.
+    let pool = Pool::from_proxies(vec![proxy_in("1.1.1.1", "US")], PoolConfig::default());
+    tokio::time::timeout(Duration::from_secs(1), pool.wait_ready(5))
+        .await
+        .expect("wait_ready must return on exhaustion, not hang");
+}
+
+#[tokio::test]
+async fn serve_waits_for_min_queue() {
+    // The server does not relay until the pool holds min_queue proxies. Fed by a test-driven
+    // channel (via the now-generic Pool::spawn) so we control arrivals.
+    let (up, _u) = mock_upstream("READY").await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Proxy>(4);
+    let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
+    let pool = Pool::spawn(stream, PoolConfig::default());
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        2, // min_queue
+        1024,
+    )
+    .await
+    .unwrap();
+
+    // One proxy — below min_queue(2): the server must not accept/relay yet.
+    tx.send(http_proxy_at(up)).await.unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let pending = tokio::time::timeout(Duration::from_millis(300), client.read(&mut buf)).await;
+    assert!(pending.is_err(), "must not relay before min_queue is met");
+
+    // Second proxy meets min_queue → the server starts accepting and relays.
+    tx.send(http_proxy_at(up)).await.unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+    assert!(
+        String::from_utf8_lossy(&resp).contains("READY"),
+        "server relays once min_queue is met"
+    );
+}
+
+#[tokio::test]
+async fn backlog_sets_listen_queue() {
+    // A non-default backlog exercises the TcpSocket bind path; assert it still yields a working
+    // listener (backlog depth itself is not portably observable).
+    let (up, _u) = mock_upstream("OK-BACKLOG").await;
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        128, // non-default backlog
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut resp))
+        .await
+        .expect("read should not time out")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&resp).contains("OK-BACKLOG"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -417,6 +506,8 @@ async fn sticky_pins_client_across_connections() {
         pool,
         resolver,
         Duration::from_secs(3),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -468,6 +559,8 @@ async fn serve_loads_a_saved_pool() {
         pool,
         resolver,
         Duration::from_secs(3),
+        0,
+        1024,
     )
     .await
     .unwrap();
@@ -498,6 +591,8 @@ async fn server_returns_502_when_pool_is_empty() {
         pool,
         resolver,
         Duration::from_secs(2),
+        0,
+        1024,
     )
     .await
     .unwrap();

@@ -175,6 +175,14 @@ struct ServeArgs {
     #[arg(long, num_args = 1.., value_name = "CODE")]
     http_allowed_codes: Vec<u16>,
 
+    /// Wait until the pool holds at least this many proxies before accepting clients.
+    #[arg(long, default_value_t = 0)]
+    min_queue: usize,
+
+    /// TCP listen backlog (queued pending connections).
+    #[arg(long, default_value_t = 1024)]
+    backlog: u32,
+
     /// Attempts (with different proxies) per client request.
     #[arg(long, default_value_t = 3)]
     max_tries: usize,
@@ -451,7 +459,15 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         Pool::spawn(stream, pool_config)
     };
     let resolver = Arc::new(Resolver::new(Duration::from_secs(args.timeout))?);
-    let handle = serve(addr, pool, resolver, Duration::from_secs(args.timeout)).await?;
+    let handle = serve(
+        addr,
+        pool,
+        resolver,
+        Duration::from_secs(args.timeout),
+        args.min_queue,
+        args.backlog,
+    )
+    .await?;
     eprintln!(
         "proxybroker serving on {} — Ctrl-C to stop",
         handle.local_addr()

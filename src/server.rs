@@ -13,7 +13,6 @@
 //! Imports are served by one dedicated task feeding a [`Notify`], not a per-waiter mutex over
 //! the receiver (design critique #22).
 
-use crate::broker::ProxyStream;
 use crate::negotiator::{negotiate, Stream, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
@@ -25,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -152,8 +151,13 @@ impl Pool {
     }
 
     /// Create a pool and spawn the importer that drains `stream` into it. The importer is the
-    /// single owner of the receiver, so waiters never serialize behind a mutex over it.
-    pub fn spawn(stream: ProxyStream, config: PoolConfig) -> Arc<Pool> {
+    /// single owner of the receiver, so waiters never serialize behind a mutex over it. Generic
+    /// over the source stream so a [`ProxyStream`] (from `find`), or any other `Stream<Item =
+    /// Proxy>` (a BYO feed, or a test's channel), can fill the pool.
+    pub fn spawn<S>(stream: S, config: PoolConfig) -> Arc<Pool>
+    where
+        S: futures_util::Stream<Item = Proxy> + Send + 'static,
+    {
         let pool = Arc::new(Pool {
             state: Mutex::new(Vec::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -165,7 +169,7 @@ impl Pool {
         {
             let pool = pool.clone();
             tokio::spawn(async move {
-                let mut stream = stream;
+                let mut stream = std::pin::pin!(stream);
                 while let Some(proxy) = stream.next().await {
                     // Screen imports too, so --load / a live find that skipped country filtering
                     // still honors the pool's allow-list.
@@ -283,6 +287,34 @@ impl Pool {
             blocked_until,
         });
         self.notify.notify_waiters();
+    }
+
+    /// How many proxies are currently pooled.
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
+
+    /// True when the pool holds no proxies.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Wait until at least `n` proxies are pooled, or the source is exhausted — so a too-small
+    /// source can never hang startup forever (B13's `--min-queue`). Reuses the importer's
+    /// [`Notify`] exactly as `get` does. Returns immediately when `n == 0`.
+    pub async fn wait_ready(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        loop {
+            // Create the waker before checking, so a push between the check and the await is not
+            // missed.
+            let waker = self.notify.notified();
+            if self.len() >= n || self.exhausted.load(Ordering::SeqCst) {
+                return;
+            }
+            waker.await;
+        }
     }
 }
 
@@ -432,21 +464,41 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Start the local proxy server on `addr`, relaying through `pool`. Returns once it is bound
-/// and accepting; the accept loop runs in a background task.
+/// Start the local proxy server on `addr`, relaying through `pool`. Binds immediately and returns
+/// the handle (so `local_addr` works at once); the accept loop runs in a background task and, when
+/// `min_queue > 0`, does not start serving until the pool holds that many proxies (B13). `backlog`
+/// is the TCP listen backlog (queued pending connections).
 pub async fn serve(
     addr: SocketAddr,
     pool: Arc<Pool>,
     resolver: Arc<Resolver>,
     timeout: Duration,
+    min_queue: usize,
+    backlog: u32,
 ) -> std::io::Result<ServerHandle> {
-    let listener = TcpListener::bind(addr).await?;
+    // TcpListener::bind does not expose the backlog; go through TcpSocket to set it. Pick the
+    // socket family from the bind address.
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    let listener = socket.listen(backlog)?;
     let local = listener.local_addr()?;
     let cancel = CancellationToken::new();
     let max_tries = pool.config.max_tries;
 
     let accept_cancel = cancel.clone();
     tokio::spawn(async move {
+        // Startup gate: wait for the pool to fill to min_queue before accepting (clients queue in
+        // the backlog meanwhile). wait_ready also returns on source exhaustion, so a too-small
+        // source cannot hang startup forever.
+        tokio::select! {
+            _ = accept_cancel.cancelled() => return,
+            _ = pool.wait_ready(min_queue) => {}
+        }
         loop {
             let (client, peer) = tokio::select! {
                 _ = accept_cancel.cancelled() => break,
