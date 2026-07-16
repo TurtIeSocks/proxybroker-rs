@@ -355,8 +355,12 @@ enum Format {
     Default,
     /// `host:port`, one per line (alias of default for grabbed proxies).
     Txt,
-    /// One JSON object per line.
+    /// One JSON object per line (NDJSON).
     Json,
+    /// `scheme://host:port`, one per line.
+    Url,
+    /// `host,port,protocols,anon,country,resp_time,error_rate`, with a header row.
+    Csv,
 }
 
 /// Stateful output formatter: a one-time `prefix` (CSV header, JSON-array `[`), a per-proxy `item`
@@ -375,7 +379,8 @@ impl Emitter {
     /// Bytes emitted once before the first proxy. `None` for the streaming line formats.
     fn prefix(&self) -> Option<String> {
         match self.format {
-            Format::Default | Format::Txt | Format::Json => None,
+            Format::Csv => Some("host,port,protocols,anon,country,resp_time,error_rate\n".into()),
+            Format::Default | Format::Txt | Format::Json | Format::Url => None,
         }
     }
 
@@ -385,15 +390,57 @@ impl Emitter {
         match self.format {
             Format::Default | Format::Txt => format!("{}\n", proxy.addr()),
             Format::Json => format!("{}\n", serde_json::to_string(proxy).unwrap()),
+            Format::Url => format!("{}://{}\n", scheme_str(proxy), proxy.addr()),
+            Format::Csv => format!("{}\n", csv_row(proxy)),
         }
     }
 
     /// Bytes emitted once after the last proxy. `None` for line formats.
     fn suffix(&self) -> Option<String> {
         match self.format {
-            Format::Default | Format::Txt | Format::Json => None,
+            Format::Default | Format::Txt | Format::Json | Format::Url | Format::Csv => None,
         }
     }
+}
+
+/// `https` if the proxy can tunnel TLS, else `http` — the URL scheme for `--format url`. A grabbed
+/// (unchecked) proxy has no confirmed types, so it falls back to `http`. `Scheme` has no
+/// `Display`, so the two-arm choice is inlined here rather than widened into the library.
+fn scheme_str(p: &Proxy) -> &'static str {
+    if p.schemes().contains(&proxybroker::Scheme::Https) {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// One CSV row for `--format csv`. Every field is comma-free by construction (protocols `|`-joined,
+/// ISO country code only, numeric stats), so no quoting layer is needed — a deviation guarded by
+/// the `csv_header_and_row` test (it fails if a field ever gains a comma).
+fn csv_row(p: &Proxy) -> String {
+    let protocols = p
+        .types()
+        .keys()
+        .map(|proto| proto.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    let anon = p
+        .types()
+        .get(&Proto::Http)
+        .and_then(|l| *l)
+        .map(AnonLevel::as_str)
+        .unwrap_or("");
+    let country = p.geo.as_ref().map(|c| c.code.as_str()).unwrap_or("");
+    format!(
+        "{},{},{},{},{},{},{}",
+        p.host,
+        p.port,
+        protocols,
+        anon,
+        country,
+        p.avg_resp_time(),
+        p.error_rate()
+    )
 }
 
 #[tokio::main]
@@ -823,5 +870,41 @@ mod format_tests {
             "exactly one object per line: {line:?}"
         );
         assert!(line.trim_end().starts_with('{'), "{line:?}");
+    }
+
+    #[test]
+    fn url_format_prefixes_scheme() {
+        // HTTP-only proxy → http.
+        assert_eq!(
+            Emitter::new(Format::Url).item(&proxy_fixture()),
+            "http://1.2.3.4:8080\n"
+        );
+        // A SOCKS5 proxy tunnels TLS → https.
+        let mut p = Proxy::new("5.6.7.8".parse().unwrap(), 1080, BTreeSet::new());
+        p.add_type(Proto::Socks5, None);
+        assert_eq!(Emitter::new(Format::Url).item(&p), "https://5.6.7.8:1080\n");
+    }
+
+    #[test]
+    fn csv_header_and_row() {
+        let mut e = Emitter::new(Format::Csv);
+        assert_eq!(
+            e.prefix().unwrap(),
+            "host,port,protocols,anon,country,resp_time,error_rate\n"
+        );
+        let row = e.item(&proxy_fixture());
+        let row = row.trim_end();
+        let fields: Vec<&str> = row.split(',').collect();
+        // Exactly 7 fields ⇒ no field contained a comma (the no-quoting guard).
+        assert_eq!(fields.len(), 7, "{row}");
+        assert_eq!(&fields[..5], ["1.2.3.4", "8080", "HTTP", "High", "US"]);
+    }
+
+    #[test]
+    fn csv_unchecked_proxy_has_empty_type_columns() {
+        // A grabbed proxy: no confirmed types, no geo → the type/geo columns are empty.
+        let p = Proxy::new("1.2.3.4".parse().unwrap(), 8080, BTreeSet::new());
+        let row = Emitter::new(Format::Csv).item(&p);
+        assert_eq!(row.trim_end(), "1.2.3.4,8080,,,,0,0");
     }
 }
