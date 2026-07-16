@@ -1,0 +1,39 @@
+# Bundled proxy providers.
+#
+# Data, not code: a dead provider is a line edit here, not a recompile-and-republish.
+# Users can override or extend this with --providers <dir> (YAML/JSON files with the same
+# ProviderSpec shape).
+#
+# This list contains only sources confirmed reachable and yielding proxies on 2026-07-15
+# (see docs/systematic-refactor/liveness.txt). proxybroker2's other ~25 entries were dead
+# (9 domains no longer resolve) and were not carried over.
+#
+# NOTE: the proxyscrape SOCKS entries fix a live upstream bug. In proxybroker2
+# (providers.py:706/710) `proto=("SOCKS4")` has no trailing comma, so it is a string, not a
+# tuple; api.py:409 then intersects its characters against protocol names, always empty, and
+# silently drops both — despite them being among the highest-yield sources still alive.
+
+- url: "https://api.proxyscrape.com/?request=getproxies&proxytype=http"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "https://api.proxyscrape.com/?request=getproxies&proxytype=socks4"
+  protocols: [SOCKS4]
+- url: "https://api.proxyscrape.com/?request=getproxies&proxytype=socks5"
+  protocols: [SOCKS5]
+- url: "https://www.sslproxies.org/"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "https://free-proxy-list.net/"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "https://us-proxy.org/"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "https://freshfreeproxylist.wordpress.com/"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "http://fineproxy.org/eng/fresh-proxies/"
+  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
+- url: "https://socks-proxy.net/"
+  protocols: [SOCKS4, SOCKS5]
+- url: "http://proxydb.net/"
+  protocols: []
+- url: "http://pubproxy.com/api/proxy?limit=20&format=txt"
+  protocols: []
+- url: "https://www.marcosbl.com/lab/proxies/"
+  protocols: []

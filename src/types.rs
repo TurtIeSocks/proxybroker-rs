@@ -110,6 +110,21 @@ impl std::str::FromStr for Proto {
 #[error("unknown protocol: {0}")]
 pub struct ParseProtoError(pub String);
 
+// Serde via the wire name, so config files write `HTTP`, `SOCKS5`, `CONNECT:80` — matching
+// Python's tokens — rather than serde's default enum spelling.
+impl serde::Serialize for Proto {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Proto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// How much the proxy reveals about the client. Ordered worst → best, so
 /// `level >= AnonLevel::Anonymous` is a meaningful filter.
 ///
