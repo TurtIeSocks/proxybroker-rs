@@ -76,6 +76,9 @@ enum Command {
     /// Run a local proxy server that rotates through working proxies.
     #[cfg(feature = "server")]
     Serve(ServeArgs),
+    /// Serve the live pool over MCP (stdio): get_proxy, pool_status, report_dead.
+    #[cfg(feature = "mcp")]
+    Mcp(McpArgs),
 }
 
 /// CLI mirror of [`proxybroker::server::Strategy`] (keeps clap's `ValueEnum` out of the library).
@@ -734,6 +737,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Check(args) => check(broker, args).await,
         #[cfg(feature = "server")]
         Command::Serve(args) => serve_cmd(broker, args).await,
+        #[cfg(feature = "mcp")]
+        Command::Mcp(args) => mcp_cmd(broker, args).await,
     }
 }
 
@@ -877,6 +882,57 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
 
 /// Build the pool-fill `FindQuery` from the serve flags. Pure (no I/O, no broker) so the
 /// flag→query mapping is unit-testable offline — the filtering itself runs upstream in `find`.
+/// Pool-fill args for `proxybroker mcp` — the subset of `ServeArgs` an MCP pool needs.
+#[cfg(feature = "mcp")]
+#[derive(clap::Args)]
+struct McpArgs {
+    /// Protocols to find for the pool. E.g. --types HTTP HTTPS.
+    #[arg(long, num_args = 1.., required = true, value_name = "TYPE", value_parser = parse_proto)]
+    types: Vec<Proto>,
+
+    /// Stop filling the pool after this many working proxies.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+
+    /// Keep only proxies located in these ISO country codes (e.g. US GB DE).
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
+    countries: Vec<String>,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 8)]
+    timeout: u64,
+    // No --max-error-rate / --max-resp-time: those PoolConfig thresholds only gate re-admission via
+    // put_ok/put_failed (server relay / connector), which the MCP handlers never call — inert here.
+}
+
+/// Fill a pool via `find` (exactly like `serve`) then serve the three MCP tools over stdio. The
+/// pool fills in the background, so `get_proxy` may return null until the first proxies land.
+#[cfg(feature = "mcp")]
+async fn mcp_cmd(broker: Broker, args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use proxybroker::server::{Pool, PoolConfig};
+
+    let pool_config = PoolConfig {
+        countries: (!args.countries.is_empty())
+            .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
+        ..Default::default()
+    };
+    let mut b = FindQuery::builder()
+        .types(types_from(args.types.clone(), Vec::new()))
+        .limit(args.limit.max(1))
+        .timeout(Duration::from_secs(args.timeout));
+    if !args.countries.is_empty() {
+        b = b.countries(args.countries.clone());
+    }
+    let stream = broker.find(b.build()).await?;
+    let pool = Pool::spawn(stream, pool_config);
+    // stderr only — stdout is the MCP JSON-RPC channel.
+    eprintln!(
+        "mcp: filling pool (limit {}); serving get_proxy/pool_status/report_dead over stdio",
+        args.limit
+    );
+    proxybroker::mcp::serve_stdio(pool).await
+}
+
 /// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
 /// matching api.py's `if limit <= 0: raise ValueError`.
 #[cfg(feature = "server")]

@@ -58,3 +58,9 @@ jobs:
       # is skipped here (required-features = ["cli"]), so no test changes are needed.
       - name: Test (no default features)
         run: cargo test --no-default-features --locked
+
+      # The CLI binary without `server` — a supported combo (required-features = ["cli"]) that
+      # neither all-features nor no-default-features compiles, so a mis-placed #[cfg] gate on a
+      # server-only fn can slip through both. Build-only: this config has no bin integration tests.
+      - name: Build (cli, no server)
+        run: cargo build --bin proxybroker --no-default-features --features cli --locked

@@ -350,6 +350,40 @@ impl Pool {
             .collect()
     }
 
+    /// A non-consuming clone of every pooled proxy — for the E4 MCP `pool_status` snapshot (feed to
+    /// [`crate::Stats::from_proxies`]) and status/selection previews. Does not check anything out.
+    pub fn proxies(&self) -> Vec<Proxy> {
+        self.state
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.proxy.clone())
+            .collect()
+    }
+
+    /// Check out the best proxy for `scheme` (optionally filtered to an ISO country code,
+    /// case-insensitive), by priority — like [`Pool::get`] but non-blocking: returns `None` at once
+    /// instead of waiting on the importer. The E4 MCP `get_proxy` tool's selection seam.
+    pub fn try_get(&self, scheme: Scheme, country: Option<&str>) -> Option<Proxy> {
+        let mut state = self.state.lock().unwrap();
+        let eligible: Vec<usize> = state
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.proxy.schemes().contains(&scheme))
+            .filter(|(_, p)| match country {
+                Some(cc) => p
+                    .proxy
+                    .geo
+                    .as_ref()
+                    .is_some_and(|g| g.code.eq_ignore_ascii_case(cc)),
+                None => true,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let idx = best_by_priority(&state, &eligible, self.config.prefer_connect)?;
+        Some(state.remove(idx).proxy)
+    }
+
     /// Wait until at least `n` proxies are pooled, or the source is exhausted — so a too-small
     /// source can never hang startup forever (B13's `--min-queue`). Reuses the importer's
     /// [`Notify`] exactly as `get` does. Returns immediately when `n == 0`.
@@ -1698,5 +1732,48 @@ mod tests {
             split_host_port("[2001:db8::1]", 80),
             ("2001:db8::1".into(), 80)
         );
+    }
+
+    fn http_at(ip: &str, cc: Option<&str>) -> Proxy {
+        let mut p = Proxy::new(ip.parse().unwrap(), 80, BTreeSet::new());
+        p.add_type(Proto::Http, None);
+        if let Some(cc) = cc {
+            p.geo = Some(crate::proxy::Country {
+                code: cc.to_string(),
+                ..Default::default()
+            });
+        }
+        p
+    }
+
+    #[test]
+    fn try_get_filters_by_country() {
+        let pool = Pool::from_proxies(
+            vec![
+                http_at("1.1.1.1", Some("US")),
+                http_at("2.2.2.2", Some("GB")),
+            ],
+            PoolConfig::default(),
+        );
+        let got = pool.try_get(Scheme::Http, Some("us")).expect("a US proxy"); // case-insensitive
+        assert_eq!(got.addr(), "1.1.1.1:80");
+        assert!(
+            pool.try_get(Scheme::Http, Some("FR")).is_none(),
+            "no FR proxy to hand out"
+        );
+    }
+
+    #[test]
+    fn proxies_snapshot_does_not_consume() {
+        let pool = Pool::from_proxies(
+            vec![http_at("1.1.1.1", None), http_at("2.2.2.2", None)],
+            PoolConfig::default(),
+        );
+        assert_eq!(pool.proxies().len(), 2, "snapshot sees both");
+        assert!(
+            pool.try_get(Scheme::Http, None).is_some(),
+            "still checkoutable"
+        );
+        assert_eq!(pool.proxies().len(), 1, "checkout removed one");
     }
 }
