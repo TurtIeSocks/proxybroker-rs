@@ -234,6 +234,216 @@ mod sqlite {
 #[cfg(feature = "store-sqlite")]
 pub use sqlite::{SqliteStore, SCHEMA_VERSION};
 
+#[cfg(feature = "persist")]
+mod memory {
+    //! An in-memory [`Store`](super::Store) — the D2 contract with no database (D3). Gated on
+    //! `persist` alone (no backend dependency), so `serve --recheck` can keep an adaptive re-check's
+    //! decay/score bookkeeping without a `--state` SQLite/Redis backend. The state lives only for
+    //! the process; nothing survives a restart.
+    //!
+    //! [`MemoryStore::upsert`](super::MemoryStore::upsert) reproduces
+    //! [`sqlite::SqliteStore`](super::sqlite)'s `ON CONFLICT` fold byte-for-byte — alpha = 0.3 new +
+    //! 0.7 prior on the success/latency EWMAs, accumulate requests/errors/uptime, and keep prior
+    //! confirmed types on a failing (empty) sample — so a MemoryStore-backed re-check decays
+    //! identically to the durable path.
+
+    use super::Store;
+    use crate::error::Error;
+    use crate::proxy::Proxy;
+    use crate::types::{AnonLevel, Proto};
+    use std::collections::{BTreeMap, HashMap};
+    use std::net::IpAddr;
+    use std::sync::Mutex;
+
+    /// One remembered proxy's durable aggregates — the same columns [`sqlite::SqliteStore`](super::sqlite)
+    /// keeps per `proxies` row, folded in memory instead of in SQL. `ewma_success` is tracked for a
+    /// faithful fold even though `load` (like both durable backends) reconstructs via
+    /// [`Proxy::restored`] and so never surfaces it.
+    struct Record {
+        types: BTreeMap<Proto, Option<AnonLevel>>,
+        requests: u32,
+        errors: u32,
+        ewma_success: f64,
+        avg_latency: f64,
+        uptime_checks: u64,
+    }
+
+    /// The in-memory [`Store`]: a `HashMap<(host, port), Record>` behind a `Mutex` (so `Arc<MemoryStore>`
+    /// is shareable across the re-check tasks). No backend dependency — `serve --recheck` without
+    /// `--state` folds into this instead of a database.
+    #[derive(Default)]
+    pub struct MemoryStore {
+        map: Mutex<HashMap<(IpAddr, u16), Record>>,
+    }
+
+    impl MemoryStore {
+        /// A fresh, empty in-memory store.
+        pub fn new() -> MemoryStore {
+            MemoryStore::default()
+        }
+    }
+
+    impl Store for MemoryStore {
+        fn upsert(&self, proxy: &Proxy) -> Result<(), Error> {
+            let sample = f64::from(u8::from(proxy.is_working())); // 1.0 working, 0.0 not
+            let uptime = u64::from(proxy.is_working());
+            let errors_total: u32 = proxy.errors().values().sum();
+            let latency = proxy.avg_resp_time();
+            let mut map = self.map.lock().unwrap();
+            map.entry((proxy.host, proxy.port))
+                .and_modify(|rec| {
+                    // CONFLICT arm — mirror SqliteStore's `UPDATE SET`.
+                    if !proxy.types().is_empty() {
+                        // Keep the prior confirmed types on a failing (empty) sample, just as
+                        // avg_latency keeps its prior on a zero sample — else a transient failure
+                        // erases a proxy's types and makes it unselectable on warm start.
+                        rec.types = proxy.types().clone();
+                    }
+                    rec.requests = rec.requests.saturating_add(proxy.requests());
+                    rec.errors = rec.errors.saturating_add(errors_total);
+                    rec.ewma_success = 0.3 * sample + 0.7 * rec.ewma_success;
+                    if latency > 0.0 {
+                        rec.avg_latency = 0.3 * latency + 0.7 * rec.avg_latency;
+                    }
+                    rec.uptime_checks = rec.uptime_checks.saturating_add(uptime);
+                })
+                .or_insert_with(|| Record {
+                    // INSERT arm — seed from the first sample (SqliteStore's VALUES row): the raw
+                    // latency (even 0) and the raw sample as the initial EWMA.
+                    types: proxy.types().clone(),
+                    requests: proxy.requests(),
+                    errors: errors_total,
+                    ewma_success: sample,
+                    avg_latency: latency,
+                    uptime_checks: uptime,
+                });
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Vec<Proxy>, Error> {
+            let map = self.map.lock().unwrap();
+            let out = map
+                .iter()
+                .map(|(&(host, port), rec)| {
+                    Proxy::restored(
+                        host,
+                        port,
+                        rec.types.clone(),
+                        rec.requests,
+                        rec.errors,
+                        rec.avg_latency,
+                    )
+                })
+                .collect();
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        /// A working proxy (non-empty types → `is_working()` true → success sample 1.0) with the
+        /// given aggregates. `Proxy::restored` seeds the private stat fields the fold reads.
+        fn working(host: &str, port: u16, requests: u32, errors: u32, avg: f64) -> Proxy {
+            let mut types = BTreeMap::new();
+            types.insert(Proto::Http, None);
+            Proxy::restored(host.parse().unwrap(), port, types, requests, errors, avg)
+        }
+
+        /// A failing proxy (empty types → `is_working()` false → success sample 0.0).
+        fn failing(host: &str, port: u16, requests: u32, errors: u32) -> Proxy {
+            Proxy::restored(
+                host.parse().unwrap(),
+                port,
+                BTreeMap::new(),
+                requests,
+                errors,
+                0.0,
+            )
+        }
+
+        fn ewma_of(store: &MemoryStore, host: &str, port: u16) -> f64 {
+            store.map.lock().unwrap()[&(host.parse().unwrap(), port)].ewma_success
+        }
+
+        #[test]
+        fn upsert_then_load_round_trips() {
+            let store = MemoryStore::new();
+            store
+                .upsert(&working("1.2.3.4", 8080, 3, 1, 250.0))
+                .unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(
+                loaded.len(),
+                1,
+                "one upserted proxy round-trips through load"
+            );
+            let p = &loaded[0];
+            assert_eq!(p.host, "1.2.3.4".parse::<IpAddr>().unwrap());
+            assert_eq!(p.port, 8080);
+            assert_eq!(p.requests(), 3);
+            assert!(p.types().contains_key(&Proto::Http));
+            // First upsert seeds avg_latency from the raw sample (SqliteStore's VALUES row).
+            assert!((p.avg_resp_time() - 250.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn first_upsert_seeds_ewma_from_sample() {
+            let store = MemoryStore::new();
+            store
+                .upsert(&working("1.2.3.4", 8080, 1, 0, 100.0))
+                .unwrap();
+            assert!(
+                (ewma_of(&store, "1.2.3.4", 8080) - 1.0).abs() < 1e-12,
+                "a working first sample seeds ewma = 1.0"
+            );
+        }
+
+        #[test]
+        fn second_upsert_folds_ewma_alpha_0_3() {
+            // working (1.0) then failing (0.0): ewma = 0.3*0.0 + 0.7*1.0 = 0.7, matching
+            // SqliteStore's `0.3*excluded + 0.7*prior` and the `fold_ewma` oracle.
+            let store = MemoryStore::new();
+            store
+                .upsert(&working("1.2.3.4", 8080, 1, 0, 100.0))
+                .unwrap();
+            store.upsert(&failing("1.2.3.4", 8080, 1, 1)).unwrap();
+            assert!((ewma_of(&store, "1.2.3.4", 8080) - 0.7).abs() < 1e-12);
+            let rec = store.map.lock().unwrap();
+            let r = &rec[&("1.2.3.4".parse::<IpAddr>().unwrap(), 8080)];
+            assert_eq!(r.requests, 2, "requests accumulate");
+            assert_eq!(r.errors, 1, "errors accumulate");
+            assert!(
+                r.types.contains_key(&Proto::Http),
+                "a failing (empty) sample must not erase confirmed types"
+            );
+            assert!(
+                (r.avg_latency - 100.0).abs() < 1e-9,
+                "a zero-latency sample leaves avg_latency unchanged (CASE latency>0)"
+            );
+        }
+
+        #[test]
+        fn latency_ewma_folds_with_same_alpha() {
+            // Two positive-latency working samples: 0.3*200 + 0.7*100 = 130, observable via load().
+            let store = MemoryStore::new();
+            store
+                .upsert(&working("9.9.9.9", 3128, 1, 0, 100.0))
+                .unwrap();
+            store
+                .upsert(&working("9.9.9.9", 3128, 1, 0, 200.0))
+                .unwrap();
+            let p = store.load().unwrap().into_iter().next().unwrap();
+            assert!((p.avg_resp_time() - 130.0).abs() < 1e-9);
+        }
+    }
+}
+
+#[cfg(feature = "persist")]
+pub use memory::MemoryStore;
+
 #[cfg(feature = "store-redis")]
 mod redis {
     //! The bundled Redis [`Store`](super::Store) backend (Wave 9). One blocking
