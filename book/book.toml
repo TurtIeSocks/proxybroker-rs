@@ -1,0 +1,21 @@
+[book]
+title = "proxybroker-rs"
+authors = ["Rin"]
+description = "Find, check, and serve public HTTP(S) and SOCKS4/5 proxies — a Rust library and CLI."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/TurtIeSocks/proxybroker-rs"
+edit-url-template = "https://github.com/TurtIeSocks/proxybroker-rs/edit/main/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
