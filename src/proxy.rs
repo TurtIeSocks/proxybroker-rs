@@ -87,6 +87,12 @@ pub struct Proxy {
     errors: HashMap<ProxyError, u32>,
     /// Successful round-trip times, seconds. Timeouts are excluded. `_runtimes`.
     runtimes: Vec<f64>,
+    /// Judge-probe latencies measured at CHECK time only (F1), seconds — the RTT of validating
+    /// this proxy against a judge. Kept separate from [`Self::runtimes`], which the serve path also
+    /// feeds via [`Self::record_attempt`], so the probe-latency metric is never contaminated by
+    /// relayed serve traffic. Not serialized (like `caps`/`trust`); a loaded proxy re-measures it on
+    /// a fresh check.
+    probe_runtimes: Vec<f64>,
     /// Upstream proxy credentials (B8), for a paid/authenticated proxy. `None` for scraped
     /// candidates; set only via BYO/URL loading. Never serialized.
     auth: Option<Credentials>,
@@ -150,6 +156,7 @@ impl Proxy {
             requests: 0,
             errors: HashMap::new(),
             runtimes: Vec::new(),
+            probe_runtimes: Vec::new(),
             auth: None,
             caps: Caps::default(),
             trust: TrustReport::default(),
@@ -192,6 +199,7 @@ impl Proxy {
             requests,
             errors,
             runtimes,
+            probe_runtimes: Vec::new(),
             auth: None,
             caps: Caps::default(),
             trust: TrustReport::default(),
@@ -301,6 +309,22 @@ impl Proxy {
     /// The `q`-quantile of this proxy's successful round-trip times, seconds, 2 dp. `0.0` if none.
     pub fn percentile(&self, q: f64) -> f64 {
         percentile(&self.runtimes, q)
+    }
+
+    /// Record one judge-probe latency (F1), seconds — the RTT of a check-time validation against a
+    /// judge. Called by the checker only; the serve path never touches this, so [`Self::probe_latency`]
+    /// stays free of relayed-request contamination (unlike [`Self::avg_resp_time`], which blends both).
+    pub fn record_probe_latency(&mut self, secs: f64) {
+        self.probe_runtimes.push(secs);
+    }
+
+    /// Mean judge-probe latency (F1), seconds, rounded to 2 dp. `0.0` if this proxy never recorded a
+    /// probe. The check-time counterpart to [`Self::avg_resp_time`], isolated from serve traffic.
+    pub fn probe_latency(&self) -> f64 {
+        if self.probe_runtimes.is_empty() {
+            return 0.0;
+        }
+        round2(self.probe_runtimes.iter().sum::<f64>() / self.probe_runtimes.len() as f64)
     }
 
     /// Pool-ordering key `(error_rate, avg_resp_time)`, lower is better. `proxy.py:priority`.
@@ -529,6 +553,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             requests: 0,
             errors: HashMap::new(),
             runtimes: Vec::new(),
+            probe_runtimes: Vec::new(), // check-time probe latency (F1); re-measured on a fresh check
             auth: None, // secrets are never serialized, so never deserialized either
             caps: Caps::default(), // capabilities are not serialized; re-measured on a fresh check
             trust: TrustReport::default(), // trust is not serialized; re-assessed on a fresh check
@@ -805,6 +830,38 @@ mod tests {
         assert_eq!(x.requests(), 3);
         assert_eq!(x.error_rate(), round2(1.0 / 3.0)); // 0.33
         assert_eq!(x.avg_resp_time(), 1.0); // (0.5+1.5)/2
+    }
+
+    #[test]
+    fn probe_latency_isolated_from_serve_rtt() {
+        // F1: the judge-probe latency (recorded at CHECK time) is its own signal, distinct from
+        // the serve-blended avg_resp_time. A check records the probe RTT into BOTH the blended
+        // runtimes and the dedicated probe signal; later serve traffic touches only the runtimes.
+        let mut x = p();
+        x.record_probe_latency(0.10);
+        x.record_attempt(Some(0.10), None); // the same check attempt, blended in
+        x.record_attempt(Some(0.90), None); // a later serve-time relayed request
+        assert_eq!(
+            x.probe_latency(),
+            0.10,
+            "probe latency reflects only the check-time probe"
+        );
+        assert_eq!(
+            x.avg_resp_time(),
+            0.50,
+            "avg_resp_time blends probe + serve"
+        );
+
+        // A serve-only proxy (never checked here) must never inflate probe latency.
+        let mut y = p();
+        y.record_attempt(Some(0.90), None);
+        assert_eq!(
+            y.probe_latency(),
+            0.0,
+            "a serve-only attempt does not touch probe latency"
+        );
+        // No probe recorded at all → 0.0.
+        assert_eq!(p().probe_latency(), 0.0);
     }
 
     #[test]

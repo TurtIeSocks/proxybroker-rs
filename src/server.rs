@@ -408,7 +408,7 @@ impl Pool {
         let state = self.state.lock().unwrap();
         let total = state.len();
         let mut snap = PoolSnapshot::default();
-        let (mut err_sum, mut rt_sum) = (0.0_f64, 0.0_f64);
+        let (mut err_sum, mut rt_sum, mut probe_sum) = (0.0_f64, 0.0_f64, 0.0_f64);
         for p in state.iter() {
             let schemes = p.proxy.schemes();
             if schemes.contains(&Scheme::Http) {
@@ -419,11 +419,13 @@ impl Pool {
             }
             err_sum += p.proxy.error_rate();
             rt_sum += p.proxy.avg_resp_time();
+            probe_sum += p.proxy.probe_latency();
         }
         snap.total = total;
         if total > 0 {
             snap.avg_error_rate = err_sum / total as f64;
             snap.avg_resp_time = rt_sum / total as f64;
+            snap.probe_latency_avg = probe_sum / total as f64;
         }
         snap
     }
@@ -450,8 +452,12 @@ pub struct PoolSnapshot {
     pub total: usize,
     /// Mean of `Proxy::error_rate()` over the pool.
     pub avg_error_rate: f64,
-    /// Mean of `Proxy::avg_resp_time()` over the pool, seconds.
+    /// Mean of `Proxy::avg_resp_time()` over the pool, seconds. Blends check-time probe RTT and
+    /// serve-time relayed-request RTT (both feed `Proxy::record_attempt`).
     pub avg_resp_time: f64,
+    /// Mean of `Proxy::probe_latency()` over the pool, seconds (F1) — the check-time judge-probe
+    /// RTT only, kept distinct from the serve-blended `avg_resp_time`.
+    pub probe_latency_avg: f64,
 }
 
 /// Selection inputs for one `get`: the strategy plus the fields it needs — the resolved sticky
@@ -696,6 +702,9 @@ pub fn render_metrics(pool: &Pool) -> String {
          # HELP proxybroker_pool_resp_time_avg_seconds Mean proxy response time over the pool.\n\
          # TYPE proxybroker_pool_resp_time_avg_seconds gauge\n\
          proxybroker_pool_resp_time_avg_seconds {rt:.2}\n\
+         # HELP proxybroker_pool_probe_latency_avg_seconds Mean judge-probe latency (check-time) over the pool.\n\
+         # TYPE proxybroker_pool_probe_latency_avg_seconds gauge\n\
+         proxybroker_pool_probe_latency_avg_seconds {probe:.2}\n\
          # HELP proxybroker_evictions_total Proxies hard-evicted from the pool.\n\
          # TYPE proxybroker_evictions_total counter\n\
          proxybroker_evictions_total {evict}\n\
@@ -706,6 +715,7 @@ pub fn render_metrics(pool: &Pool) -> String {
         https = s.https,
         err = s.avg_error_rate,
         rt = s.avg_resp_time,
+        probe = s.probe_latency_avg,
         evict = pool.evictions(),
         rot = pool.rotations(),
     )
@@ -1760,6 +1770,35 @@ mod tests {
         assert!(
             pool.try_get(Scheme::Http, Some("FR")).is_none(),
             "no FR proxy to hand out"
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn render_metrics_emits_probe_latency_distinct_from_resp_time() {
+        // F1: a proxy whose check recorded a judge-probe latency, then served slower traffic.
+        // The check records the probe RTT into BOTH the blended runtimes and the probe signal;
+        // the later serve request blends only into avg_resp_time. So the two series diverge.
+        let mut p = Proxy::new("1.2.3.4".parse().unwrap(), 80, BTreeSet::new());
+        p.add_type(Proto::Http, None);
+        p.record_probe_latency(0.10); // check-time judge probe
+        p.record_attempt(Some(0.10), None); // same check attempt, blended in
+        p.record_attempt(Some(0.90), None); // later serve-time relayed request
+        let pool = Pool::from_proxies(vec![p], PoolConfig::default());
+        let out = render_metrics(&pool);
+
+        assert!(
+            out.contains("# TYPE proxybroker_pool_probe_latency_avg_seconds gauge"),
+            "missing probe-latency HELP/TYPE block:\n{out}"
+        );
+        // Probe latency = pure check-time 0.10; resp_time = blended (0.10 + 0.90)/2 = 0.50.
+        assert!(
+            out.contains("proxybroker_pool_probe_latency_avg_seconds 0.10"),
+            "probe latency should be the pure check-time value:\n{out}"
+        );
+        assert!(
+            out.contains("proxybroker_pool_resp_time_avg_seconds 0.50"),
+            "resp_time should be the serve-blended value:\n{out}"
         );
     }
 

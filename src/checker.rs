@@ -345,6 +345,10 @@ impl Checker {
                         "check outcome",
                     );
                     proxy.record_attempt(Some(rtt), None);
+                    // F1: the same RTT is the judge-probe latency. Record it into a dedicated
+                    // check-time signal so the probe-latency metric never blends with serve traffic
+                    // (which feeds only `record_attempt`).
+                    proxy.record_probe_latency(rtt);
                     proxy.add_type(proto, obs.level);
                     proxy.record_caps(obs.caps);
                     proxy.record_trust(obs.trust);
