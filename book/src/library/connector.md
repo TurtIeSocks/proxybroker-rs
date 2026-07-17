@@ -73,13 +73,16 @@ A plain forward-HTTP proxy (which needs absolute-form requests) is **not** the
 intended fit — prefer CONNECT/SOCKS proxies. An HTTPS-only proxy for a given
 connection is skipped and another is tried.
 
-### Deferred: TLS-to-target and `broker.rotating()` sugar
+### Deferred: TLS-to-target
 
 For an `https://` URL the connector returns the tunnel and the **caller layers
-its own end-to-end TLS**. Terminate-and-verify TLS to the target is a later
-feature with its own consumer, and a `Broker::rotating()` convenience
-constructor is deferred until a consumer wants it. See the
-[deferred backlog](../project/deferred-backlog.md).
+its own end-to-end TLS** (e.g. a `hyper-rustls` `HttpsConnector` wrapping the
+connector). Terminate-and-verify TLS to the target is a later feature with its
+own consumer. See the [deferred backlog](../project/deferred-backlog.md).
+
+The `Broker::rotating()` convenience constructor that was deferred here has now
+**shipped** — see [`Broker::rotating`](./broker.md) for the one-call
+find → pool → connector pipeline.
 
 ## Security note
 

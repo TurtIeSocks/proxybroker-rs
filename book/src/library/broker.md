@@ -198,8 +198,55 @@ let query = FindQuery::builder()
 # let _ = query;
 ```
 
+## `rotating` (feature `connector`)
+
+`Broker::rotating` is the one-call convenience for the whole
+discover → pool → rotate pipeline. It runs [`find`](#findquery), feeds the
+resulting stream into a background-warming [`Pool`](./pool.md), and wraps that
+pool in a ready [`RotatingProxyConnector`](./connector.md):
+
+```rust
+pub async fn rotating(
+    &self,
+    query: FindQuery,
+    cfg: RotateConfig,
+) -> Result<RotatingProxyConnector, Error>
+```
+
+The pool fills as `find` streams; the connector routes each connection through a
+healthy proxy (dead ones self-eject via the pool's health thresholds). It hands
+hyper a **raw tunnel** to the target and does not terminate TLS — for an
+`https://` target, layer TLS over the connector (e.g. a `hyper-rustls`
+`HttpsConnector`).
+
+```rust
+use proxybroker::{Broker, FindQuery, Proto, TypeSpec};
+use proxybroker::connector::RotateConfig;
+
+# async fn f() -> Result<(), Box<dyn std::error::Error>> {
+let broker = Broker::builder().build();
+let connector = broker
+    .rotating(
+        FindQuery {
+            types: vec![TypeSpec::any(Proto::Http)],
+            ..Default::default()
+        },
+        RotateConfig::default(),
+    )
+    .await?;
+// Hand `connector` to a hyper_util Client — see the connector page.
+# let _ = connector;
+# Ok(())
+# }
+```
+
+For a pre-seeded pool or a custom `PoolConfig`, compose the pieces yourself:
+`find` → [`Pool::spawn`](./pool.md) →
+[`RotatingProxyConnector::from_pool`](./connector.md).
+
 ## See also
 
 - [Proxy](./proxy.md) — the value type each `ProxyStream` yields.
 - [Pool](./pool.md) — feed a `ProxyStream` into a rotating proxy pool.
+- [Rotating connector](./connector.md) — what `rotating` returns; a drop-in hyper `Service`.
 - [feature flags](../architecture/feature-flags.md) — `geo`, `server`, and friends.
