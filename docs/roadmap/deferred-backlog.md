@@ -6,18 +6,24 @@ that would justify building it. Consolidated from the wave specs so they live in
 of scattered `⚠` notes.
 
 Status as of 2026-07-17: the committed roadmap (Waves 1–9, all A/B/C/D/E/F items + `store-redis` +
-F4 TUI) plus C8 (ASN) and P1 (provider expansion) are **shipped**. Nothing below blocks anything.
+F4 TUI) plus C8 (ASN) and P1 (provider expansion) are **shipped**. A backlog sweep then built four
+of the six deferrals and consciously kept two deferred (see below). Nothing below blocks anything.
 
-## Documented deferrals
+## Shipped from the backlog (2026-07-17 sweep)
 
-| Item | What's deferred | Source | Trigger to build |
-|---|---|---|---|
-| **A6 cert-pinning** | TLS certificate-fingerprint check in the honeypot/trust verdict. The core (canary + header scan) ships dependency-free; cert-pin would read the fingerprint off `negotiator::Stream`. Open question: gate behind a `trust-tls` feature (sha2/ring) vs. drop. | [wave-5](wave-5-checking-depth.md) | A user needs honeypot detection via TLS introspection. |
-| **E1 `broker.rotating()` sugar** | A `Broker::rotating(query) -> RotatingProxyConnector` convenience that spawns a pool via `find(query)` and wraps it. The connector itself ships; only the one-liner is deferred. | [wave-8](wave-8-distribution-and-ecosystem.md) | A consumer wants the wrapper instead of hand-assembling pool + connector. |
-| **E1 TLS-to-target** | The rotating connector returns the raw tunnel to `host:port`; for an `https://` URL the caller layers their own TLS. | [wave-8](wave-8-distribution-and-ecosystem.md) | A v2 connector that terminates TLS to the target host. |
-| **D3 memory-only re-check** | Adaptive re-check decay is gated on `persist` (it needs a durable `last_seen`). No in-memory-only score map exists for a DB-less adaptive mode. | [wave-7](wave-7-persistence-and-adaptive.md) | A user wants adaptive re-check without a `--state` backend. |
-| **F1 judge-probe latency metric** | Prometheus exposes the serve-time `avg_resp_time` (relayed-request RTT) as the latency signal; actual judge-probe latency is not plumbed into a separate metric. | [wave-6](wave-6-observability.md) | A consumer needs true probe latency reported distinctly from serve RTT. |
-| **D1 Docker registry auto-push** | The `Dockerfile` (FROM-scratch) + a `docker build` CI smoke test ship; the image is documented in the README but not auto-pushed to a registry. | [wave-8](wave-8-distribution-and-ecosystem.md) | A registry secret is wired and published images are wanted. |
+| Item | What shipped |
+|---|---|
+| **D1 Docker registry auto-push** | A `docker` job in `release.yml` pushes the FROM-scratch image to GHCR on a `v*` tag (built-in `GITHUB_TOKEN`, no secret). |
+| **F1 judge-probe latency metric** | `proxybroker_pool_probe_latency_avg_seconds` gauge — the check-time judge-probe RTT, recorded on a dedicated unserialized `Proxy` field, kept distinct from the serve-blended `avg_resp_time`. |
+| **D3 memory-only re-check** | `serve --recheck` works without `--state` via an in-memory `MemoryStore` (`Store` impl gated on `persist`, no backend); its EWMA fold mirrors `SqliteStore`. |
+| **E1 `broker.rotating()` sugar** | `Broker::rotating(query, cfg)` composes `find` → `Pool::spawn` → `RotatingProxyConnector::from_pool` in one call. |
+
+## Consciously kept deferred (reviewed, not built)
+
+| Item | Why it stays deferred |
+|---|---|
+| **A6 cert-pinning** | There is no known-good certificate to *pin against* for arbitrary scraped proxies, and the check path already accepts any cert by design. A real version would be a user-supplied expected fingerprint or a bare "expose the fingerprint" — both add `sha2` + a `trust-tls` feature for thin value. The wave-5 spec itself flagged "or defer entirely." **Trigger:** a user who pins specific known proxies and wants a fingerprint-mismatch `TrustSignal`. |
+| **E1 TLS-to-target** | Redundant with standard hyper composition: a caller wanting validated `https://` through the connector wraps it in a `hyper-rustls` `HttpsConnector` (which does proper cert-validated TLS-to-target). Building it *into* `RotatingProxyConnector` reimplements the ecosystem's blessed layering; the connector's raw-tunnel design is correct. **Trigger:** a genuine consumer that needs a self-contained https:// connector without composing hyper-rustls. |
 
 ## Softer ideas (planning-era, not formal roadmap deferrals)
 
