@@ -4,9 +4,11 @@
 # Users can override or extend this with --providers <dir> (YAML/JSON files with the same
 # ProviderSpec shape).
 #
-# This list contains only sources confirmed reachable and yielding proxies on 2026-07-15
-# (see docs/systematic-refactor/liveness.txt). proxybroker2's other ~25 entries were dead
-# (9 domains no longer resolve) and were not carried over.
+# The first block below is proxybroker2's surviving sources — those confirmed reachable and
+# yielding on 2026-07-15 (see docs/systematic-refactor/liveness.txt); its other ~25 entries were
+# dead (9 domains no longer resolve) and were not carried over. The 2026-07-17 liveness audit then
+# dropped two more that had since died (pubproxy.com, fineproxy.org). The second block is the P1
+# expansion (2026-07-17) to 50 curated sources — see docs/roadmap/p1-provider-research.md.
 #
 # NOTE: the proxyscrape SOCKS entries fix a live upstream bug. In proxybroker2
 # (providers.py:706/710) `proto=("SOCKS4")` has no trailing comma, so it is a string, not a
@@ -27,13 +29,109 @@
   protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
 - url: "https://freshfreeproxylist.wordpress.com/"
   protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
-- url: "http://fineproxy.org/eng/fresh-proxies/"
-  protocols: [HTTP, HTTPS, "CONNECT:80", "CONNECT:25"]
 - url: "https://socks-proxy.net/"
   protocols: [SOCKS4, SOCKS5]
 - url: "http://proxydb.net/"
   protocols: []
-- url: "http://pubproxy.com/api/proxy?limit=20&format=txt"
-  protocols: []
 - url: "https://www.marcosbl.com/lab/proxies/"
   protocols: []
+
+# --- P1 (2026-07-17): curated expansion 12 -> 50. See docs/roadmap/p1-provider-research.md.
+# Selection: sources confirmed LIVE and yielding on 2026-07-17, from repos with a fresh
+# commit + an automated refresh (hourly GitHub Action or a live txt API). Stale-but-serving
+# dumps, mirrors, and JS-obfuscated sites were rejected (yield alone hides dead-repo staleness).
+# Liveness is re-checked by the scheduled provider-audit workflow, not this file.
+# TheSpeedX/PROXY-List — hourly GitHub Action, high volume
+- url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"
+  protocols: [SOCKS5]
+# monosans/proxy-list — hourly, pre-validated (smaller, cleaner)
+- url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"
+  protocols: [SOCKS5]
+# proxifly/free-proxy-list — ~5-min refresh; scheme://ip:port lines
+- url: "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"
+  protocols: [SOCKS5]
+# zloi-user/hideip.me — hourly; ip:port:country lines
+- url: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt"
+  protocols: [HTTPS]
+- url: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt"
+  protocols: [SOCKS5]
+# ErcinDedeoglu/proxies — frequent; large dumps
+- url: "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+  protocols: [HTTPS]
+- url: "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt"
+  protocols: [SOCKS5]
+# vakhov/fresh-proxy-list — frequent
+- url: "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt"
+  protocols: [HTTP]
+- url: "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt"
+  protocols: [HTTPS]
+- url: "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt"
+  protocols: [SOCKS5]
+# roosterkid/openproxylist — hourly; *_RAW plain ip:port
+- url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
+  protocols: [HTTPS]
+- url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt"
+  protocols: [SOCKS4]
+- url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt"
+  protocols: [SOCKS5]
+# hookzof/socks5_list — hourly SOCKS5
+- url: "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"
+  protocols: [SOCKS5]
+# proxyscrape v4 free-proxy-list API (txt)
+- url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=http"
+  protocols: [HTTP]
+- url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=https"
+  protocols: [HTTPS]
+- url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=socks4"
+  protocols: [SOCKS4]
+- url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=socks5"
+  protocols: [SOCKS5]
+# proxyspace.pro — high-yield txt API
+- url: "https://proxyspace.pro/http.txt"
+  protocols: [HTTP]
+- url: "https://proxyspace.pro/https.txt"
+  protocols: [HTTPS]
+- url: "https://proxyspace.pro/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://proxyspace.pro/socks5.txt"
+  protocols: [SOCKS5]
+# openproxylist.xyz — high-yield txt API
+- url: "https://api.openproxylist.xyz/http.txt"
+  protocols: [HTTP]
+- url: "https://api.openproxylist.xyz/https.txt"
+  protocols: [HTTPS]
+- url: "https://api.openproxylist.xyz/socks4.txt"
+  protocols: [SOCKS4]
+- url: "https://api.openproxylist.xyz/socks5.txt"
+  protocols: [SOCKS5]
+# sunny9577/proxy-scraper — distinct scraper, generated hourly
+- url: "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt"
+  protocols: [HTTP]
+# dpangestuw/Free-Proxy — fresh scraper (HTTP)
+- url: "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt"
+  protocols: [HTTP]
+# Zaeem20/FREE_PROXIES_LIST — fresh (SOCKS5)
+- url: "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt"
+  protocols: [SOCKS5]

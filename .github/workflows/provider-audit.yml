@@ -1,0 +1,33 @@
+name: Provider audit
+
+# P1 liveness audit: fetch every bundled provider and flag any that yield zero proxies (dead or
+# format-changed). Scheduled + manual ONLY — deliberately NOT run on pull_request/push, so a source
+# rotting upstream never blocks a merge. It is a maintenance signal: a red run means "curate
+# data/providers.yaml", not "this PR is broken". The offline suite (provider_registry.rs) guards
+# the registry's shape; this guards its liveness.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: bundled provider liveness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The audit test is #[ignore]d, so it runs only with --ignored. --nocapture prints the
+      # per-source yield table; the test fails (listing the dead URLs) if any source yields zero.
+      - name: Audit bundled providers
+        run: cargo test --test provider_audit --locked -- --ignored --nocapture
