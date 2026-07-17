@@ -720,10 +720,11 @@ impl BrokerBuilder {
     }
 
     pub fn build(self) -> Broker {
-        // Auto-attach the bundled geo database when built with `geo-bundled` (the default) and
-        // the caller neither supplied one nor opted out. Without this, country filtering
-        // silently rejects everything — a footgun for library users, since a proxy with no
-        // known location can never match a requested country.
+        crate::install_default_crypto_provider(); // before building the default reqwest client
+                                                  // Auto-attach the bundled geo database when built with `geo-bundled` (the default) and
+                                                  // the caller neither supplied one nor opted out. Without this, country filtering
+                                                  // silently rejects everything — a footgun for library users, since a proxy with no
+                                                  // known location can never match a requested country.
         #[cfg(feature = "geo")]
         let geo = match (self.geo, self.no_geo) {
             (Some(db), _) => Some(db),

@@ -27,6 +27,24 @@
 //! # Ok(()) }
 //! ```
 
+/// Install the `ring` crypto provider as rustls' process default, exactly once (idempotent).
+///
+/// This crate builds reqwest with `rustls-no-provider` so aws-lc-rs — whose `-sys` C/asm crate is
+/// the musl cross-compile blocker — stays out of the dependency graph. The trade-off: reqwest bakes
+/// in no crypto provider, and `reqwest::Client::new()` **panics** unless one is installed first.
+///
+/// [`Broker::build`](broker::BrokerBuilder::build) and [`Resolver::new`](resolver::Resolver::new)
+/// call this before constructing their own clients, so the normal paths need nothing. **Call it
+/// yourself before building your own `reqwest::Client`** to pass to
+/// [`BrokerBuilder::client`](broker::BrokerBuilder::client).
+pub fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub mod broker;
 pub mod checker;
 #[cfg(feature = "connector")]

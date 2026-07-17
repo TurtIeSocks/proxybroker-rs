@@ -64,3 +64,37 @@ jobs:
       # server-only fn can slip through both. Build-only: this config has no bin integration tests.
       - name: Build (cli, no server)
         run: cargo build --bin proxybroker --no-default-features --features cli --locked
+
+  # Distribution smoke (D1): the static musl binary, the FROM-scratch Docker image, and the
+  # installer script. Separate job so it runs in parallel and doesn't slow the test matrix. The
+  # graph is ring-only (no aws-lc-rs), so musl needs only musl-tools.
+  dist:
+    name: musl + docker + installer smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Install musl + shellcheck
+        run: sudo apt-get update && sudo apt-get install -y musl-tools shellcheck
+
+      # The static, libc-free binary the installer and Docker image ship. Prove it builds, runs
+      # with zero runtime data files (all embedded), and carries the CC BY 4.0 attribution.
+      - name: Build + run the static musl binary
+        run: |
+          cargo build --locked --target x86_64-unknown-linux-musl
+          ./target/x86_64-unknown-linux-musl/debug/proxybroker --version | grep -q "IP Geolocation by DB-IP"
+
+      # The FROM-scratch image: proves it is self-contained (no libc, no data files) offline.
+      - name: Docker scratch image smoke
+        run: |
+          docker build -t pb-scratch .
+          docker run --rm pb-scratch --version | grep -q "IP Geolocation by DB-IP"
+
+      - name: Shellcheck the installer
+        run: shellcheck install.sh

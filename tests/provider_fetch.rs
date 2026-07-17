@@ -43,6 +43,7 @@ async fn fetch_extracts_proxies_from_a_live_response() {
     let mut spec = ProviderSpec::new(&url, &[Proto::Http]);
     spec.timeout = 5;
 
+    proxybroker::install_default_crypto_provider(); // reqwest (rustls-no-provider) needs this first
     let client = reqwest::Client::new();
     let got = fetch(&spec, &client).await;
 
@@ -63,6 +64,7 @@ async fn fetch_failure_yields_no_proxies_not_an_error() {
         s.timeout = 2;
         s
     };
+    proxybroker::install_default_crypto_provider();
     let got = fetch(&spec, &reqwest::Client::new()).await;
     assert!(got.is_empty());
 }

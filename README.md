@@ -18,7 +18,20 @@ statement of changes.
 ```sh
 cargo add proxybroker          # library
 cargo install proxybroker      # CLI
+
+# prebuilt binary (Linux musl / macOS), no toolchain — verifies a checksum, installs to ~/.local/bin:
+curl -fsSL https://raw.githubusercontent.com/TurtIeSocks/proxybroker-rs/main/install.sh | sh
 ```
+
+Docker — a `FROM scratch` image (just the static binary; all geo/provider data is embedded):
+
+```sh
+docker build -t proxybroker .
+docker run --rm proxybroker find --types HTTP --limit 5
+```
+
+The binary is a fully static `x86_64`/`aarch64` musl build (TLS is ring-only rustls — no
+aws-lc-rs), so it has no runtime libc or data-file dependencies.
 
 All three commands — `grab`, `find`, `serve` — work end-to-end. See
 `docs/systematic-refactor/` for the port's design record.
