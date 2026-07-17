@@ -8,11 +8,14 @@ use http_body_util::{BodyExt, Empty};
 use hyper::Uri;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use proxybroker::broker::{Broker, FindQuery};
+use proxybroker::checker::RetryPolicy;
 use proxybroker::connector::{RotateConfig, RotatingProxyConnector};
+use proxybroker::provider::ProviderSpec;
 use proxybroker::proxy::Proxy;
 use proxybroker::resolver::Resolver;
 use proxybroker::server::{Pool, PoolConfig};
-use proxybroker::types::Proto;
+use proxybroker::types::{Proto, TypeSpec};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -148,4 +151,70 @@ async fn empty_pool_is_an_error_not_a_hang() {
         .await
         .expect_err("no proxy → error, not a hang");
     let _ = err; // hyper-util wraps it; the point is it resolves to an Err rather than blocking
+}
+
+/// A server that returns a fixed HTTP 200 body to every request (used as an external-IP stub and
+/// as an empty provider page). Distinct from `mock_upstream` — it does not count hits.
+async fn serve_fixed(body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (addr, h)
+}
+
+/// E1 sugar: `Broker::rotating(query, cfg)` composes `find` -> `Pool::spawn` -> `from_pool` in one
+/// call. Driven end to end offline: a stubbed external-IP endpoint lets `find` build its checker,
+/// an empty provider yields no proxies, and the produced connector is live — it reports the empty
+/// pool (not a hang), proving the whole pipeline wired. Routing behaviour is covered by the
+/// `from_pool` tests above.
+#[tokio::test]
+async fn broker_rotating_composes_find_into_a_live_connector() {
+    let (ext_ip, _e) = serve_fixed("203.0.113.9").await; // external-IP discovery stub
+    let (prov, _p) = serve_fixed("").await; // provider page listing zero proxies
+    let resolver = Resolver::new(Duration::from_secs(3))
+        .unwrap()
+        .with_ip_endpoints(vec![format!("http://{ext_ip}/")]);
+    let broker = Broker::builder()
+        .providers(vec![ProviderSpec::new(
+            &format!("http://{prov}/"),
+            &[Proto::Http],
+        )])
+        .resolver(resolver)
+        .build();
+    let query = FindQuery {
+        types: vec![TypeSpec::any(Proto::Http)],
+        timeout: Duration::from_secs(3),
+        max_conn: 4,
+        retry: RetryPolicy::tries(1),
+        ..Default::default()
+    };
+
+    let connector = broker
+        .rotating(query, RotateConfig::default())
+        .await
+        .expect("rotating() composes find -> pool -> connector");
+
+    // No proxies discovered → the connector is live and reports the empty pool rather than hanging.
+    let err = client(connector)
+        .get(Uri::from_static("http://1.2.3.4/"))
+        .await
+        .expect_err("empty pool should error, not hang");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("proxy"),
+        "expected a no-proxy error, got: {err:?}"
+    );
 }

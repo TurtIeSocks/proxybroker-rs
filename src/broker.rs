@@ -435,6 +435,40 @@ impl Broker {
         })
     }
 
+    /// Convenience (E1): discover proxies with [`find`](Self::find), feed them into a
+    /// background-warming [`Pool`](crate::server::Pool), and wrap it in a ready
+    /// [`RotatingProxyConnector`](crate::connector::RotatingProxyConnector) — the whole
+    /// discover → pool → rotate pipeline in one call. The pool fills as `find` streams; the
+    /// connector routes each connection through a healthy proxy (dead ones self-eject via the
+    /// pool's health thresholds).
+    ///
+    /// For a pre-seeded pool or a custom [`PoolConfig`](crate::server::PoolConfig), compose the
+    /// pieces yourself: `find` → [`Pool::spawn`](crate::server::Pool::spawn) →
+    /// [`RotatingProxyConnector::from_pool`](crate::connector::RotatingProxyConnector::from_pool).
+    ///
+    /// The connector hands hyper a **raw tunnel** to the target and does not terminate TLS to it;
+    /// for an `https://` target, layer TLS over the connector (e.g. a `hyper-rustls`
+    /// `HttpsConnector`).
+    #[cfg(feature = "connector")]
+    pub async fn rotating(
+        &self,
+        query: FindQuery,
+        cfg: crate::connector::RotateConfig,
+    ) -> Result<crate::connector::RotatingProxyConnector, Error> {
+        // A resolver for the connector's target-host lookups. Reuse the broker's if one was set;
+        // otherwise a fresh one (find builds its own internally, so an unset broker briefly holds
+        // two — both cheap, and DNS is DNS).
+        let resolver = match &self.resolver {
+            Some(r) => r.clone(),
+            None => Arc::new(Resolver::new(query.timeout)?),
+        };
+        let stream = self.find(query).await?;
+        let pool = crate::server::Pool::spawn(stream, crate::server::PoolConfig::default());
+        Ok(crate::connector::RotatingProxyConnector::from_pool(
+            pool, resolver, cfg,
+        ))
+    }
+
     /// The resolver + external-IP discovery + [`Checker`] setup shared by `find` and `check`.
     /// Proxy candidates are already IP literals, so the resolver is only for external-IP
     /// discovery and judge-host resolution.
