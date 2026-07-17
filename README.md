@@ -23,7 +23,14 @@ cargo install proxybroker      # CLI
 curl -fsSL https://raw.githubusercontent.com/TurtIeSocks/proxybroker-rs/main/install.sh | sh
 ```
 
-Docker — a `FROM scratch` image (just the static binary; all geo/provider data is embedded):
+Docker — a `FROM scratch` image (just the static binary; all geo/provider data is embedded).
+Pull the published image from the GitHub Container Registry (tagged per release, plus `latest`):
+
+```sh
+docker run --rm ghcr.io/turtiesocks/proxybroker-rs:latest find --types HTTP --limit 5
+```
+
+Or build it yourself from the repo:
 
 ```sh
 docker build -t proxybroker .

@@ -193,3 +193,56 @@ jobs:
           include: LICENSE,LICENSE-DATA,NOTICE,README.md
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the FROM-scratch image to the GitHub Container Registry. Same image the `dist` job in
+  # ci.yml smoke-tests (repo-root Dockerfile, single build context) — here it is tagged with the
+  # release version and `latest`, then pushed. `if: github.event_name == 'push'` restricts this to
+  # a real `v*` tag push, mirroring the crates.io `publish` job: a manual workflow_dispatch (which
+  # back-fills binaries for an OLD tag) must NOT move the moving `latest` pointer backwards, and a
+  # registry image — like an immutable crate version — should ship only from a genuine tag event.
+  # PRs and branch pushes never trigger this workflow at all (see `on:`), so the push is gated to
+  # release events by construction. Auth is the built-in GITHUB_TOKEN — no external secret.
+  docker:
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Compute the image reference + tags WITHOUT interpolating the ref into a shell. The image
+      # path is lowercased automatically (GHCR requires it; `github.repository` may carry capitals).
+      # The validated tag from `verify` (already regex-checked to vMAJOR.MINOR.PATCH) drives a semver
+      # pattern that emits the bare version (v0.1.2 -> 0.1.2); `latest` is added unconditionally.
+      # metadata-action also emits an org.opencontainers.image.source label linking the package to
+      # this repo — required or the first push to a new package 403s even with packages: write.
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.verify.outputs.tag }}
+            type=raw,value=latest
+
+      # Reuses the repo-root Dockerfile + context (linux/amd64, matching the ci.yml smoke test). No
+      # QEMU multi-arch: the Dockerfile compiles the crate from source, so emulated aarch64 builds
+      # would be prohibitively slow — the aarch64 story is the musl binary shipped by `binaries`.
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
