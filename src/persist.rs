@@ -14,6 +14,15 @@
 use crate::error::Error;
 use crate::proxy::Proxy;
 
+/// The canonical EWMA fold (`alpha·sample + (1-alpha)·prev`). SqliteStore's SQL and RedisStore's Lua
+/// both replicate this with the literal alpha = 0.3; this is the single Rust definition tests measure
+/// against. `#[cfg(test)]`: neither backend calls this at runtime (the fold happens in SQL/Lua so the
+/// upsert stays one atomic round-trip) — it exists solely as the oracle `fold_ewma_arithmetic` pins.
+#[cfg(test)]
+pub(crate) fn fold_ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
+    alpha * sample + (1.0 - alpha) * prev
+}
+
 /// The persistence contract (D2): remember proxies across runs. Implemented by the bundled
 /// [`SqliteStore`] (`store-sqlite`); a Redis backend is planned for Wave 9. Library users can impl
 /// this for any store and wire it via `Broker::with_observer` + [`Store::load`].
@@ -224,3 +233,14 @@ mod sqlite {
 
 #[cfg(feature = "store-sqlite")]
 pub use sqlite::{SqliteStore, SCHEMA_VERSION};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fold_ewma_arithmetic() {
+        assert!((super::fold_ewma(0.0, 1.0, 0.3) - 0.3).abs() < 1e-12);
+        assert!((super::fold_ewma(1.0, 0.0, 0.3) - 0.7).abs() < 1e-12);
+        let e = super::fold_ewma(super::fold_ewma(0.0, 1.0, 0.3), 1.0, 0.3); // 0.51
+        assert!((e - 0.51).abs() < 1e-12);
+    }
+}
