@@ -234,6 +234,84 @@ mod sqlite {
 #[cfg(feature = "store-sqlite")]
 pub use sqlite::{SqliteStore, SCHEMA_VERSION};
 
+#[cfg(feature = "store-redis")]
+mod redis {
+    //! The bundled Redis [`Store`](super::Store) backend (Wave 9). One blocking
+    //! `redis::Connection` behind a `Mutex`, mirroring [`sqlite::SqliteStore`](super::sqlite)'s
+    //! connection handling — `redis::Connection` is `Send` but not `Sync`. The atomic upsert fold
+    //! that `SqliteStore` does with SQL `ON CONFLICT` is a Lua `EVAL` here: Redis runs a script
+    //! single-threaded, so [`UPSERT_LUA`] is race-free without a WATCH/MULTI transaction.
+
+    use std::net::IpAddr;
+
+    /// Per-proxy Redis key: a hash of the durable fields (`host`, `port`, `types`, `requests`,
+    /// `errors`, `ewma_success`, `avg_latency`, `first_seen`, `last_seen`, `uptime_checks`).
+    fn proxy_key(host: &IpAddr, port: u16) -> String {
+        format!("proxybroker:proxy:{host}:{port}")
+    }
+
+    /// The set of every known `"host:port"` member — how `load` enumerates proxies without a
+    /// Redis `SCAN` (which would need a cursor loop, and could double/miss keys under concurrent
+    /// writes to a live set).
+    const SET_KEY: &str = "proxybroker:proxies";
+
+    /// Schema marker key, checked/set on `RedisStore::open` — a lighter analogue of SQLite's
+    /// `PRAGMA user_version`.
+    const SCHEMA_KEY: &str = "proxybroker:schema";
+
+    /// Current schema version string, written to [`SCHEMA_KEY`].
+    const SCHEMA_VERSION: &str = "1";
+
+    /// The atomic upsert: fold one check's outcome into the proxy hash and register it in
+    /// [`SET_KEY`]. Reproduces `SqliteStore::upsert`'s `ON CONFLICT` arithmetic byte-for-byte
+    /// (alpha = 0.3), including the confirmed-types guard — a failing re-check's empty `"[]"`
+    /// types must not erase previously confirmed types, or a transient failure makes a proxy
+    /// unselectable on warm start. Redis runs Lua scripts single-threaded, so this whole fold is
+    /// one atomic round-trip — no WATCH/MULTI needed even with two `RedisStore`s on a shared
+    /// fleet upserting concurrently.
+    ///
+    /// `KEYS[1]` = proxy hash key, `KEYS[2]` = the proxies set key.
+    /// `ARGV`: 1=host, 2=port, 3=types_json, 4=sample, 5=working, 6=latency, 7=now, 8=requests,
+    /// 9=errors.
+    const UPSERT_LUA: &str = r#"
+local h = redis.call('HGETALL', KEYS[1])
+local cur = {}
+for i=1,#h,2 do cur[h[i]] = h[i+1] end
+local function num(x) return tonumber(x) or 0 end
+local first = (next(cur) == nil)
+local sample, working, latency = tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6])
+local ewma   = first and sample or (0.3*sample + 0.7*num(cur.ewma_success))
+local avglat = first and latency or ((latency > 0) and (0.3*latency + 0.7*num(cur.avg_latency)) or num(cur.avg_latency))
+local types  = (ARGV[3] ~= '[]') and ARGV[3] or (cur.types or ARGV[3])
+redis.call('HSET', KEYS[1],
+  'host', ARGV[1], 'port', ARGV[2], 'types', types,
+  'requests', num(cur.requests) + tonumber(ARGV[8]),
+  'errors',   num(cur.errors)   + tonumber(ARGV[9]),
+  'ewma_success', ewma, 'avg_latency', avglat,
+  'first_seen', first and ARGV[7] or (cur.first_seen or ARGV[7]),
+  'last_seen', ARGV[7],
+  'uptime_checks', num(cur.uptime_checks) + working)
+redis.call('SADD', KEYS[2], ARGV[1] .. ':' .. ARGV[2])
+return 1
+"#;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Pure — no server. Pins the key format and that the Lua literally carries the alpha =
+        /// 0.3 fold (a typo turning `0.3`/`0.7` into e.g. `0.5`/`0.5` would silently change the
+        /// smoothing without any other test catching it).
+        #[test]
+        fn redis_key_layout() {
+            let host: IpAddr = "1.2.3.4".parse().unwrap();
+            assert_eq!(proxy_key(&host, 8080), "proxybroker:proxy:1.2.3.4:8080");
+            assert!(UPSERT_LUA.contains("0.3"));
+            assert!(UPSERT_LUA.contains("0.7"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
