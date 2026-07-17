@@ -1,5 +1,5 @@
 /target
 **/*.rs.bk
 *.pdb
-.DS_STORE.superpowers/
 .DS_Store
+.superpowers/
