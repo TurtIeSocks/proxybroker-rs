@@ -81,6 +81,8 @@ pub use error::{Error, ProxyError};
 pub use geo::GeoDb;
 pub use negotiator::{Stream, Target};
 pub use parse::parse_proxy_lines;
+#[cfg(feature = "store-redis")]
+pub use persist::RedisStore;
 #[cfg(feature = "persist")]
 pub use persist::Store;
 #[cfg(feature = "store-sqlite")]

@@ -242,7 +242,14 @@ mod redis {
     //! that `SqliteStore` does with SQL `ON CONFLICT` is a Lua `EVAL` here: Redis runs a script
     //! single-threaded, so [`UPSERT_LUA`] is race-free without a WATCH/MULTI transaction.
 
+    use super::Store;
+    use crate::error::Error;
+    use crate::proxy::Proxy;
+    use crate::types::{AnonLevel, Proto};
+    use ::redis::Commands;
+    use std::collections::BTreeMap;
     use std::net::IpAddr;
+    use std::sync::Mutex;
 
     /// Per-proxy Redis key: a hash of the durable fields (`host`, `port`, `types`, `requests`,
     /// `errors`, `ewma_success`, `avg_latency`, `first_seen`, `last_seen`, `uptime_checks`).
@@ -295,6 +302,166 @@ redis.call('SADD', KEYS[2], ARGV[1] .. ':' .. ARGV[2])
 return 1
 "#;
 
+    /// The bundled Redis [`Store`] backend: one blocking connection behind a `Mutex` (mirrors
+    /// [`sqlite::SqliteStore`](super::sqlite::SqliteStore) — `redis::Connection` is `Send` but not
+    /// `Sync`, so the mutex is what makes `Arc<RedisStore>` shareable). The key layout already
+    /// namespaces everything under `proxybroker:*`, so there is no separate prefix field.
+    pub struct RedisStore {
+        conn: Mutex<::redis::Connection>,
+    }
+
+    impl RedisStore {
+        /// Open a connection to `url` (`redis://host:port/db`), checking/setting the schema
+        /// marker key ([`SCHEMA_KEY`]) — Redis has no `PRAGMA user_version`, so a plain string key
+        /// stands in for SQLite's migration guard. A present-but-different value is a hard error:
+        /// there is only one schema version so far, but this keeps a future bump from silently
+        /// misreading old-shape hashes.
+        pub fn open(url: &str) -> Result<RedisStore, Error> {
+            let client = ::redis::Client::open(url).map_err(db)?;
+            let mut conn = client.get_connection().map_err(db)?;
+            let existing: Option<String> = conn.get(SCHEMA_KEY).map_err(db)?;
+            if let Some(v) = &existing {
+                if v != SCHEMA_VERSION {
+                    return Err(Error::Persist(format!(
+                        "redis store schema mismatch: found {v:?}, expected {SCHEMA_VERSION:?} \
+                         — wipe the proxybroker:* keys or point --state at a fresh database"
+                    )));
+                }
+            }
+            let _: () = conn.set(SCHEMA_KEY, SCHEMA_VERSION).map_err(db)?;
+            Ok(RedisStore {
+                conn: Mutex::new(conn),
+            })
+        }
+    }
+
+    impl Store for RedisStore {
+        fn upsert(&self, proxy: &Proxy) -> Result<(), Error> {
+            let now = unix_now();
+            let types_json = types_to_json(proxy.types());
+            let sample = f64::from(u8::from(proxy.is_working())); // 1.0 working, 0.0 not
+            let working = i64::from(proxy.is_working());
+            let errors_total: u32 = proxy.errors().values().sum();
+            let key = proxy_key(&proxy.host, proxy.port);
+
+            let script = ::redis::Script::new(UPSERT_LUA);
+            let mut conn = self.conn.lock().unwrap();
+            // One atomic round-trip: Redis runs the whole fold single-threaded, so this is race-
+            // free against a second `RedisStore` (possibly another process) upserting concurrently.
+            let _: i64 = script
+                .key(key)
+                .key(SET_KEY)
+                .arg(proxy.host.to_string())
+                .arg(proxy.port)
+                .arg(types_json)
+                .arg(sample)
+                .arg(working)
+                .arg(proxy.avg_resp_time())
+                .arg(now)
+                .arg(proxy.requests())
+                .arg(errors_total)
+                .invoke(&mut *conn)
+                .map_err(db)?;
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Vec<Proxy>, Error> {
+            let mut conn = self.conn.lock().unwrap();
+            let members: Vec<String> = conn.smembers(SET_KEY).map_err(db)?;
+            let mut out = Vec::new();
+            for member in members {
+                // Members are `host:port`; `rsplit_once` takes the LAST colon, which is always the
+                // port separator even for a bare (unbracketed) IPv6 host.
+                let Some((host_s, port_s)) = member.rsplit_once(':') else {
+                    tracing::warn!(
+                        "redis store: malformed proxies-set member {member:?}, skipping"
+                    );
+                    continue;
+                };
+                let Ok(host) = host_s.parse::<IpAddr>() else {
+                    tracing::warn!("redis store: unparseable host {host_s:?}, skipping");
+                    continue;
+                };
+                let Ok(port) = port_s.parse::<u16>() else {
+                    tracing::warn!("redis store: unparseable port {port_s:?}, skipping");
+                    continue;
+                };
+                let hash: std::collections::HashMap<String, String> =
+                    conn.hgetall(proxy_key(&host, port)).map_err(db)?;
+                if hash.is_empty() {
+                    // The set member survived a crash/partial write with no matching hash.
+                    tracing::warn!("redis store: missing hash for {host}:{port}, skipping");
+                    continue;
+                }
+                let requests = hash
+                    .get("requests")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let errors = hash.get("errors").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let avg_latency = hash
+                    .get("avg_latency")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let types_json = hash.get("types").map(String::as_str).unwrap_or("[]");
+                out.push(Proxy::restored(
+                    host,
+                    port,
+                    types_from_json(types_json),
+                    requests,
+                    errors,
+                    avg_latency,
+                ));
+            }
+            Ok(out)
+        }
+    }
+
+    fn db(e: ::redis::RedisError) -> Error {
+        Error::Persist(e.to_string())
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Serialize confirmed types the shape the `Proxy` JSON uses: `[{"type":"HTTP","level":"High"}]`.
+    /// Replicated from `sqlite::types_to_json` byte-for-byte (kept private to each backend module
+    /// rather than extracted, so neither backend's internals move — see the task brief).
+    fn types_to_json(types: &BTreeMap<Proto, Option<AnonLevel>>) -> String {
+        let arr: Vec<_> = types
+            .iter()
+            .map(|(p, l)| {
+                serde_json::json!({ "type": p.as_str(), "level": l.map(|x| x.as_str()).unwrap_or("") })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Replicated from `sqlite::types_from_json` byte-for-byte.
+    fn types_from_json(s: &str) -> BTreeMap<Proto, Option<AnonLevel>> {
+        let mut map = BTreeMap::new();
+        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(s) else {
+            return map;
+        };
+        for v in arr {
+            let Some(t) = v["type"].as_str() else {
+                continue;
+            };
+            let Ok(proto) = t.parse::<Proto>() else {
+                continue;
+            };
+            let level = v["level"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<AnonLevel>().ok());
+            map.insert(proto, level);
+        }
+        map
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -311,6 +478,9 @@ return 1
         }
     }
 }
+
+#[cfg(feature = "store-redis")]
+pub use redis::RedisStore;
 
 #[cfg(test)]
 mod tests {
