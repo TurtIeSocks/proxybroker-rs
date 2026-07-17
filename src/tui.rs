@@ -16,6 +16,9 @@ use std::net::IpAddr;
 
 /// One row of the dashboard's proxy table — a display-ready projection of a [`Proxy`].
 pub struct Row {
+    /// `(host, port)` — the [`DashboardState::history`] key for this row's sparkline (carried so
+    /// `render` looks the ring up directly instead of re-parsing the display `addr`).
+    pub key: (IpAddr, u16),
     pub addr: String,
     pub protos: String,
     pub error_rate: f64,
@@ -68,6 +71,7 @@ impl DashboardState {
         self.rows = proxies
             .iter()
             .map(|p| Row {
+                key: (p.host, p.port),
                 addr: p.addr(),
                 protos: p
                     .types()
@@ -146,19 +150,6 @@ impl DashboardState {
     }
 }
 
-/// Recover the `(host, port)` history key from a rendered [`Row::addr`] (`Proxy::addr()`'s
-/// `host:port`, IPv6 bracketed as `[host]:port`). Used only to look up the selected row's
-/// sparkline ring — [`Row`] itself carries the display string, not the parsed address.
-fn parse_addr(addr: &str) -> Option<(IpAddr, u16)> {
-    if let Some(rest) = addr.strip_prefix('[') {
-        let (host, port) = rest.split_once("]:")?;
-        Some((host.parse().ok()?, port.parse().ok()?))
-    } else {
-        let (host, port) = addr.rsplit_once(':')?;
-        Some((host.parse().ok()?, port.parse().ok()?))
-    }
-}
-
 /// Draw one frame: a one-line pool summary, a `Table` of [`DashboardState::rows`] (sorted per
 /// [`DashboardState::sort`]), and a `Sparkline` of the selected row's response-time history. Pure
 /// — no I/O, safe to call against a [`ratatui::backend::TestBackend`].
@@ -205,8 +196,7 @@ pub fn render(frame: &mut ratatui::Frame, state: &DashboardState) {
     let selected_ring = state
         .rows
         .get(state.selected)
-        .and_then(|r| parse_addr(&r.addr))
-        .and_then(|key| state.history.get(&key));
+        .and_then(|r| state.history.get(&r.key));
     let spark_data: Vec<u64> = selected_ring
         .map(|ring| {
             ring.iter()
@@ -218,6 +208,76 @@ pub fn render(frame: &mut ratatui::Frame, state: &DashboardState) {
         .block(Block::bordered().title("Selected resp time (ms)"))
         .data(spark_data);
     frame.render_widget(sparkline, spark_area);
+}
+
+/// A terminal-mode guard: enters raw mode + the alternate screen on construction and restores both
+/// on `Drop`, so any exit path — return, quit, `?`, or panic — leaves the terminal usable.
+struct TermGuard;
+
+impl TermGuard {
+    fn enter() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        Ok(TermGuard)
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    }
+}
+
+/// Restore the terminal on a panic before the default hook prints the backtrace — otherwise a panic
+/// inside the raw-mode loop wedges the user's terminal.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        default(info);
+    }));
+}
+
+/// Run the live dashboard against `pool`: redraw every `refresh` and on each keypress, until the
+/// user quits (`q`/Esc) or the event stream ends. The [`TermGuard`] restores the terminal on exit.
+pub async fn run_top(
+    pool: std::sync::Arc<crate::server::Pool>,
+    refresh: std::time::Duration,
+) -> std::io::Result<()> {
+    use futures_util::StreamExt;
+    install_panic_hook();
+    let _guard = TermGuard::enter()?;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+
+    let mut state = DashboardState::default();
+    state.apply(&pool.proxies(), pool.snapshot());
+
+    let mut ticker = tokio::time::interval(refresh);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut events = crossterm::event::EventStream::new();
+
+    loop {
+        term.draw(|f| render(f, &state))?;
+        tokio::select! {
+            _ = ticker.tick() => state.apply(&pool.proxies(), pool.snapshot()),
+            ev = events.next() => match ev {
+                // Filter to Press so terminals that also emit Repeat/Release don't double-handle.
+                Some(Ok(crossterm::event::Event::Key(k)))
+                    if k.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    if !state.on_key(k.code) {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => break,
+                _ => {}
+            },
+        }
+    }
+    Ok(()) // _guard's Drop restores the terminal
 }
 
 #[cfg(test)]

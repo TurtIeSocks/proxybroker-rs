@@ -79,6 +79,9 @@ enum Command {
     /// Serve the live pool over MCP (stdio): get_proxy, pool_status, report_dead.
     #[cfg(feature = "mcp")]
     Mcp(McpArgs),
+    /// Live terminal dashboard: a sortable pool table + latency sparklines (F4).
+    #[cfg(feature = "tui")]
+    Top(TopArgs),
 }
 
 /// CLI mirror of [`proxybroker::server::Strategy`] (keeps clap's `ValueEnum` out of the library).
@@ -741,6 +744,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(args) => serve_cmd(broker, args).await,
         #[cfg(feature = "mcp")]
         Command::Mcp(args) => mcp_cmd(broker, args).await,
+        #[cfg(feature = "tui")]
+        Command::Top(args) => top_cmd(broker, args).await,
     }
 }
 
@@ -932,6 +937,62 @@ async fn mcp_cmd(broker: Broker, args: McpArgs) -> Result<(), Box<dyn std::error
         args.limit
     );
     proxybroker::mcp::serve_stdio(pool).await
+}
+
+/// Pool-fill args for `proxybroker top` (F4) — the `mcp` subset plus a redraw interval + warm-start.
+#[cfg(feature = "tui")]
+#[derive(clap::Args)]
+struct TopArgs {
+    /// Protocols to find for the pool. E.g. --types HTTP HTTPS.
+    #[arg(long, num_args = 1.., required = true, value_name = "TYPE", value_parser = parse_proto)]
+    types: Vec<Proto>,
+
+    /// Stop filling the pool after this many working proxies.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+
+    /// Keep only proxies located in these ISO country codes (e.g. US GB DE).
+    #[arg(long, visible_alias = "only-cc", num_args = 1.., value_delimiter = ',', value_name = "CC")]
+    countries: Vec<String>,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 8)]
+    timeout: u64,
+
+    /// Dashboard redraw interval in seconds.
+    #[arg(long, default_value_t = 2)]
+    refresh: u64,
+
+    /// Warm-start the pool from a stored SQLite DB at this path (requires store-sqlite).
+    #[arg(long, value_name = "PATH")]
+    state: Option<PathBuf>,
+}
+
+/// Fill a pool via `find` (optionally warm-started from `--state`) then render the live TUI dashboard.
+#[cfg(feature = "tui")]
+async fn top_cmd(broker: Broker, args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use proxybroker::server::{Pool, PoolConfig};
+
+    let (broker, history) = open_state(broker, args.state.as_deref())?;
+    let pool_config = PoolConfig {
+        countries: (!args.countries.is_empty())
+            .then(|| args.countries.iter().map(|c| c.to_uppercase()).collect()),
+        ..Default::default()
+    };
+    let mut b = FindQuery::builder()
+        .types(types_from(args.types.clone(), Vec::new()))
+        .limit(args.limit.max(1))
+        .timeout(Duration::from_secs(args.timeout));
+    if !args.countries.is_empty() {
+        b = b.countries(args.countries.clone());
+    }
+    let stream = broker.find(b.build()).await?;
+    let pool = Pool::spawn(
+        futures_util::stream::iter(history).chain(stream),
+        pool_config,
+    );
+    proxybroker::tui::run_top(pool, Duration::from_secs(args.refresh)).await?;
+    Ok(())
 }
 
 /// `serve` needs a positive limit (an unbounded pool would fill forever), so `0` maps to `1`,
