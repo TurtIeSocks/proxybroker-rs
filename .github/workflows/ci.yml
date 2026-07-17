@@ -98,3 +98,28 @@ jobs:
 
       - name: Shellcheck the installer
         run: shellcheck install.sh
+
+  # store-redis (Wave 9): the RedisStore round-trip can't be faithfully mocked (Lua atomicity), so
+  # its integration tests run against a real Redis service container. The main test matrix stays
+  # Redis-free — this is the one deliberately non-offline test path (the fold arithmetic + key
+  # layout are pure-tested in the main run).
+  store-redis:
+    name: store-redis (redis service)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: store-redis
+      - name: Test the Redis backend
+        run: cargo test --features store-redis --locked
