@@ -52,10 +52,13 @@ pub fn fresh_marker() -> String {
 
 /// RFC 5952 canonical textual form of `s`, or `None` if it is not a valid IP address.
 ///
-/// Mirrors `utils.py:canonicalize_ip`. IPv4 canonical form equals the input; both Python's
-/// `ipaddress` and Rust's `IpAddr` reject leading zeros (`010.1.1.1` → `None`), so the
-/// "quiet killer" is neutralized for free. Zone IDs (`fe80::1%eth0`) are preserved to match
-/// Python — Rust's `IpAddr` parser rejects `%zone`, so they are split off, the base is
+/// Mirrors `utils.py:canonicalize_ip` **byte for byte** (asserted against a Python oracle in
+/// `tests/utils_chars.rs`) — including accepting the unspecified address `0.0.0.0`/`::`, which
+/// Python's `ipaddress` accepts. Dropping non-routable sentinels is the *provider* layer's job
+/// (see `ProviderSpec::extract`), not this parity-faithful primitive. IPv4 canonical form equals
+/// the input; both Python's `ipaddress` and Rust's `IpAddr` reject leading zeros (`010.1.1.1` →
+/// `None`), so the "quiet killer" is neutralized for free. Zone IDs (`fe80::1%eth0`) are preserved
+/// to match Python — Rust's `IpAddr` parser rejects `%zone`, so they are split off, the base is
 /// canonicalized, and the zone re-appended verbatim.
 pub fn canonicalize_ip(s: &str) -> Option<String> {
     if let Some((base, zone)) = s.split_once('%') {

@@ -91,6 +91,16 @@ impl ProviderSpec {
             let Some(host) = canonicalize_ip(&raw_host) else {
                 continue;
             };
+            // Drop the unspecified address (`0.0.0.0` / `::`): some lists ship it as a sentinel
+            // line and it is never a routable proxy. `canonicalize_ip` stays Python-parity-faithful
+            // (it accepts it, matching `ipaddress`); this non-routable policy lives at the provider
+            // layer, not in the shared primitive. `host` is a canonical IP, so the parse succeeds.
+            if host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_unspecified())
+            {
+                continue;
+            }
             let cand = Candidate {
                 host,
                 port,
@@ -294,6 +304,20 @@ mod tests {
     fn deduplicates_repeated_addresses() {
         let body = "9.9.9.9:53\n9.9.9.9:53\n9.9.9.9:53";
         assert_eq!(spec(&[]).extract(body).len(), 1);
+    }
+
+    #[test]
+    fn drops_the_unspecified_sentinel() {
+        // Some lists (e.g. openproxylist) lead with a `0.0.0.0:80` sentinel that is never a routable
+        // proxy. It must not become a candidate, while real rows on either side survive.
+        let body = "0.0.0.0:80\n8.8.8.8:8080\n1.1.1.1:3128";
+        let got = spec(&[Proto::Http]).extract(body);
+        assert!(
+            got.iter().all(|c| c.host != "0.0.0.0"),
+            "unspecified address leaked into candidates: {got:?}"
+        );
+        assert_eq!(got.len(), 2, "both real rows must be kept: {got:?}");
+        assert!(got.iter().any(|c| c.host == "8.8.8.8" && c.port == 8080));
     }
 
     #[test]
