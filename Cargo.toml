@@ -59,7 +59,11 @@ bytes = "1.12"
 # Provider scraping only. The checker deliberately does NOT use reqwest — it has no
 # per-request proxy and an opaque error type. See docs/systematic-refactor/research.md.
 # NB: 0.13 renamed the 0.12-era `rustls-tls` feature to `rustls`. Verified by cargo, not memory.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "gzip"] }
+# `rustls-no-provider` (not `rustls`): the latter pulls aws-lc-rs (its `__rustls-aws-lc-rs`), whose
+# `-sys` C/asm crate is the musl cross-compile blocker (D1). We supply the ring provider ourselves
+# (rustls already ships with `ring`) and install it as the process default at startup, keeping the
+# whole graph ring-only and musl-clean.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "webpki-roots", "gzip"] }
 # The checker's HTTP, spoken over a stream we negotiated ourselves.
 hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

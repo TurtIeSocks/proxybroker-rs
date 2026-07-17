@@ -34,6 +34,7 @@ pub struct Resolver {
 impl Resolver {
     /// Build a resolver using the system DNS configuration.
     pub fn new(timeout: Duration) -> Result<Self, Error> {
+        crate::install_default_crypto_provider(); // before building the reqwest DoH client below
         let dns = hickory_resolver::Resolver::builder_tokio()
             .map_err(|e| Error::Config(format!("dns resolver init: {e}")))?
             .build()
