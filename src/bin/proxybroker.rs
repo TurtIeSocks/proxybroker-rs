@@ -205,10 +205,11 @@ struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     metrics: Option<std::net::SocketAddr>,
 
-    /// Remember proxies across runs in a SQLite DB at this path — warm-starts the pool from stored
-    /// history and folds each fresh check back in (D2; requires the `store-sqlite` build feature).
-    #[arg(long, value_name = "PATH")]
-    state: Option<PathBuf>,
+    /// Remember proxies across runs — warm-starts the pool from stored history and folds each fresh
+    /// check back in. A file path uses SQLite (`store-sqlite`); a `redis://`/`rediss://` URL uses
+    /// Redis (`store-redis`, Wave 9).
+    #[arg(long, value_name = "PATH_OR_URL")]
+    state: Option<String>,
 
     /// Adaptively re-check pooled proxies on a cadence proportional to their stability, keeping the
     /// pool fresh without re-running find (D3; requires --state and the store-sqlite feature).
@@ -383,9 +384,10 @@ struct FindArgs {
     progress: bool,
 
     /// Remember proxies across runs in a SQLite DB at this path — each checked proxy is folded into
-    /// its durable history (D2; requires the `store-sqlite` build feature).
-    #[arg(long, value_name = "PATH")]
-    state: Option<PathBuf>,
+    /// its durable history. File path → SQLite (`store-sqlite`); `redis://` URL → Redis
+    /// (`store-redis`).
+    #[arg(long, value_name = "PATH_OR_URL")]
+    state: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -799,12 +801,11 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     };
     // D3: adaptive re-check loop. Cloned before `serve` takes the pool; the handle lives until
     // shutdown (its Drop cancels the loop). Needs --state (a durable score to re-check into).
-    #[cfg(feature = "store-sqlite")]
+    #[cfg(any(feature = "store-sqlite", feature = "store-redis"))]
     let _rechecker = if args.recheck {
         match args.state.as_deref() {
-            Some(path) => {
-                let store: Arc<dyn proxybroker::Store> =
-                    Arc::new(proxybroker::SqliteStore::open(path)?);
+            Some(spec) => {
+                let store = select_store(spec)?; // its own store handle, chosen by URL scheme
                 let checker = broker.build_checker(&serve_query(&args)).await?;
                 let cfg = proxybroker::RecheckConfig {
                     min_interval: Duration::from_secs(args.recheck_min),
@@ -851,9 +852,9 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     };
     // These flags are always present (clap mishandles #[cfg]-gated fields), so warn — rather than
     // silently no-op — when the build lacks the backing feature, matching --state's behavior.
-    #[cfg(not(feature = "store-sqlite"))]
+    #[cfg(not(any(feature = "store-sqlite", feature = "store-redis")))]
     if args.recheck {
-        eprintln!("--recheck requires a store backend; rebuild with --features store-sqlite");
+        eprintln!("--recheck requires a store backend; rebuild with --features store-sqlite (or store-redis)");
     }
     #[cfg(not(feature = "watch"))]
     if args.watch {
@@ -982,20 +983,35 @@ fn types_from(protos: Vec<Proto>, lvl: Vec<AnonLevel>) -> Vec<TypeSpec> {
         .collect()
 }
 
+/// Construct the `--state` [`Store`] backend from its spec: a `redis://`/`rediss://` URL → Redis,
+/// anything else → a SQLite file path. Each arm errors clearly when its backing feature is absent.
+#[cfg(any(feature = "store-sqlite", feature = "store-redis"))]
+fn select_store(
+    spec: &str,
+) -> Result<std::sync::Arc<dyn proxybroker::Store>, Box<dyn std::error::Error>> {
+    if spec.starts_with("redis://") || spec.starts_with("rediss://") {
+        #[cfg(feature = "store-redis")]
+        return Ok(std::sync::Arc::new(proxybroker::RedisStore::open(spec)?));
+        #[cfg(not(feature = "store-redis"))]
+        return Err(format!("--state {spec}: a redis:// URL needs --features store-redis").into());
+    }
+    #[cfg(feature = "store-sqlite")]
+    return Ok(std::sync::Arc::new(proxybroker::SqliteStore::open(spec)?));
+    #[cfg(not(feature = "store-sqlite"))]
+    Err(format!("--state {spec}: a file path needs --features store-sqlite").into())
+}
+
 /// Open the `--state` store (D2): return the broker with an upsert observer installed (every checked
-/// proxy is folded into its durable row) plus the warm-start history read from the DB. A no-op
-/// returning empty history when `--state` is unset or the `persist` feature is off.
-#[cfg(feature = "store-sqlite")]
+/// proxy is folded into its durable row) plus the warm-start history read from the store. A no-op
+/// returning empty history when `--state` is unset or no backend feature is built.
+#[cfg(any(feature = "store-sqlite", feature = "store-redis"))]
 fn open_state(
     broker: Broker,
-    path: Option<&std::path::Path>,
+    spec: Option<&str>,
 ) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
-    match path {
-        Some(p) => {
-            // Behind the trait so a future backend (store-redis, Wave 9) is a construction swap
-            // — e.g. dispatch by URL scheme — with no change to the wiring below.
-            let store: std::sync::Arc<dyn proxybroker::Store> =
-                std::sync::Arc::new(proxybroker::SqliteStore::open(p)?);
+    match spec {
+        Some(s) => {
+            let store = select_store(s)?; // backend chosen by URL scheme
             let history = store.load()?;
             let writer = store.clone();
             let obs: proxybroker::broker::CheckObserver = std::sync::Arc::new(move |px: &Proxy| {
@@ -1008,13 +1024,13 @@ fn open_state(
         None => Ok((broker, Vec::new())),
     }
 }
-#[cfg(not(feature = "store-sqlite"))]
+#[cfg(not(any(feature = "store-sqlite", feature = "store-redis")))]
 fn open_state(
     broker: Broker,
-    path: Option<&std::path::Path>,
+    spec: Option<&str>,
 ) -> Result<(Broker, Vec<Proxy>), Box<dyn std::error::Error>> {
-    if path.is_some() {
-        eprintln!("--state requires a store backend; rebuild with --features store-sqlite");
+    if spec.is_some() {
+        eprintln!("--state requires a store backend; rebuild with --features store-sqlite (or store-redis)");
     }
     Ok((broker, Vec::new()))
 }
