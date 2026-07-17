@@ -52,6 +52,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     geo_db: Option<PathBuf>,
 
+    /// Path to a MaxMind-format ASN database (e.g. GeoLite2-ASN.mmdb) to attribute each proxy to
+    /// its Autonomous System. Off unless given — no ASN data is bundled.
+    #[arg(long, global = true, value_name = "PATH")]
+    asn_db: Option<PathBuf>,
+
     /// Load extra providers from YAML/JSON configs in this directory (appended to the
     /// bundled set). May be repeated. Pass --providers-only to use ONLY these.
     #[arg(long, global = true, value_name = "DIR")]
@@ -257,7 +262,7 @@ struct GrabArgs {
     format: Format,
 
     /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
-    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{asn}} {{asn_org}} {{duration}} {{error_rate}};
     /// unknown tokens pass through literally.
     #[arg(long, value_name = "TEMPLATE")]
     output_format: Option<String>,
@@ -368,7 +373,7 @@ struct FindArgs {
     format: Format,
 
     /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
-    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{asn}} {{asn_org}} {{duration}} {{error_rate}};
     /// unknown tokens pass through literally.
     #[arg(long, value_name = "TEMPLATE")]
     output_format: Option<String>,
@@ -463,7 +468,7 @@ struct CheckArgs {
     format: Format,
 
     /// Render each proxy through this template instead — overrides --format. Tokens: {{proxy}}
-    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{duration}} {{error_rate}};
+    /// {{host}} {{port}} {{scheme}} {{protocols}} {{anon}} {{country}} {{asn}} {{asn_org}} {{duration}} {{error_rate}};
     /// unknown tokens pass through literally.
     #[arg(long, value_name = "TEMPLATE")]
     output_format: Option<String>,
@@ -656,6 +661,19 @@ fn country_str(p: &Proxy) -> &str {
     p.geo.as_ref().map(|c| c.code.as_str()).unwrap_or("")
 }
 
+/// The ASN number as a string, or `""` when no `--asn-db` resolved it (C8). Template-only.
+fn asn_str(p: &Proxy) -> String {
+    p.asn
+        .as_ref()
+        .map(|a| a.number.to_string())
+        .unwrap_or_default()
+}
+
+/// The ASN owner organization, or `""` when absent / unknown (C8). Template-only.
+fn asn_org_str(p: &Proxy) -> &str {
+    p.asn.as_ref().and_then(|a| a.org.as_deref()).unwrap_or("")
+}
+
 /// Render a proxy through a `--output-format` template (C6). A **closed** token set replaced
 /// sequentially — tokens are distinct non-overlapping literals, so `str::replace` per token is
 /// correct without a parser. Unknown `{{...}}` tokens are left literally (predictable, config-free).
@@ -667,6 +685,8 @@ fn render_template(tmpl: &str, p: &Proxy) -> String {
         .replace("{{protocols}}", &proto_list(p))
         .replace("{{anon}}", anon_str(p))
         .replace("{{country}}", country_str(p))
+        .replace("{{asn}}", &asn_str(p))
+        .replace("{{asn_org}}", asn_org_str(p))
         .replace("{{duration}}", &p.avg_resp_time().to_string())
         .replace("{{error_rate}}", &p.error_rate().to_string())
 }
@@ -732,6 +752,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Some(db) = db {
             builder = builder.geo(db);
+        }
+        // C8: ASN attribution is opt-in via --asn-db (a separate database from --geo-db); nothing
+        // ASN-shaped is bundled, so without the flag proxies carry no `asn`.
+        if let Some(path) = &cli.asn_db {
+            builder = builder.asn_db(GeoDb::open(path)?);
         }
     }
 
@@ -1663,6 +1688,22 @@ mod format_tests {
     #[test]
     fn template_leaves_unknown_tokens_literal() {
         assert_eq!(render_template("{{nope}}", &proxy_fixture()), "{{nope}}");
+    }
+
+    #[test]
+    fn template_renders_asn_tokens() {
+        // With an --asn-db, {{asn}}/{{asn_org}} render the number and owner.
+        let mut p = proxy_fixture();
+        p.asn = Some(proxybroker::Asn {
+            number: 15169,
+            org: Some("Google LLC".into()),
+        });
+        assert_eq!(
+            render_template("{{asn}} {{asn_org}}", &p),
+            "15169 Google LLC"
+        );
+        // Absent ASN (the default: no --asn-db) renders both as empty.
+        assert_eq!(render_template("{{asn}}{{asn_org}}", &proxy_fixture()), "");
     }
 
     #[test]

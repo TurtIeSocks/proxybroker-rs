@@ -118,6 +118,20 @@ You can always bring your own database — including your own lawfully-licensed 
 proxybroker --geo-db /path/to/GeoLite2-Country.mmdb find --types HTTP
 ```
 
+### ASN attribution
+
+To tag each proxy with the Autonomous System that owns its IP (its network operator), pass a
+separate ASN database with `--asn-db`. This is opt-in and unbundled — no ASN data ships with the
+crate — for the same licensing reason as the City data above:
+
+```sh
+proxybroker --asn-db /path/to/GeoLite2-ASN.mmdb find --types HTTP --format json
+```
+
+Each proxy then carries an `asn` object (`{ "number": 15169, "org": "Google LLC" }`, or `null`
+when no `--asn-db` resolved it) in `--format json`, and the `{{asn}}` / `{{asn_org}}` tokens work
+in `--output-format` templates. `--geo-db` and `--asn-db` are independent and can be combined.
+
 Full analysis with primary sources: [`docs/systematic-refactor/research.md`](docs/systematic-refactor/research.md).
 
 ## Licence

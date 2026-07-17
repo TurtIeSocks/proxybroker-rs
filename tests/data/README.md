@@ -18,5 +18,19 @@ DB populates `geo.region` / `geo.city` (C7), while the bundled DB-IP Country-Lit
 - **Why vendored:** the `maxminddb` crate references these files via a git submodule and does not
   ship them in its published package, so the fixture is committed here directly.
 
+## `GeoLite2-ASN-Test.mmdb`
+
+A MaxMind **ASN**-format database used by `tests/geo_asn.rs` to prove that a user-supplied ASN DB
+populates `proxy.asn` (C8), while the bundled DB-IP Country-Lite does not.
+
+- **Source:** `test-data/GeoLite2-ASN-Test.mmdb` from
+  [maxmind/MaxMind-DB](https://github.com/maxmind/MaxMind-DB) (`main`), vendored verbatim.
+- **License:** Apache License 2.0 (same terms and provenance as `city-test.mmdb` above).
+- **Nature:** synthetic sample data MaxMind publishes for exercising MMDB *readers* — not real ASN
+  data.
+- **Why vendored:** same reason as `city-test.mmdb` — the `maxminddb` crate references these files
+  via a git submodule and does not ship them in its published package.
+
 This is **not** the runtime geo database. The bundled runtime DB is DB-IP Country-Lite
-(CC BY 4.0), lives at `data/dbip-country-lite.mmdb`, and is Country-resolution only.
+(CC BY 4.0), lives at `data/dbip-country-lite.mmdb`, and is Country-resolution only. **No ASN data
+is bundled at all** — ASN attribution requires the user to pass their own `--asn-db`.

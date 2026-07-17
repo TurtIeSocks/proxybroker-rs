@@ -274,6 +274,10 @@ pub struct Broker {
     resolver: Option<Arc<Resolver>>,
     #[cfg(feature = "geo")]
     geo: Option<Arc<GeoDb>>,
+    /// ASN database (C8), from `--asn-db`. Separate from `geo`: ASN lives in its own MaxMind/DB-IP
+    /// file, and nothing ASN-shaped is bundled, so this is `None` unless the caller supplies one.
+    #[cfg(feature = "geo")]
+    asn: Option<Arc<GeoDb>>,
     /// Observer fired per checked proxy (D2 persistence hook). `None` = no-op.
     on_checked: Option<CheckObserver>,
 }
@@ -518,6 +522,10 @@ impl Broker {
         if let Some(db) = &self.geo {
             proxy.geo = db.lookup(proxy.host);
         }
+        // C8: ASN attribution from a separate --asn-db, independent of the country lookup above.
+        if let Some(db) = &self.asn {
+            proxy.asn = db.lookup_asn(proxy.host);
+        }
     }
 
     #[cfg(not(feature = "geo"))]
@@ -681,6 +689,8 @@ pub struct BrokerBuilder {
     geo: Option<Arc<GeoDb>>,
     #[cfg(feature = "geo")]
     no_geo: bool,
+    #[cfg(feature = "geo")]
+    asn: Option<Arc<GeoDb>>,
 }
 
 impl BrokerBuilder {
@@ -719,6 +729,15 @@ impl BrokerBuilder {
         self
     }
 
+    /// Attach an ASN database (C8) so checked proxies carry their Autonomous System (`proxy.asn`).
+    /// This is a **separate** database from [`geo`](Self::geo) — ASN ships in its own MaxMind/DB-IP
+    /// file — and there is no bundled default, so without this call `proxy.asn` stays `None`.
+    #[cfg(feature = "geo")]
+    pub fn asn_db(mut self, db: GeoDb) -> Self {
+        self.asn = Some(Arc::new(db));
+        self
+    }
+
     pub fn build(self) -> Broker {
         crate::install_default_crypto_provider(); // before building the default reqwest client
                                                   // Auto-attach the bundled geo database when built with `geo-bundled` (the default) and
@@ -744,6 +763,8 @@ impl BrokerBuilder {
             resolver: self.resolver,
             #[cfg(feature = "geo")]
             geo,
+            #[cfg(feature = "geo")]
+            asn: self.asn,
             on_checked: None,
         }
     }

@@ -34,6 +34,18 @@ pub struct Region {
     pub name: String,
 }
 
+/// Autonomous System attribution for an IP (C8): the network that owns it. Populated only from a
+/// user-supplied ASN database (`--asn-db`) — a separate MaxMind/DB-IP file from the country/city DB,
+/// so no ASN data is bundled (the CC BY 4.0 hygiene constraint: ship the hook, bundle nothing).
+/// Orthogonal to [`Country`]: geolocation and network ownership are independent facts about an IP.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Asn {
+    /// The autonomous system number, e.g. `15169`.
+    pub number: u32,
+    /// The organization that owns the ASN, e.g. `"Google LLC"`. `None` when the DB omits it.
+    pub org: Option<String>,
+}
+
 /// Username/password for an authenticated upstream proxy (B8). Carried on [`Proxy`], applied by
 /// the negotiator (SOCKS5 RFC 1929) and the server (HTTP `Proxy-Authorization`). Never serialized
 /// (kept out of `--format json`), and its [`std::fmt::Debug`] is redacted so a `Proxy` debug print
@@ -65,6 +77,8 @@ pub struct Proxy {
     pub expected_types: BTreeSet<Proto>,
     /// Country, or `None` when geo is disabled or the lookup missed.
     pub geo: Option<Country>,
+    /// Autonomous System (C8), or `None` unless a `--asn-db` was supplied and resolved this IP.
+    pub asn: Option<Asn>,
     /// Confirmed protocols and, for HTTP, the measured anonymity level.
     types: BTreeMap<Proto, Option<AnonLevel>>,
     /// Total connection attempts. `stat["requests"]`.
@@ -131,6 +145,7 @@ impl Proxy {
             port,
             expected_types,
             geo: None,
+            asn: None,
             types: BTreeMap::new(),
             requests: 0,
             errors: HashMap::new(),
@@ -172,6 +187,7 @@ impl Proxy {
             port,
             expected_types: BTreeSet::new(),
             geo: None,
+            asn: None,
             types,
             requests,
             errors,
@@ -350,7 +366,7 @@ impl Proxy {
 /// idiomatic replacement for the `as_json()` method: `serde_json::to_string(&proxy)`.
 impl Serialize for Proxy {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut st = s.serialize_struct("Proxy", 6)?;
+        let mut st = s.serialize_struct("Proxy", 7)?;
         st.serialize_field("host", &self.host.to_string())?;
         st.serialize_field("port", &self.port)?;
 
@@ -371,6 +387,17 @@ impl Serialize for Proxy {
                 },
                 "city": self.geo.as_ref().and_then(|c| c.city.as_deref()),
             }),
+        )?;
+
+        // asn: null when no --asn-db resolved it (the default), else { number, org }. Unlike geo's
+        // fixed-empty-shape (proxybroker2 parity), ASN is a new field with no parity duty, so null
+        // is the unambiguous "not looked up" marker (ASN 0 is a real reserved number).
+        st.serialize_field(
+            "asn",
+            &self
+                .asn
+                .as_ref()
+                .map(|a| serde_json::json!({ "number": a.number, "org": a.org })),
         )?;
 
         let types: Vec<_> = self
@@ -422,6 +449,15 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             #[serde(default)]
             city: Option<String>,
         }
+        // asn sits top-level beside `geo` (network attribution is orthogonal to geolocation).
+        // Serialize emits null when absent, so `Option<RawAsn>` maps null → None directly.
+        #[derive(serde::Deserialize, Default)]
+        struct RawAsn {
+            #[serde(default)]
+            number: u32,
+            #[serde(default)]
+            org: Option<String>,
+        }
         #[derive(serde::Deserialize)]
         struct RawType {
             #[serde(rename = "type")]
@@ -435,6 +471,8 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             port: u16,
             #[serde(default)]
             geo: RawGeo,
+            #[serde(default)]
+            asn: Option<RawAsn>,
             #[serde(default)]
             types: Vec<RawType>,
             // avg_resp_time / error_rate are present in the JSON but computed, not stored —
@@ -476,11 +514,17 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             types.insert(proto, level);
         }
 
+        let asn = raw.asn.map(|a| Asn {
+            number: a.number,
+            org: a.org,
+        });
+
         Ok(Proxy {
             host,
             port: raw.port,
             expected_types: BTreeSet::new(),
             geo,
+            asn,
             types,
             requests: 0,
             errors: HashMap::new(),
@@ -675,6 +719,32 @@ mod tests {
     }
 
     #[test]
+    fn asn_round_trips_and_absent_serializes_null() {
+        // ASN attribution (C8) comes from a user --asn-db; like geo it must survive save/load,
+        // since --load never re-resolves it. Absent ASN serializes as null (no --asn-db supplied).
+        let mut absent = Proxy::new("9.9.9.9".parse().unwrap(), 53, BTreeSet::new());
+        absent.add_type(Proto::Socks5, None);
+        let v = serde_json::to_value(&absent).unwrap();
+        assert!(v["asn"].is_null(), "absent ASN must serialize as null: {v}");
+        let back: Proxy = serde_json::from_value(v).unwrap();
+        assert_eq!(back.asn, None);
+        assert_eq!(back, absent);
+
+        let mut present = Proxy::new("8.8.8.8".parse().unwrap(), 8080, BTreeSet::new());
+        present.asn = Some(Asn {
+            number: 15169,
+            org: Some("Google LLC".into()),
+        });
+        present.add_type(Proto::Http, Some(AnonLevel::High));
+        let v = serde_json::to_value(&present).unwrap();
+        assert_eq!(v["asn"]["number"], 15169);
+        assert_eq!(v["asn"]["org"], "Google LLC");
+        let back: Proxy = serde_json::from_str(&serde_json::to_string(&present).unwrap()).unwrap();
+        assert_eq!(back.asn, present.asn);
+        assert_eq!(back, present);
+    }
+
+    #[test]
     fn deserialize_ignores_computed_stat_fields() {
         // avg_resp_time/error_rate are present in the JSON (from a checked proxy) but are not
         // restored — the loaded proxy's timing history starts empty.
@@ -805,12 +875,17 @@ mod tests {
         assert_eq!(v["types"][1]["level"], ""); // no level for non-HTTP
 
         // Proxy JSON = v1, FROZEN (see decisions.md). This golden test asserts the COMPLETE shape
-        // so region/city (C7) or any future field cannot drift the schema silently — a breaking
-        // change must bump the `--format` variant (e.g. json2), never an in-band field. For a
-        // country-only Country (the bundled DB, and this fixture) region is empty and city is null.
+        // so region/city (C7) or any future field cannot drift the schema silently. The freeze
+        // permits only *additive, always-present, backward-compatible* fields (a consumer reading
+        // host/port/geo/types is unaffected); a *breaking* change — removing or retyping a field —
+        // must bump the `--format` variant (e.g. json2). `asn` (C8) is such an additive field: null
+        // for every proxy unless a `--asn-db` resolved it, so no existing consumer path changes.
+        // For a country-only Country (the bundled DB, and this fixture) region is empty and city is
+        // null; asn is null because this fixture set no --asn-db.
         assert_eq!(v["geo"]["region"]["code"], "");
         assert_eq!(v["geo"]["region"]["name"], "");
         assert_eq!(v["geo"]["city"], serde_json::Value::Null);
+        assert_eq!(v["asn"], serde_json::Value::Null);
         assert_eq!(v["avg_resp_time"], 0.0);
         assert_eq!(v["error_rate"], 0.0);
         let mut top_keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -818,6 +893,7 @@ mod tests {
         assert_eq!(
             top_keys,
             [
+                "asn",
                 "avg_resp_time",
                 "error_rate",
                 "geo",
@@ -825,7 +901,7 @@ mod tests {
                 "port",
                 "types"
             ],
-            "top-level Proxy JSON keys are frozen at v1"
+            "top-level Proxy JSON keys are frozen at v1 (asn added additively in C8)"
         );
 
         // A top-level-only check is addition-blind: a new key nested inside geo / geo.country /
