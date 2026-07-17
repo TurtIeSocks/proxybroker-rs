@@ -110,6 +110,28 @@ fn ewma_folds_across_two_connections() {
         .expect("HGET ewma_success");
     // fold_ewma(1.0, 0.0, 0.3) = 0.3*0.0 + 0.7*1.0 = 0.7
     assert!((ewma - 0.7).abs() < 1e-9, "ewma={ewma}");
+
+    // The failing re-check carried latency 0.0, so the avg_latency zero-guard must KEEP the prior
+    // 0.5 (matching SqliteStore's `CASE WHEN excluded.avg_latency > 0 …`), not fold the 0.0 in.
+    let avg_latency: f64 = redis::cmd("HGET")
+        .arg("proxybroker:proxy:5.5.5.5:8080")
+        .arg("avg_latency")
+        .query(&mut conn)
+        .expect("HGET avg_latency");
+    assert!(
+        (avg_latency - 0.5).abs() < 1e-9,
+        "avg_latency zero-guard should keep the prior 0.5, got {avg_latency}"
+    );
+
+    // requests/errors accumulate across upserts (not overwrite): 1 + 1 requests, 0 + 1 errors.
+    let (requests, errors): (u32, u32) = redis::cmd("HMGET")
+        .arg("proxybroker:proxy:5.5.5.5:8080")
+        .arg("requests")
+        .arg("errors")
+        .query(&mut conn)
+        .expect("HMGET requests/errors");
+    assert_eq!(requests, 2, "requests accumulate across upserts");
+    assert_eq!(errors, 1, "errors accumulate across upserts");
 }
 
 #[test]
