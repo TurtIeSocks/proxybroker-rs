@@ -38,6 +38,7 @@ series:
 | `proxybroker_pool_size{scheme="https"}` | gauge | Proxies in the pool serving HTTPS |
 | `proxybroker_pool_error_rate_avg` | gauge | Mean proxy error rate over the pool |
 | `proxybroker_pool_resp_time_avg_seconds` | gauge | Mean proxy response time (seconds) |
+| `proxybroker_pool_probe_latency_avg_seconds` | gauge | Mean judge-probe latency (check-time) over the pool |
 | `proxybroker_evictions_total` | counter | Proxies hard-evicted from the pool |
 | `proxybroker_rotations_total` | counter | Mid-request rotations to a different proxy |
 
@@ -54,6 +55,9 @@ proxybroker_pool_error_rate_avg 0.08
 # HELP proxybroker_pool_resp_time_avg_seconds Mean proxy response time over the pool.
 # TYPE proxybroker_pool_resp_time_avg_seconds gauge
 proxybroker_pool_resp_time_avg_seconds 1.34
+# HELP proxybroker_pool_probe_latency_avg_seconds Mean judge-probe latency (check-time) over the pool.
+# TYPE proxybroker_pool_probe_latency_avg_seconds gauge
+proxybroker_pool_probe_latency_avg_seconds 0.42
 # HELP proxybroker_evictions_total Proxies hard-evicted from the pool.
 # TYPE proxybroker_evictions_total counter
 proxybroker_evictions_total 5

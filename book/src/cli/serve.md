@@ -106,13 +106,15 @@ proxybroker serve --types HTTP --only-cc US,DE
 
 ### Persistence and re-checking
 
-These need a store backend (`store-sqlite` or `store-redis`; see
-[feature flags](../architecture/feature-flags.md)).
+These need a persistence build (the `persist` feature; see
+[feature flags](../architecture/feature-flags.md)). `--state` additionally needs a store
+backend (`store-sqlite` or `store-redis`) to durably remember proxies; `--recheck` alone works
+on any `persist` build, keeping its scores in memory when no `--state` is given.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--state <PATH_OR_URL>` | — | Remember proxies across runs. A file path uses SQLite; a `redis://`/`rediss://` URL uses Redis. Warm-starts the pool from stored history and folds each fresh check back in. |
-| `--recheck` | off | Adaptively re-check pooled proxies on a cadence proportional to their stability. Requires `--state` and `store-sqlite`. |
+| `--recheck` | off | Adaptively re-check pooled proxies on a cadence proportional to their stability. Needs the `persist` feature (any of `store-sqlite`/`store-redis`/`persist`). With `--state` the decay scores persist across runs; without it they are kept in memory and reset on restart. |
 | `--recheck-rate <N>` | `5.0` | Global re-check ceiling, checks/sec. |
 | `--recheck-min <SECS>` | `60` | Shortest re-check cadence (a flaky proxy). |
 | `--recheck-max <SECS>` | `3600` | Longest re-check cadence (a rock-solid proxy). |
@@ -134,6 +136,7 @@ proxybroker_pool_size{scheme="http"}            <gauge>
 proxybroker_pool_size{scheme="https"}           <gauge>
 proxybroker_pool_error_rate_avg                 <gauge>
 proxybroker_pool_resp_time_avg_seconds          <gauge>
+proxybroker_pool_probe_latency_avg_seconds      <gauge>
 proxybroker_evictions_total                     <counter>
 proxybroker_rotations_total                     <counter>
 ```

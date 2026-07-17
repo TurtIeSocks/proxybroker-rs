@@ -77,9 +77,11 @@ SQLite file path. If the matching backend feature is not compiled in, the CLI
 prints a hint (`--state <spec>: a file path needs --features store-sqlite`)
 rather than silently doing nothing.
 
-`--state` is also the prerequisite for adaptive re-checking (`--recheck`), which
-needs a durable score to re-check into. See [serve](../cli/serve.md) for the
-`--recheck*` cadence flags.
+`--state` gives adaptive re-checking (`--recheck`) a **durable** score to
+re-check into, so scores survive restarts. But `--recheck` no longer *requires*
+`--state`: without it, the re-checker folds into an in-memory
+[`MemoryStore`](#memorystore-persist) instead (scores reset on restart). See
+[serve](../cli/serve.md) for the `--recheck*` cadence flags.
 
 ## Warm start: `Proxy::restored`
 
@@ -137,6 +139,32 @@ The current on-disk schema version, written to `PRAGMA user_version`. `open`
 runs `migrate`, which reads the stored version and creates the table if it is
 below 1. A schema change bumps this constant and adds a migration arm.
 
+## `MemoryStore` (`persist`)
+
+The in-memory backend: a `HashMap<(host, port), Record>` behind a `Mutex` (so
+`Arc<MemoryStore>` is shareable across the re-check tasks), gated on the
+`persist` feature alone — **no backend dependency**. It exists so `serve
+--recheck` can keep an adaptive re-check's decay/score bookkeeping without a
+`--state` SQLite/Redis backend; the state lives only for the process and nothing
+survives a restart.
+
+```rust
+use proxybroker::persist::MemoryStore;
+
+let store = MemoryStore::new(); // empty; no file, no connection
+```
+
+Its `upsert` fold reproduces [`SqliteStore`](#sqlitestore-store-sqlite)'s
+`ON CONFLICT` arithmetic byte-for-byte — alpha = 0.3 new + 0.7 prior on the
+success/latency EWMAs, accumulate requests/errors/uptime, and keep the prior
+confirmed types on a failing (empty) sample — so a MemoryStore-backed re-check
+decays identically to the durable path. `load` reconstructs through
+[`Proxy::restored`](#warm-start-proxyrestored) like both durable backends.
+
+This is what the CLI selects when `--recheck` runs without `--state` (or on a
+`persist`-only build with no backend compiled in); it prints
+`re-checking into memory only (no durable --state); scores reset on restart`.
+
 ## `RedisStore` (`store-redis`)
 
 The Redis backend (added in Wave 9). One blocking `redis::Connection` behind a
@@ -168,7 +196,7 @@ rather than a silent misread of old-shape hashes.
 
 | Feature | Enables | Pulls in |
 | --- | --- | --- |
-| `persist` | The `Store` trait + observer machinery, no backend | — |
+| `persist` | The `Store` trait + observer machinery + `MemoryStore`, no backend | — |
 | `store-sqlite` | `SqliteStore`, `SCHEMA_VERSION` (implies `persist`) | `rusqlite` (bundled) |
 | `store-redis` | `RedisStore` (implies `persist`) | `redis` (blocking, `script` + rustls) |
 

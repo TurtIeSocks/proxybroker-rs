@@ -57,7 +57,16 @@ embedded into the binary itself, so it stands alone.
 
 The bundled `Dockerfile` produces a `FROM scratch` image containing just the static binary
 plus the licence files. Because the geo database and provider list are embedded, the image
-needs no data volumes:
+needs no data volumes.
+
+Each release pushes the image to the GitHub Container Registry (GHCR), tagged with the release
+version plus a moving `latest`. Pull and run it directly — no build required:
+
+```sh
+docker run --rm ghcr.io/turtiesocks/proxybroker-rs:latest find --types HTTP --limit 5
+```
+
+Or build it yourself from the repo:
 
 ```sh
 docker build -t proxybroker .
