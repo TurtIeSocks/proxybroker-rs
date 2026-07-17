@@ -41,6 +41,9 @@ store-sqlite = ["persist", "dep:rusqlite"]
 # `ON CONFLICT` is a Lua `EVAL` here (Redis runs scripts single-threaded, so no WATCH/MULTI needed).
 # The `Store` trait is synchronous, so this uses redis-rs's blocking `Connection` — no tokio-comp.
 store-redis = ["persist", "dep:redis"]
+# `proxybroker top` terminal dashboard (F4). Pulls ratatui + crossterm; off by default so the
+# default binary stays lean. Needs `cli` (the subcommand) and `server` (reads a live Pool).
+tui = ["cli", "server", "dep:ratatui", "dep:crossterm"]
 # Live-reload the `serve --load` file (E3): a filesystem watcher reconciles the running pool.
 watch = ["server", "dep:notify"]
 # Expose the live pool over MCP stdio (E4, `proxybroker mcp`). rmcp is pinned exactly — it churns.
@@ -108,6 +111,8 @@ notify = { version = "8", optional = true }
 # Pinned exactly (=): rmcp's macro + transport surface moves across releases (roadmap C-flag).
 rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"], optional = true }
 tower-service = { version = "0.3", optional = true }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

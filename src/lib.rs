@@ -67,6 +67,8 @@ pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod stats;
+#[cfg(all(feature = "tui", feature = "server"))]
+pub mod tui;
 pub mod types;
 pub mod utils;
 #[cfg(all(feature = "server", feature = "watch"))]
