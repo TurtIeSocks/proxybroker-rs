@@ -108,6 +108,42 @@ impl DashboardState {
             SortKey::Country => self.rows.sort_by(|a, b| a.country.cmp(&b.country)),
         }
     }
+
+    /// Handle one keypress. Returns `false` to signal quit, `true` to keep running. `a`/`e`/`r`/`c`
+    /// change [`Self::sort`] and re-sort in place; `Down`/`j` and `Up`/`k` move [`Self::selected`],
+    /// clamped to the current row count. Anything else is a no-op.
+    pub fn on_key(&mut self, key: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('a') => {
+                self.sort = SortKey::Addr;
+                self.sort_rows();
+            }
+            KeyCode::Char('e') => {
+                self.sort = SortKey::ErrorRate;
+                self.sort_rows();
+            }
+            KeyCode::Char('r') => {
+                self.sort = SortKey::RespTime;
+                self.sort_rows();
+            }
+            KeyCode::Char('c') => {
+                self.sort = SortKey::Country;
+                self.sort_rows();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.rows.is_empty() {
+                    self.selected = (self.selected + 1).min(self.rows.len() - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 /// Recover the `(host, port)` history key from a rendered [`Row::addr`] (`Proxy::addr()`'s
@@ -172,7 +208,11 @@ pub fn render(frame: &mut ratatui::Frame, state: &DashboardState) {
         .and_then(|r| parse_addr(&r.addr))
         .and_then(|key| state.history.get(&key));
     let spark_data: Vec<u64> = selected_ring
-        .map(|ring| ring.iter().map(|secs| (secs * 1000.0).round() as u64).collect())
+        .map(|ring| {
+            ring.iter()
+                .map(|secs| (secs * 1000.0).round() as u64)
+                .collect()
+        })
         .unwrap_or_default();
     let sparkline = Sparkline::default()
         .block(Block::bordered().title("Selected resp time (ms)"))
@@ -205,7 +245,10 @@ mod tests {
             ..Default::default()
         };
         st.apply(&pool.proxies(), pool.snapshot());
-        assert_eq!(st.rows[0].addr, "1.1.1.1:80", "fastest first under RespTime");
+        assert_eq!(
+            st.rows[0].addr, "1.1.1.1:80",
+            "fastest first under RespTime"
+        );
         st.apply(&pool.proxies(), pool.snapshot());
         assert_eq!(
             st.history[&("1.1.1.1".parse().unwrap(), 80)].len(),
@@ -246,5 +289,66 @@ mod tests {
             text.find("1.1.1.1").unwrap() < text.find("2.2.2.2").unwrap(),
             "sorted: fast first"
         );
+    }
+
+    #[test]
+    fn sort_key_cycles() {
+        use crossterm::event::KeyCode;
+
+        // "9.9.9.9" is fastest (first under RespTime) but lexicographically last (last under
+        // Addr) — a key that flips the row order proves `on_key` actually re-sorted.
+        let pool = Pool::from_proxies(
+            vec![proxy("9.9.9.9", 0.1), proxy("1.1.1.1", 0.9)],
+            PoolConfig::default(),
+        );
+        let mut st = DashboardState::default(); // default sort: RespTime
+        st.apply(&pool.proxies(), pool.snapshot());
+        assert_eq!(
+            st.rows[0].addr, "9.9.9.9:80",
+            "fastest first under RespTime"
+        );
+
+        assert!(st.on_key(KeyCode::Char('a')));
+        assert_eq!(
+            st.rows[0].addr, "1.1.1.1:80",
+            "lexicographic first under Addr"
+        );
+    }
+
+    #[test]
+    fn quit_key_returns_false() {
+        use crossterm::event::KeyCode;
+
+        let mut st = DashboardState::default();
+        assert!(!st.on_key(KeyCode::Char('q')), "q quits");
+        assert!(!st.on_key(KeyCode::Esc), "Esc quits");
+    }
+
+    #[test]
+    fn select_moves_within_bounds() {
+        use crossterm::event::KeyCode;
+
+        let pool = Pool::from_proxies(
+            vec![
+                proxy("1.1.1.1", 0.1),
+                proxy("2.2.2.2", 0.2),
+                proxy("3.3.3.3", 0.3),
+            ],
+            PoolConfig::default(),
+        );
+        let mut st = DashboardState::default();
+        st.apply(&pool.proxies(), pool.snapshot());
+        assert_eq!(st.selected, 0);
+
+        assert!(st.on_key(KeyCode::Up));
+        assert_eq!(st.selected, 0, "up at 0 stays 0");
+
+        for _ in 0..10 {
+            st.on_key(KeyCode::Down);
+        }
+        assert_eq!(st.selected, 2, "down past the end stays clamped");
+
+        assert!(st.on_key(KeyCode::Up));
+        assert_eq!(st.selected, 1, "up moves back by one");
     }
 }
