@@ -9,6 +9,8 @@
 
 use crate::proxy::Proxy;
 use crate::server::PoolSnapshot;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::{Block, Paragraph, Row as TableRow, Sparkline, Table};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
@@ -108,6 +110,76 @@ impl DashboardState {
     }
 }
 
+/// Recover the `(host, port)` history key from a rendered [`Row::addr`] (`Proxy::addr()`'s
+/// `host:port`, IPv6 bracketed as `[host]:port`). Used only to look up the selected row's
+/// sparkline ring — [`Row`] itself carries the display string, not the parsed address.
+fn parse_addr(addr: &str) -> Option<(IpAddr, u16)> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        Some((host.parse().ok()?, port.parse().ok()?))
+    } else {
+        let (host, port) = addr.rsplit_once(':')?;
+        Some((host.parse().ok()?, port.parse().ok()?))
+    }
+}
+
+/// Draw one frame: a one-line pool summary, a `Table` of [`DashboardState::rows`] (sorted per
+/// [`DashboardState::sort`]), and a `Sparkline` of the selected row's response-time history. Pure
+/// — no I/O, safe to call against a [`ratatui::backend::TestBackend`].
+pub fn render(frame: &mut ratatui::Frame, state: &DashboardState) {
+    let [header_area, table_area, spark_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(frame.area());
+
+    let header_text = format!(
+        "total {} | http {} | https {} | avg err {:.2} | avg resp {:.2}s",
+        state.snapshot.total,
+        state.snapshot.http,
+        state.snapshot.https,
+        state.snapshot.avg_error_rate,
+        state.snapshot.avg_resp_time,
+    );
+    frame.render_widget(Paragraph::new(header_text), header_area);
+
+    let widths = [
+        Constraint::Length(21),
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ];
+    let header_row = TableRow::new(["Addr", "Protos", "Err%", "Resp(s)", "Country"]);
+    let rows = state.rows.iter().map(|r| {
+        TableRow::new([
+            r.addr.clone(),
+            r.protos.clone(),
+            format!("{:.2}", r.error_rate),
+            format!("{:.2}", r.resp_time),
+            r.country.clone(),
+        ])
+    });
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::bordered().title("Proxies"));
+    frame.render_widget(table, table_area);
+
+    let selected_ring = state
+        .rows
+        .get(state.selected)
+        .and_then(|r| parse_addr(&r.addr))
+        .and_then(|key| state.history.get(&key));
+    let spark_data: Vec<u64> = selected_ring
+        .map(|ring| ring.iter().map(|secs| (secs * 1000.0).round() as u64).collect())
+        .unwrap_or_default();
+    let sparkline = Sparkline::default()
+        .block(Block::bordered().title("Selected resp time (ms)"))
+        .data(spark_data);
+    frame.render_widget(sparkline, spark_area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +211,40 @@ mod tests {
             st.history[&("1.1.1.1".parse().unwrap(), 80)].len(),
             2,
             "ring grew per apply"
+        );
+    }
+
+    #[test]
+    fn top_renders_sorted_pool_table() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let pool = Pool::from_proxies(
+            vec![proxy("2.2.2.2", 0.9), proxy("1.1.1.1", 0.1)],
+            PoolConfig::default(),
+        );
+        let mut st = DashboardState {
+            sort: SortKey::RespTime,
+            ..Default::default()
+        };
+        st.apply(&pool.proxies(), pool.snapshot());
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| render(f, &st)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("1.1.1.1:80") && text.contains("2.2.2.2:80"),
+            "both addrs rendered"
+        );
+        assert!(
+            text.find("1.1.1.1").unwrap() < text.find("2.2.2.2").unwrap(),
+            "sorted: fast first"
         );
     }
 }
