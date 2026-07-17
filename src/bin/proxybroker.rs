@@ -964,9 +964,9 @@ struct TopArgs {
     #[arg(long, default_value_t = 2)]
     refresh: u64,
 
-    /// Warm-start the pool from a stored SQLite DB at this path (requires store-sqlite).
-    #[arg(long, value_name = "PATH")]
-    state: Option<PathBuf>,
+    /// Warm-start the pool from stored history: a file path (SQLite) or a `redis://` URL (Redis).
+    #[arg(long, value_name = "PATH_OR_URL")]
+    state: Option<String>,
 }
 
 /// Fill a pool via `find` (optionally warm-started from `--state`) then render the live TUI dashboard.
