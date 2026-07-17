@@ -68,6 +68,7 @@ Shipped on `feat/wave-1-inputs`: Step 0 refactor (`3709226`, extract `build_chec
 | C5 | **`Serialize for Stats` + `--stats-format json`** | S | One derive; machine-readable summary for CI/dashboards. |
 | C6 | **Custom output template** (`--output-format "{{proxy}}/{{country}}"`) | S | mubeng parity; render against `Proxy` getters. |
 | C7 | **Region/city from a user-supplied City DB** | S | ⚠ CC BY 4.0: read richer fields only from a user's `--geo-db`; keep bundled DB Country-Lite, bundle no City data. |
+| C8 | **ASN attribution from a user-supplied ASN DB** | S | ⚠ CC BY 4.0: read ASN only from a user's `--asn-db` (a separate mmdb from `--geo-db`); bundle no ASN data. Additive `asn` field on the v1 JSON (null unless resolved) + `{{asn}}`/`{{asn_org}}` template tokens. |
 
 ## Wave 5 — Checking depth
 *Deepen the check engine. All touch `checker.rs` `attempt`/`check_one` + `proxy.rs`.*

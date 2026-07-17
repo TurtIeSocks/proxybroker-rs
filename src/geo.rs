@@ -6,7 +6,7 @@
 //!
 //! Gated behind the `geo` feature; `geo-bundled` additionally embeds the database.
 
-use crate::proxy::{Country, Region};
+use crate::proxy::{Asn, Country, Region};
 use maxminddb::Reader;
 use std::net::IpAddr;
 use std::path::Path;
@@ -66,6 +66,21 @@ impl GeoDb {
             city,
         })
     }
+
+    /// The Autonomous System of `ip` (C8), or `None` if this database has no ASN record for it.
+    ///
+    /// ASN lives in a **separate** MaxMind/DB-IP database (`GeoLite2-ASN.mmdb`) from country/city,
+    /// so this is normally called on a `GeoDb` opened from a user's `--asn-db`. Decoded via
+    /// `geoip2::Asn` (verified against maxminddb 0.29). The bundled Country-Lite carries no ASN
+    /// fields, so decoding it here yields `autonomous_system_number == None` → `None`: no ASN data
+    /// is shipped (the CC BY 4.0 hygiene constraint).
+    pub fn lookup_asn(&self, ip: IpAddr) -> Option<Asn> {
+        let rec: maxminddb::geoip2::Asn = self.reader.lookup(ip).ok()?.decode().ok()??;
+        Some(Asn {
+            number: rec.autonomous_system_number?,
+            org: rec.autonomous_system_organization.map(str::to_owned),
+        })
+    }
 }
 
 #[cfg(all(test, feature = "geo-bundled"))]
@@ -93,5 +108,14 @@ mod tests {
         let c = db.lookup("8.8.8.8".parse().unwrap()).unwrap();
         assert_eq!(c.region, None);
         assert_eq!(c.city, None);
+    }
+
+    #[test]
+    fn bundled_db_carries_no_asn() {
+        // The C8 hygiene constraint, executable: the bundled DB is Country-only, so decoding it as
+        // Asn finds no autonomous_system_number and yields None. No ASN data is shipped — ASN
+        // populates ONLY from a user-supplied --asn-db (see tests/geo_asn.rs for the positive path).
+        let db = GeoDb::bundled().unwrap();
+        assert_eq!(db.lookup_asn("8.8.8.8".parse().unwrap()), None);
     }
 }

@@ -90,7 +90,7 @@ pub use persist::Store;
 #[cfg(feature = "store-sqlite")]
 pub use persist::{SqliteStore, SCHEMA_VERSION};
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};
-pub use proxy::{read_ndjson, write_ndjson, Capabilities, Country, Credentials, Proxy};
+pub use proxy::{read_ndjson, write_ndjson, Asn, Capabilities, Country, Credentials, Proxy};
 pub use resolver::Resolver;
 #[cfg(all(feature = "server", feature = "persist"))]
 pub use scheduler::{decayed_score, next_interval, spawn_rechecker, RecheckConfig, RecheckHandle};
