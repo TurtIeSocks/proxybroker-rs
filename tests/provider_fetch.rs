@@ -72,9 +72,11 @@ async fn fetch_failure_yields_no_proxies_not_an_error() {
 #[test]
 fn bundled_registry_parses_and_is_nonempty() {
     let reg = proxybroker::provider::bundled_registry();
+    // 45 = the P1 churn floor (we ship 50; the audit may curate a few dead ones out). See
+    // provider_registry.rs::bundled_registry_is_curated_and_well_formed for the rationale.
     assert!(
-        reg.len() >= 50,
-        "expected the curated P1 provider set (>=50), got {}",
+        reg.len() >= 45,
+        "expected the curated P1 provider set (>=45), got {}",
         reg.len()
     );
     // The proxyscrape SOCKS entries must carry the right protocol (the missing-comma bug fix).

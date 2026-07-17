@@ -12,19 +12,28 @@ Tier A = 38 curated entries across 11 actively-maintained sources.
 |---|---|---|---|
 | 1 | Count/philosophy | Tier A curated → **exactly 50** | breadth without redundant near-duplicate dumps |
 | 2 | Staleness | **fresh repos only** (pushed 2026-07-17, hourly Actions) | curl yield hides dead-repo staleness |
-| 3 | PR scope | **all 38 in one PR** | homogeneous URL additions + one test |
-| 4 | Parse test | **format-archetype fixtures + registry test** | 38 sources → 3 body formats under one scanner; per-source fixtures re-test the same 3 formats 38× |
+| 3 | PR scope | **one PR** | homogeneous URL additions + one test |
+| 4 | Parse test | **format-archetype fixtures + registry test** | 50 sources → 3 body formats under one scanner; per-source fixtures re-test the same 3 formats |
 | 5 | Liveness audit | **new scheduled workflow** (weekly, non-blocking) | roadmap: "liveness as a periodic CI audit, not a unit test" |
+
+## Outcome
+
+Shipped **50** sources: 10 proxybroker2 survivors + **40 new**. The build's first run of the new
+audit caught two survivors (pubproxy.com, fineproxy.org) that had died since 2026-07-15; they were
+dropped and two fresh sources added in their place — so the net-new count is 40, not the 38 the
+research tier proposed. The offline registry floor is `>= 45` (not 50): the audit's remedy for a
+dead source is to remove it, so a hard `>= 50` would red the blocking suite on the very curation
+the audit requests. 45 proves the expansion holds while leaving slack for churn.
 
 ## Assumptions / deviations
 
 - **Per-source recorded fixtures → per-format archetypes.** The roadmap says "add each with a
-  recorded-fixture parse test." Tier A's 38 sources use only **3** body formats (plain `ip:port`;
+  recorded-fixture parse test." The 50 sources use only **3** body formats (plain `ip:port`;
   `ip:port:country`; `scheme://ip:port`) and all go through the one generic `find_addrs_global`
   scanner, so a per-source fixture only re-tests its format. The real per-source failure modes are
   handled elsewhere: a typo'd/malformed entry by the **registry integrity test** (offline), and a
   dead/format-changed live source by the **scheduled audit**. Net: 3 archetype fixtures instead of
-  38, same coverage, far less repo weight.
+  50, same coverage, far less repo weight.
 - **proxyscrape v2 kept alongside v4.** The existing 3 v2 `getproxies` endpoints stay; the 4 new
   v4 endpoints are additive (different pool, v2 may deprecate).
 - **No custom `pattern`s.** Every Tier-A format is scanner-parseable as-is (verified).
