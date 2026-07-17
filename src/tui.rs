@@ -98,7 +98,8 @@ impl DashboardState {
         // Derive the header counts from the same `proxies` slice — identical to `Pool::snapshot`'s
         // per-scheme counts + means, but atomic with the rows (no second pool lock to race).
         let total = proxies.len();
-        let (mut http, mut https, mut err_sum, mut rt_sum) = (0usize, 0usize, 0.0_f64, 0.0_f64);
+        let (mut http, mut https, mut err_sum, mut rt_sum, mut probe_sum) =
+            (0usize, 0usize, 0.0_f64, 0.0_f64, 0.0_f64);
         for p in proxies {
             let schemes = p.schemes();
             if schemes.contains(&Scheme::Http) {
@@ -109,6 +110,7 @@ impl DashboardState {
             }
             err_sum += p.error_rate();
             rt_sum += p.avg_resp_time();
+            probe_sum += p.probe_latency();
         }
         self.snapshot = PoolSnapshot {
             http,
@@ -121,6 +123,11 @@ impl DashboardState {
             },
             avg_resp_time: if total > 0 {
                 rt_sum / total as f64
+            } else {
+                0.0
+            },
+            probe_latency_avg: if total > 0 {
+                probe_sum / total as f64
             } else {
                 0.0
             },
