@@ -37,8 +37,10 @@ progress = ["cli", "dep:indicatif"]
 persist = []
 # SQLite backend for `--state` (D2). Bundled SQLite: static link, no system libsqlite3.
 store-sqlite = ["persist", "dep:rusqlite"]
-# store-redis (deferred to Wave 9): store-redis = ["persist", "dep:redis"] — an atomic EWMA upsert
-# needs a Lua EVAL / WATCH-MULTI (no SQL ON CONFLICT), plus an async client + test infra.
+# Redis backend for `--state` (D2, Wave 9). The atomic EWMA upsert that SqliteStore does with SQL
+# `ON CONFLICT` is a Lua `EVAL` here (Redis runs scripts single-threaded, so no WATCH/MULTI needed).
+# The `Store` trait is synchronous, so this uses redis-rs's blocking `Connection` — no tokio-comp.
+store-redis = ["persist", "dep:redis"]
 # Live-reload the `serve --load` file (E3): a filesystem watcher reconciles the running pool.
 watch = ["server", "dep:notify"]
 # Expose the live pool over MCP stdio (E4, `proxybroker mcp`). rmcp is pinned exactly — it churns.
@@ -93,6 +95,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optio
 indicatif = { version = "0.18", optional = true }
 # `bundled` compiles SQLite from source: no system libsqlite3, static link (matches the musl goal).
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# The blocking `redis::Connection`/`Client`/`Commands` are unconditional (core, not feature-gated) —
+# matches the sync `Store` trait, no tokio-comp needed. `script` (for `redis::Script`, the atomic
+# upsert) is the one extra feature we need; disabling the rest (acl/streams/geospatial/num-bigint,
+# on by default) keeps the dep minimal. Verified against the crate source, not memory: current major
+# is 1.x (`cargo search redis` → redis = "1.4.0"; confirmed in ~/.cargo/registry/src/.../redis-1.4.0).
+# `tls-rustls-webpki-roots`: makes `rediss://` (managed Redis: ElastiCache/Upstash/Redis Cloud) work
+# with bundled roots (no OS cert store — right for the static musl / scratch binary). It reuses the
+# crate's ring-only rustls (D1), so the graph stays aws-lc-free.
+redis = { version = "1", optional = true, default-features = false, features = ["script", "tls-rustls-webpki-roots"] }
 notify = { version = "8", optional = true }
 # Pinned exactly (=): rmcp's macro + transport surface moves across releases (roadmap C-flag).
 rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"], optional = true }
