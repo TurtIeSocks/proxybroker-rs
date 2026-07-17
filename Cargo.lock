@@ -1687,10 +1687,13 @@ dependencies = [
  "combine",
  "itoa",
  "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2",
  "url",
+ "webpki-roots",
  "xxhash-rust",
 ]
 

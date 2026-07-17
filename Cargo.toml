@@ -100,7 +100,10 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # upsert) is the one extra feature we need; disabling the rest (acl/streams/geospatial/num-bigint,
 # on by default) keeps the dep minimal. Verified against the crate source, not memory: current major
 # is 1.x (`cargo search redis` → redis = "1.4.0"; confirmed in ~/.cargo/registry/src/.../redis-1.4.0).
-redis = { version = "1", optional = true, default-features = false, features = ["script"] }
+# `tls-rustls-webpki-roots`: makes `rediss://` (managed Redis: ElastiCache/Upstash/Redis Cloud) work
+# with bundled roots (no OS cert store — right for the static musl / scratch binary). It reuses the
+# crate's ring-only rustls (D1), so the graph stays aws-lc-free.
+redis = { version = "1", optional = true, default-features = false, features = ["script", "tls-rustls-webpki-roots"] }
 notify = { version = "8", optional = true }
 # Pinned exactly (=): rmcp's macro + transport surface moves across releases (roadmap C-flag).
 rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"], optional = true }
