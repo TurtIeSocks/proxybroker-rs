@@ -114,7 +114,7 @@ Shipped on `feat/wave-1-inputs`: Step 0 refactor (`3709226`, extract `build_chec
 
 | # | Feature | Effort | Notes |
 |---|---|---|---|
-| P1 | **More bundled providers (12 → ~50) + dead-source curation** | M, ongoing | ⚠ offline-testable: add each with a recorded-fixture parse test; treat liveness as a periodic CI audit, not a unit test. Slot into any wave. |
+| P1 | **More bundled providers (12 → ~50) + dead-source curation** | M, ongoing | ✅ 2026-07-17: registry at **50** curated live sources (research in `p1-provider-research.md`, spec in `p1-provider-expansion.md`). Offline guard = format-archetype fixtures + registry integrity test; liveness = scheduled `provider-audit.yml`. Stays "ongoing" — the audit re-curates over time. |
 
 ---
 
