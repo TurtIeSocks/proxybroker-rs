@@ -86,7 +86,7 @@ pub use parse::parse_proxy_lines;
 #[cfg(feature = "store-redis")]
 pub use persist::RedisStore;
 #[cfg(feature = "persist")]
-pub use persist::Store;
+pub use persist::{MemoryStore, Store};
 #[cfg(feature = "store-sqlite")]
 pub use persist::{SqliteStore, SCHEMA_VERSION};
 pub use provider::{config_template, load_provider_dir, Candidate, ProviderSpec};

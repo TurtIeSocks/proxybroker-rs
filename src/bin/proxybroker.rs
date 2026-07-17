@@ -221,7 +221,8 @@ struct ServeArgs {
     state: Option<String>,
 
     /// Adaptively re-check pooled proxies on a cadence proportional to their stability, keeping the
-    /// pool fresh without re-running find (D3; requires --state and the store-sqlite feature).
+    /// pool fresh without re-running find (D3; needs the `persist` feature). Folds scores into
+    /// `--state` when given; otherwise keeps them in memory (reset on restart).
     #[arg(long)]
     recheck: bool,
 
@@ -831,35 +832,29 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         None => None,
     };
     // D3: adaptive re-check loop. Cloned before `serve` takes the pool; the handle lives until
-    // shutdown (its Drop cancels the loop). Needs --state (a durable score to re-check into).
-    #[cfg(any(feature = "store-sqlite", feature = "store-redis"))]
+    // shutdown (its Drop cancels the loop). Folds each outcome into a Store: the durable `--state`
+    // backend when this build has one and `--state` was given, else an in-memory `MemoryStore`
+    // (score bookkeeping only, reset on exit) so `--recheck` works with no database.
+    #[cfg(feature = "persist")]
     let _rechecker = if args.recheck {
-        match args.state.as_deref() {
-            Some(spec) => {
-                let store = select_store(spec)?; // its own store handle, chosen by URL scheme
-                let checker = broker.build_checker(&serve_query(&args)).await?;
-                let cfg = proxybroker::RecheckConfig {
-                    min_interval: Duration::from_secs(args.recheck_min),
-                    max_interval: Duration::from_secs(args.recheck_max),
-                    rate_per_sec: args.recheck_rate,
-                    decay_halflife: Duration::from_secs(args.decay_halflife),
-                };
-                eprintln!(
-                    "adaptive re-checking enabled (rate {}/s)",
-                    args.recheck_rate
-                );
-                Some(proxybroker::spawn_rechecker(
-                    pool.clone(),
-                    checker,
-                    store,
-                    cfg,
-                ))
-            }
-            None => {
-                eprintln!("--recheck requires --state; re-checking disabled");
-                None
-            }
-        }
+        let store = recheck_store(args.state.as_deref())?;
+        let checker = broker.build_checker(&serve_query(&args)).await?;
+        let cfg = proxybroker::RecheckConfig {
+            min_interval: Duration::from_secs(args.recheck_min),
+            max_interval: Duration::from_secs(args.recheck_max),
+            rate_per_sec: args.recheck_rate,
+            decay_halflife: Duration::from_secs(args.decay_halflife),
+        };
+        eprintln!(
+            "adaptive re-checking enabled (rate {}/s)",
+            args.recheck_rate
+        );
+        Some(proxybroker::spawn_rechecker(
+            pool.clone(),
+            checker,
+            store,
+            cfg,
+        ))
     } else {
         None
     };
@@ -883,9 +878,9 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     };
     // These flags are always present (clap mishandles #[cfg]-gated fields), so warn — rather than
     // silently no-op — when the build lacks the backing feature, matching --state's behavior.
-    #[cfg(not(any(feature = "store-sqlite", feature = "store-redis")))]
+    #[cfg(not(feature = "persist"))]
     if args.recheck {
-        eprintln!("--recheck requires a store backend; rebuild with --features store-sqlite (or store-redis)");
+        eprintln!("--recheck requires a persistence feature; rebuild with --features persist (or store-sqlite/store-redis)");
     }
     #[cfg(not(feature = "watch"))]
     if args.watch {
@@ -1086,6 +1081,24 @@ fn select_store(
     return Ok(std::sync::Arc::new(proxybroker::SqliteStore::open(spec)?));
     #[cfg(not(feature = "store-sqlite"))]
     Err(format!("--state {spec}: a file path needs --features store-sqlite").into())
+}
+
+/// Pick the [`Store`](proxybroker::Store) a `serve --recheck` folds into (D3): the durable `--state`
+/// backend when this build has one AND `--state` was given, else an in-memory [`MemoryStore`](proxybroker::MemoryStore)
+/// whose score bookkeeping lives only for the process. The memory fallback is what lets `--recheck`
+/// run with no database (a persist-only build, or a backend build with no `--state`). Gated on
+/// `all(server, persist)` — only `serve_cmd` calls it.
+#[cfg(all(feature = "server", feature = "persist"))]
+fn recheck_store(
+    state: Option<&str>,
+) -> Result<std::sync::Arc<dyn proxybroker::Store>, Box<dyn std::error::Error>> {
+    #[cfg(any(feature = "store-sqlite", feature = "store-redis"))]
+    if let Some(spec) = state {
+        return select_store(spec); // durable: the same handle open_state opens, chosen by URL scheme
+    }
+    let _ = state; // persist-only build, or --recheck without --state → memory fallback
+    eprintln!("re-checking into memory only (no durable --state); scores reset on restart");
+    Ok(std::sync::Arc::new(proxybroker::MemoryStore::new()))
 }
 
 /// Open the `--state` store (D2): return the broker with an upsert observer installed (every checked
@@ -1474,6 +1487,30 @@ fn init_tracing(level: &str, json: bool) {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    // D3: `--recheck` without `--state` must fall back to an in-memory store — score bookkeeping
+    // that does NOT persist across store handles (a durable file would). Confirms `serve_cmd`'s
+    // store selection picks `MemoryStore` on the no-`--state` path.
+    #[cfg(feature = "persist")]
+    #[test]
+    fn recheck_store_without_state_is_in_memory() {
+        use std::collections::BTreeMap;
+        let mut types = BTreeMap::new();
+        types.insert(Proto::Http, None);
+        let px = Proxy::restored("1.2.3.4".parse().unwrap(), 8080, types, 1, 0, 100.0);
+
+        let first = recheck_store(None).unwrap();
+        first.upsert(&px).unwrap();
+        assert_eq!(first.load().unwrap().len(), 1);
+
+        // A second no-`--state` handle starts empty — memory, not a shared durable file that would
+        // still hold the first upsert.
+        let second = recheck_store(None).unwrap();
+        assert!(
+            second.load().unwrap().is_empty(),
+            "no --state must not persist across store handles"
+        );
+    }
 
     #[cfg(feature = "progress")]
     #[test]
