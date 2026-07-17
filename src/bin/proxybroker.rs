@@ -79,7 +79,8 @@ enum Command {
     /// Serve the live pool over MCP (stdio): get_proxy, pool_status, report_dead.
     #[cfg(feature = "mcp")]
     Mcp(McpArgs),
-    /// Live terminal dashboard: a sortable pool table + latency sparklines (F4).
+    /// Live terminal dashboard: a sortable pool table + latency sparklines (F4). Keep --log at the
+    /// default `warn` — higher levels log to stderr over the dashboard.
     #[cfg(feature = "tui")]
     Top(TopArgs),
 }

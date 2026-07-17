@@ -9,6 +9,7 @@
 
 use crate::proxy::Proxy;
 use crate::server::PoolSnapshot;
+use crate::types::Scheme;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Paragraph, Row as TableRow, Sparkline, Table};
 use std::collections::{HashMap, VecDeque};
@@ -64,10 +65,11 @@ impl Default for DashboardState {
 }
 
 impl DashboardState {
-    /// Rebuild [`Self::rows`] from a live pool snapshot: one [`Row`] per proxy, each proxy's
-    /// current `avg_resp_time()` pushed onto its history ring, then re-sorted by [`Self::sort`]
-    /// and [`Self::selected`] clamped to the new row count.
-    pub fn apply(&mut self, proxies: &[Proxy], snapshot: PoolSnapshot) {
+    /// Rebuild [`Self::rows`] from one non-consuming pool read: one [`Row`] per proxy, each proxy's
+    /// current `avg_resp_time()` pushed onto its history ring, the header [`PoolSnapshot`] derived
+    /// from the SAME slice (so the header and table can't disagree within a frame — one lock, taken
+    /// by the caller's `Pool::proxies()`), then re-sorted and [`Self::selected`] clamped.
+    pub fn apply(&mut self, proxies: &[Proxy]) {
         self.rows = proxies
             .iter()
             .map(|p| Row {
@@ -93,7 +95,36 @@ impl DashboardState {
             }
         }
 
-        self.snapshot = snapshot;
+        // Derive the header counts from the same `proxies` slice — identical to `Pool::snapshot`'s
+        // per-scheme counts + means, but atomic with the rows (no second pool lock to race).
+        let total = proxies.len();
+        let (mut http, mut https, mut err_sum, mut rt_sum) = (0usize, 0usize, 0.0_f64, 0.0_f64);
+        for p in proxies {
+            let schemes = p.schemes();
+            if schemes.contains(&Scheme::Http) {
+                http += 1;
+            }
+            if schemes.contains(&Scheme::Https) {
+                https += 1;
+            }
+            err_sum += p.error_rate();
+            rt_sum += p.avg_resp_time();
+        }
+        self.snapshot = PoolSnapshot {
+            http,
+            https,
+            total,
+            avg_error_rate: if total > 0 {
+                err_sum / total as f64
+            } else {
+                0.0
+            },
+            avg_resp_time: if total > 0 {
+                rt_sum / total as f64
+            } else {
+                0.0
+            },
+        };
         self.sort_rows();
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
@@ -217,7 +248,14 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        // Roll raw mode back if entering the alternate screen fails — otherwise we'd return Err
+        // with no guard to restore it, leaving the shell wedged (no echo / line buffering).
+        if let Err(e) =
+            crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
         Ok(TermGuard)
     }
 }
@@ -247,13 +285,15 @@ pub async fn run_top(
     refresh: std::time::Duration,
 ) -> std::io::Result<()> {
     use futures_util::StreamExt;
+    // `tokio::time::interval` panics on a zero period, so floor the (user-settable) refresh.
+    let refresh = refresh.max(std::time::Duration::from_millis(100));
     install_panic_hook();
     let _guard = TermGuard::enter()?;
     let mut term =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
 
     let mut state = DashboardState::default();
-    state.apply(&pool.proxies(), pool.snapshot());
+    state.apply(&pool.proxies());
 
     let mut ticker = tokio::time::interval(refresh);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -262,7 +302,7 @@ pub async fn run_top(
     loop {
         term.draw(|f| render(f, &state))?;
         tokio::select! {
-            _ = ticker.tick() => state.apply(&pool.proxies(), pool.snapshot()),
+            _ = ticker.tick() => state.apply(&pool.proxies()),
             ev = events.next() => match ev {
                 // Filter to Press so terminals that also emit Repeat/Release don't double-handle.
                 Some(Ok(crossterm::event::Event::Key(k)))
@@ -304,12 +344,12 @@ mod tests {
             sort: SortKey::RespTime,
             ..Default::default()
         };
-        st.apply(&pool.proxies(), pool.snapshot());
+        st.apply(&pool.proxies());
         assert_eq!(
             st.rows[0].addr, "1.1.1.1:80",
             "fastest first under RespTime"
         );
-        st.apply(&pool.proxies(), pool.snapshot());
+        st.apply(&pool.proxies());
         assert_eq!(
             st.history[&("1.1.1.1".parse().unwrap(), 80)].len(),
             2,
@@ -330,7 +370,7 @@ mod tests {
             sort: SortKey::RespTime,
             ..Default::default()
         };
-        st.apply(&pool.proxies(), pool.snapshot());
+        st.apply(&pool.proxies());
 
         let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
         term.draw(|f| render(f, &st)).unwrap();
@@ -362,7 +402,7 @@ mod tests {
             PoolConfig::default(),
         );
         let mut st = DashboardState::default(); // default sort: RespTime
-        st.apply(&pool.proxies(), pool.snapshot());
+        st.apply(&pool.proxies());
         assert_eq!(
             st.rows[0].addr, "9.9.9.9:80",
             "fastest first under RespTime"
@@ -397,7 +437,7 @@ mod tests {
             PoolConfig::default(),
         );
         let mut st = DashboardState::default();
-        st.apply(&pool.proxies(), pool.snapshot());
+        st.apply(&pool.proxies());
         assert_eq!(st.selected, 0);
 
         assert!(st.on_key(KeyCode::Up));
