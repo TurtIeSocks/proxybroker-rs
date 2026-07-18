@@ -80,6 +80,14 @@ let body = proxybroker::server::render_metrics(&pool);
 
 Both `render_metrics` and `serve_metrics` are gated on the `metrics` feature.
 
+### Grafana dashboard
+
+A ready-made dashboard covering all six series lives at
+[`grafana/proxybroker-dashboard.json`](https://github.com/TurtIeSocks/proxybroker-rs/blob/main/grafana/proxybroker-dashboard.json).
+Import it in Grafana (Dashboards → New → Import → *Upload JSON file*) and pick your Prometheus data
+source when prompted. It has six panels — pool size by scheme, available proxies, error rate,
+serve-vs-probe latency, and eviction/rotation rates.
+
 ## Structured JSON logs (`--log-format json`)
 
 The global `--log-format` option (default `text`) controls how the `tracing`
