@@ -101,6 +101,11 @@ pub struct Proxy {
     caps: Caps,
     /// Honeypot/trust verdict (A6). Empty (trusted) unless `--trust-check` ran. Not serialized.
     trust: TrustReport,
+    /// Persisted cross-run success EWMA (`persist::Store`), `0.0..=1.0`; `None` for a fresh proxy
+    /// with no warm-start history. Feeds [`Self::priority`] so a proven-good
+    /// exit outranks an unproven one. Not serialized (stays out of the frozen JSON shape, like
+    /// `caps`/`trust`); a reloaded proxy receives it via [`Self::with_ewma`].
+    ewma_success: Option<f64>,
 }
 
 /// A proxy's full capability profile (A4): the recorded [`Caps`] plus CONNECT:25 support derived
@@ -160,6 +165,7 @@ impl Proxy {
             auth: None,
             caps: Caps::default(),
             trust: TrustReport::default(),
+            ewma_success: None,
         }
     }
 
@@ -203,6 +209,7 @@ impl Proxy {
             auth: None,
             caps: Caps::default(),
             trust: TrustReport::default(),
+            ewma_success: None,
         }
     }
 
@@ -216,6 +223,13 @@ impl Proxy {
     /// The upstream credentials, if any (B8).
     pub fn auth(&self) -> Option<&Credentials> {
         self.auth.as_ref()
+    }
+
+    /// Attach a persisted success EWMA on warm start (builder-style); `None` leaves the proxy
+    /// unproven. Feeds [`Self::priority`] so proven exits are preferred.
+    pub fn with_ewma(mut self, ewma_success: Option<f64>) -> Self {
+        self.ewma_success = ewma_success;
+        self
     }
 
     /// `host:port`, IPv6 bracketed per RFC 3986 (`proxy.py:_format_host_port`). No trailing
@@ -334,7 +348,16 @@ impl Proxy {
     /// order with a total comparison (`f64::total_cmp`), so ties are deterministic rather
     /// than fatal. Deviation recorded in `decisions.md`.
     pub fn priority(&self) -> (f64, f64) {
-        (self.error_rate(), self.avg_resp_time())
+        // Historical key = (error_rate, avg_resp_time); lower is better. When a persisted success
+        // EWMA exists, take the WORSE of the live error rate and the EWMA's implied error
+        // (1 - ewma): a proven-good exit failing NOW still ranks down, a fresh exit ranks by its
+        // live rate, and warm-start history informs an otherwise-unproven exit. With no EWMA this
+        // is byte-identical to the historical key (`proxy.py:priority` parity preserved exactly).
+        let key = match self.ewma_success {
+            Some(ewma) => self.error_rate().max(1.0 - ewma),
+            None => self.error_rate(),
+        };
+        (key, self.avg_resp_time())
     }
 
     /// Transport schemes this proxy can serve. `proxy.py:schemes`.
@@ -557,6 +580,7 @@ impl<'de> serde::Deserialize<'de> for Proxy {
             auth: None, // secrets are never serialized, so never deserialized either
             caps: Caps::default(), // capabilities are not serialized; re-measured on a fresh check
             trust: TrustReport::default(), // trust is not serialized; re-assessed on a fresh check
+            ewma_success: None, // not serialized; set on warm start via with_ewma
         })
     }
 }
@@ -599,6 +623,49 @@ mod tests {
             8080,
             BTreeSet::from([Proto::Http]),
         )
+    }
+
+    /// A restored proxy with the given live stats + optional persisted success EWMA.
+    fn restored_p(requests: u32, errors: u32, ewma: Option<f64>) -> Proxy {
+        Proxy::restored(
+            "1.2.3.4".parse().unwrap(),
+            8080,
+            BTreeMap::from([(Proto::Https, None)]),
+            requests,
+            errors,
+            0.5,
+        )
+        .with_ewma(ewma)
+    }
+
+    #[test]
+    fn priority_parity_without_ewma() {
+        // No persisted EWMA => priority key is byte-identical to the historical
+        // (error_rate, avg_resp_time), so warm-start-free pools order exactly as before.
+        let x = restored_p(10, 3, None);
+        assert_eq!(x.priority(), (x.error_rate(), x.avg_resp_time()));
+    }
+
+    #[test]
+    fn priority_prefers_higher_ewma() {
+        // Two identical-live proxies; the one with the better persisted success EWMA ranks first.
+        let good = restored_p(0, 0, Some(0.9));
+        let bad = restored_p(0, 0, Some(0.3));
+        assert!(
+            good.priority().0 < bad.priority().0,
+            "high-EWMA exit must be preferred"
+        );
+    }
+
+    #[test]
+    fn reliability_takes_worse_of_history_and_live() {
+        // Good history (EWMA 0.9) but failing live (error_rate 0.5) => ranked by the worse (0.5),
+        // so a proven exit that is failing right now is still de-prioritized.
+        let x = restored_p(10, 5, Some(0.9)); // live success = 0.5
+        assert!(
+            (x.priority().0 - 0.5).abs() < 1e-9,
+            "worse-of-two = 1 - 0.5"
+        );
     }
 
     #[test]
