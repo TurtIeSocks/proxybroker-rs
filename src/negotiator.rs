@@ -125,6 +125,29 @@ pub async fn negotiate(
     }
 }
 
+/// Lightweight liveness/reachability probe for the pool's verify-on-lease gate: dial `proxy` and
+/// open a `CONNECT` tunnel to `target` (no TLS, no request), returning `true` iff the tunnel
+/// establishes. Catches proxies that died since admission — the dominant "dead-by-lease" failure
+/// for ephemeral (free) pools, where a proxy validated at admission is often dead seconds later.
+/// The tunnel is dropped immediately. `timeout` bounds both the dial and the CONNECT.
+#[cfg(feature = "server")] // only the pool's verify-on-lease gate uses it
+pub(crate) async fn probe_tunnel(
+    proxy_host: IpAddr,
+    proxy_port: u16,
+    target: &Target,
+    timeout: Duration,
+    creds: Option<&Credentials>,
+) -> bool {
+    let Ok(Ok(tcp)) =
+        tokio::time::timeout(timeout, TcpStream::connect((proxy_host, proxy_port))).await
+    else {
+        return false;
+    };
+    negotiate(Proto::Connect80, tcp, target, timeout, creds)
+        .await
+        .is_ok()
+}
+
 async fn socks4(tcp: TcpStream, target: &Target, deadline: Duration) -> Result<Stream, ProxyError> {
     // SOCKS4 has no domain support; it needs an IPv4 destination.
     let ip = match target.ip {

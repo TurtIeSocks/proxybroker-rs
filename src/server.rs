@@ -85,6 +85,17 @@ pub struct PoolConfig {
     /// this set (e.g. dodge a `403`/`503` block page). `None` = accept any status (no peek, blind
     /// splice — today's behaviour). CONNECT tunnels are opaque and never status-gated.
     pub http_allowed_codes: Option<Vec<u16>>,
+    /// Verify-on-lease: when `Some(timeout)`, re-probe a selected proxy with a `CONNECT` tunnel to
+    /// [`Self::verify_target`] before handing it out; a proxy that fails to open the tunnel is
+    /// benched and another is drawn. Kills "dead-by-lease" for ephemeral (free) pools, where a
+    /// proxy validated at admission is frequently dead seconds later. `None` = off (default,
+    /// unchanged behaviour). Adds up to `timeout` of lease latency per dead proxy skipped.
+    pub verify_on_lease: Option<Duration>,
+    /// `(host, port)` the verify-on-lease `CONNECT` probe tunnels to — a stable public endpoint the
+    /// proxy resolves itself (default `("1.1.1.1", 443)`). Only consulted when `verify_on_lease` is
+    /// `Some`. Use a generic host to test *liveness*; a target-specific host also screens
+    /// reachability to that route.
+    pub verify_target: (String, u16),
 }
 
 impl Default for PoolConfig {
@@ -101,6 +112,8 @@ impl Default for PoolConfig {
             fail_timeout: Duration::from_secs(30),
             prefer_connect: false,
             http_allowed_codes: None,
+            verify_on_lease: None,
+            verify_target: ("1.1.1.1".to_string(), 443),
         }
     }
 }
@@ -205,11 +218,27 @@ impl Pool {
     /// and no suitable proxy remains. Ties are ordered with `total_cmp` so equal response times
     /// never panic (the `server.py` heapq bug).
     pub async fn get(&self, scheme: Scheme, key: &ClientKey) -> Option<Proxy> {
+        // Bound on verify-on-lease redraws so an all-dead pool returns `None` (NoProxies) rather
+        // than spinning through benched-and-re-benched exits forever.
+        const VERIFY_MAX_ATTEMPTS: usize = 8;
+        let mut verify_attempts = 0usize;
         loop {
             // `notified()` must be created before we inspect the pool, so a push between the
             // check and the await is not missed.
             let waker = self.notify.notified();
             if let Some(proxy) = self.try_select(scheme, key) {
+                // Verify-on-lease: re-probe the drawn proxy before handing it out; a dead one is
+                // benched and another drawn (bounded). Off (`None`) leaves behaviour unchanged.
+                if let Some(timeout) = self.config.verify_on_lease {
+                    if !self.verify_live(&proxy, timeout).await {
+                        self.put_failed(proxy);
+                        verify_attempts += 1;
+                        if verify_attempts >= VERIFY_MAX_ATTEMPTS {
+                            return None;
+                        }
+                        continue;
+                    }
+                }
                 return Some(proxy);
             }
             if self.exhausted.load(Ordering::SeqCst) {
@@ -218,6 +247,19 @@ impl Pool {
             }
             waker.await;
         }
+    }
+
+    /// CONNECT-tunnel liveness probe backing [`PoolConfig::verify_on_lease`]: `true` iff `proxy` is
+    /// up and can open a tunnel to the configured verify target right now.
+    async fn verify_live(&self, proxy: &Proxy, timeout: Duration) -> bool {
+        let (host, port) = &self.config.verify_target;
+        let target = crate::negotiator::Target {
+            host: host.clone(),
+            ip: None,
+            port: *port,
+        };
+        crate::negotiator::probe_tunnel(proxy.host, proxy.port, &target, timeout, proxy.auth())
+            .await
     }
 
     /// One selection attempt against the current pool contents. Resolves the sticky pin (if any),
@@ -1814,5 +1856,115 @@ mod tests {
             "still checkoutable"
         );
         assert_eq!(pool.proxies().len(), 1, "checkout removed one");
+    }
+
+    // ---- verify-on-lease: re-probe a drawn proxy before handing it out --------
+
+    /// An Https-capable proxy fixture at `127.0.0.1:port`.
+    fn https_at_port(port: u16) -> Proxy {
+        let mut p = Proxy::new("127.0.0.1".parse().unwrap(), port, BTreeSet::new());
+        p.add_type(Proto::Https, None);
+        p
+    }
+
+    fn verify_target() -> crate::negotiator::Target {
+        crate::negotiator::Target {
+            host: "1.1.1.1".into(),
+            ip: None,
+            port: 443,
+        }
+    }
+
+    fn loopback_key() -> ClientKey {
+        ClientKey::Ip(std::net::Ipv4Addr::LOCALHOST.into())
+    }
+
+    /// One-shot mock HTTP proxy that answers any `CONNECT` with `200`. Returns the bound port.
+    async fn mock_connect_ok() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut acc, mut b) = (Vec::new(), [0u8; 1]);
+                while let Ok(n) = sock.read(&mut b).await {
+                    if n == 0 {
+                        break;
+                    }
+                    acc.push(b[0]);
+                    if acc.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn probe_tunnel_false_on_refused_connection() {
+        // 127.0.0.1:1 is not listening → dial refused → dead.
+        let ok = crate::negotiator::probe_tunnel(
+            "127.0.0.1".parse().unwrap(),
+            1,
+            &verify_target(),
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        assert!(!ok, "a refused proxy must probe as dead");
+    }
+
+    #[tokio::test]
+    async fn probe_tunnel_true_via_mock_connect() {
+        let port = mock_connect_ok().await;
+        let ok = crate::negotiator::probe_tunnel(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            &verify_target(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        assert!(ok, "a proxy that answers CONNECT 200 must probe as live");
+    }
+
+    #[tokio::test]
+    async fn get_verify_on_lease_rejects_all_dead_pool() {
+        let cfg = PoolConfig {
+            verify_on_lease: Some(Duration::from_millis(300)),
+            ..PoolConfig::default()
+        };
+        let pool = Pool::from_proxies(vec![https_at_port(1), https_at_port(2)], cfg);
+        let got = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.get(Scheme::Https, &loopback_key()),
+        )
+        .await
+        .expect("get() must not hang under verify-on-lease");
+        assert!(
+            got.is_none(),
+            "an all-dead pool under verify-on-lease must return None, not a dead proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_verify_on_lease_hands_out_live_proxy() {
+        let port = mock_connect_ok().await;
+        let cfg = PoolConfig {
+            verify_on_lease: Some(Duration::from_secs(2)),
+            ..PoolConfig::default()
+        };
+        let pool = Pool::from_proxies(vec![https_at_port(port)], cfg);
+        let got = pool.get(Scheme::Https, &loopback_key()).await;
+        assert!(
+            got.is_some(),
+            "a live (mock) proxy must pass verify-on-lease"
+        );
+        assert_eq!(got.unwrap().port, port);
     }
 }

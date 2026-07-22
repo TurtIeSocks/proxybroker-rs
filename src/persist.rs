@@ -127,7 +127,10 @@ mod sqlite {
         fn load(&self) -> Result<Vec<Proxy>, Error> {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
-                .prepare("SELECT host, port, types, requests, errors, avg_latency FROM proxies")
+                .prepare(
+                    "SELECT host, port, types, requests, errors, avg_latency, ewma_success \
+                     FROM proxies",
+                )
                 .map_err(db)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -138,21 +141,25 @@ mod sqlite {
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, f64>(5)?,
+                        row.get::<_, f64>(6)?,
                     ))
                 })
                 .map_err(db)?;
             let mut out = Vec::new();
             for row in rows {
-                let (host, port, types_json, requests, errors, avg) = row.map_err(db)?;
+                let (host, port, types_json, requests, errors, avg, ewma) = row.map_err(db)?;
                 let Ok(host) = host.parse() else { continue }; // skip an unparseable stored host
-                out.push(Proxy::restored(
-                    host,
-                    port as u16,
-                    types_from_json(&types_json),
-                    requests as u32,
-                    errors as u32,
-                    avg,
-                ));
+                out.push(
+                    Proxy::restored(
+                        host,
+                        port as u16,
+                        types_from_json(&types_json),
+                        requests as u32,
+                        errors as u32,
+                        avg,
+                    )
+                    .with_ewma(Some(ewma)),
+                );
             }
             Ok(out)
         }
@@ -333,6 +340,7 @@ mod memory {
                         rec.errors,
                         rec.avg_latency,
                     )
+                    .with_ewma(Some(rec.ewma_success))
                 })
                 .collect();
             Ok(out)
@@ -613,14 +621,18 @@ return 1
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 let types_json = hash.get("types").map(String::as_str).unwrap_or("[]");
-                out.push(Proxy::restored(
-                    host,
-                    port,
-                    types_from_json(types_json),
-                    requests,
-                    errors,
-                    avg_latency,
-                ));
+                let ewma = hash.get("ewma_success").and_then(|s| s.parse().ok());
+                out.push(
+                    Proxy::restored(
+                        host,
+                        port,
+                        types_from_json(types_json),
+                        requests,
+                        errors,
+                        avg_latency,
+                    )
+                    .with_ewma(ewma),
+                );
             }
             Ok(out)
         }
