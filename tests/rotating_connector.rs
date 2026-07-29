@@ -113,31 +113,73 @@ async fn ejects_failing_proxy_and_retries() {
     assert_eq!(&body[..], b"recovered");
 }
 
+/// A mock proxy that accepts an HTTP `CONNECT`, acks it, and then answers whatever arrives through
+/// the tunnel with a fixed 200 — a raw tunnel that speaks no TLS of its own.
+async fn mock_connect_upstream(
+    body: &'static str,
+    hits: Arc<AtomicUsize>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            hits.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read_exact(&mut byte).await.is_ok() {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !head.starts_with(b"CONNECT ") {
+                    return;
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await;
+                // Now the tunnel is open: read the tunnelled request, answer it.
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (addr, h)
+}
+
 #[tokio::test]
-async fn https_only_proxy_is_not_used_for_https_target() {
-    // Security: an HTTPS-typed proxy would negotiate via Proto::Https, which terminates TLS to the
-    // target with the checker's accept-all verifier — a MITM hole. The connector must refuse it (no
-    // safe raw tunnel), returning an error rather than a silently-unverified TLS stream.
+async fn https_typed_proxy_is_used_through_a_raw_connect_tunnel() {
+    // An `Https`-typed proxy proved it speaks CONNECT — the checker only stamps that type after a
+    // successful CONNECT followed by a TLS upgrade over it. So the connector uses the CONNECT half
+    // and drops the TLS half: the proxy is neither discarded (it is a working tunnel) nor allowed
+    // to pre-terminate TLS with the checker's accept-all verifier. A plaintext round trip
+    // completing at all is the proof no TLS was layered underneath.
     let hits = Arc::new(AtomicUsize::new(0));
-    let (up, _h) = mock_upstream("should-not-be-reached", hits.clone()).await;
+    let (up, _h) = mock_connect_upstream("tunnelled", hits.clone()).await;
     let mut proxy = Proxy::new(up.ip(), up.port(), BTreeSet::from([Proto::Https]));
-    proxy.add_type(Proto::Https, None); // HTTPS only — no SOCKS/CONNECT tunnel
+    proxy.add_type(Proto::Https, None); // HTTPS only — no separately-checked CONNECT/SOCKS type
     let pool = Pool::from_proxies(vec![proxy], PoolConfig::default());
     let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
     let connector = RotatingProxyConnector::from_pool(pool, resolver, RotateConfig::default());
 
-    let outcome = client(connector)
-        .get(Uri::from_static("https://secure.example/"))
-        .await;
-    assert!(
-        outcome.is_err(),
-        "an HTTPS-only proxy must not serve an https target via accept-all TLS termination"
-    );
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        0,
-        "no tunnel should have been dialed"
-    );
+    // An IP-literal https target: the pool's scheme filter admits an `Https`-typed proxy here, and
+    // no DNS is needed (constraint C5). The hyper client layers no TLS, so what crosses the tunnel
+    // is plaintext — which only round-trips if the connector handed back a *plain* stream.
+    let resp = client(connector)
+        .get(Uri::from_static("https://1.2.3.4/"))
+        .await
+        .expect("an Https-typed proxy is a usable CONNECT tunnel");
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"tunnelled");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the proxy should be dialed");
 }
 
 #[tokio::test]

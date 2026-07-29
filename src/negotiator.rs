@@ -146,6 +146,16 @@ pub(crate) fn tunnel_proto(proxy: &Proxy) -> Option<Proto> {
     [Proto::Socks5, Proto::Socks4, Proto::Connect80]
         .into_iter()
         .find(|p| proxy.types().contains_key(p))
+        // An `Https`-typed proxy has *proved* it speaks CONNECT: the checker only stamps that type
+        // after `negotiate` completed a `CONNECT` and then a TLS upgrade over it. So the capability
+        // is there even when `Connect80` was never separately checked — offer the tunnel half of it
+        // and drop the TLS half. Discarding such a proxy would throw away a usable, proven tunnel.
+        .or_else(|| {
+            proxy
+                .types()
+                .contains_key(&Proto::Https)
+                .then_some(Proto::Connect80)
+        })
 }
 
 /// Lightweight liveness/reachability probe for the pool's verify-on-lease gate: dial `proxy` and
@@ -397,6 +407,71 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAllVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "server", feature = "connector"))]
+    fn typed(types: &[Proto]) -> Proxy {
+        let mut p = Proxy::new(
+            "1.1.1.1".parse().unwrap(),
+            80,
+            std::collections::BTreeSet::new(),
+        );
+        for t in types {
+            p.add_type(*t, None);
+        }
+        p
+    }
+
+    /// The invariant the whole picker exists for: whatever the proxy offers, the result never
+    /// terminates TLS to the target.
+    #[test]
+    #[cfg(any(feature = "server", feature = "connector"))]
+    fn tunnel_proto_never_yields_a_tls_terminating_proto() {
+        for types in [
+            vec![Proto::Https],
+            vec![Proto::Https, Proto::Socks5],
+            vec![Proto::Https, Proto::Connect80],
+            vec![Proto::Connect25],
+            vec![Proto::Http],
+            vec![],
+        ] {
+            let got = tunnel_proto(&typed(&types));
+            assert_ne!(got, Some(Proto::Https), "types {types:?}");
+            assert_ne!(got, Some(Proto::Connect25), "types {types:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "server", feature = "connector"))]
+    fn tunnel_proto_prefers_cheapest_handshake_first() {
+        assert_eq!(
+            tunnel_proto(&typed(&[Proto::Socks5, Proto::Socks4, Proto::Connect80])),
+            Some(Proto::Socks5)
+        );
+        assert_eq!(
+            tunnel_proto(&typed(&[Proto::Socks4, Proto::Connect80])),
+            Some(Proto::Socks4)
+        );
+    }
+
+    /// An `Https`-typed proxy proved its CONNECT works during checking, so it is usable as a raw
+    /// tunnel rather than discarded.
+    #[test]
+    #[cfg(any(feature = "server", feature = "connector"))]
+    fn tunnel_proto_reuses_a_proven_connect_from_an_https_type() {
+        assert_eq!(
+            tunnel_proto(&typed(&[Proto::Https])),
+            Some(Proto::Connect80)
+        );
+    }
+
+    /// No tunnel capability at all — a forward-HTTP-only proxy is not a tunnel and must not be
+    /// dressed up as one.
+    #[test]
+    #[cfg(any(feature = "server", feature = "connector"))]
+    fn tunnel_proto_is_none_without_any_tunnel_capability() {
+        assert_eq!(tunnel_proto(&typed(&[Proto::Http])), None);
+        assert_eq!(tunnel_proto(&typed(&[])), None);
+    }
 
     #[test]
     fn connect_request_ipv4_unbracketed() {

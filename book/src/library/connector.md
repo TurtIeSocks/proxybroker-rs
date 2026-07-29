@@ -65,13 +65,18 @@ a bare negotiated tunnel wrapped for hyper.
 
 The connector gives hyper a transparent byte stream to the **target**; hyper then
 speaks origin-form HTTP over it. That is correct for CONNECT/SOCKS tunnels, where
-the stream really reaches the target. Concretely, `tunnel_proto` prefers
-SOCKS5 → SOCKS4 → CONNECT:80, and only falls back to plain-HTTP passthrough when
-the target scheme is `http`.
+the stream really reaches the target. Concretely, the shared `tunnel_proto`
+(in `negotiator.rs`, also used by the local server's relay) prefers
+SOCKS5 → SOCKS4 → CONNECT:80. An `Https`-typed proxy falls back to a raw
+CONNECT:80 — the checker only stamps that type after a successful `CONNECT`
+*followed by* a TLS upgrade, so the tunnel capability is proven even when
+CONNECT was never separately checked; the connector takes the tunnel and drops
+the TLS. On top of that, the connector alone falls back to plain-HTTP
+passthrough when the target scheme is `http`.
 
 A plain forward-HTTP proxy (which needs absolute-form requests) is **not** the
-intended fit — prefer CONNECT/SOCKS proxies. An HTTPS-only proxy for a given
-connection is skipped and another is tried.
+intended fit — prefer CONNECT/SOCKS proxies. A proxy offering no tunnel at all
+is skipped for that connection and another is tried.
 
 ### Deferred: TLS-to-target
 
@@ -89,12 +94,16 @@ find → pool → connector pipeline.
 The checker uses a liveness-only `AcceptAllVerifier` when it probes a proxy's
 TLS — that is fine for deciding whether a proxy is alive, but it accepts any
 certificate. The connector deliberately **never** reuses it for real client
-traffic: doing so would be a silent MITM hole. The server's protocol picker can
-return `Proto::Https` (which upgrades TLS to the target with the accept-all
-verifier) and the SMTP-specific `Connect25`; both are **excluded** from the
-connector's `tunnel_proto`, so it only ever hands hyper a plain, un-terminated
-byte stream. The caller's own TLS stack — not the checker's — validates the
-target certificate.
+traffic: doing so would be a silent MITM hole. `Proto::Https` (which upgrades TLS
+to the target with the accept-all verifier) and the SMTP-specific `Connect25`
+are therefore **excluded** from `tunnel_proto` by construction, so it only ever
+yields a plain, un-terminated byte stream. The caller's own TLS stack — not the
+checker's — validates the target certificate.
+
+The same picker backs the local server's CONNECT/SOCKS5 relay. Keeping one
+picker is deliberate: the two paths drifted apart once already, and the server's
+relay spent several releases handing CONNECT clients a stream whose TLS it had
+already terminated.
 
 ## Feature dependencies
 
