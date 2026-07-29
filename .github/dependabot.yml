@@ -6,10 +6,10 @@ version: 2
 # catches the ones with a filed advisory; this is what keeps the tree current enough that an
 # advisory lands on a version we can actually move off.
 #
-# github-actions: workflow actions run with `contents: write` and `packages: write` on release, so
-# a compromised action is a supply-chain compromise of the published artifacts. Actions are pinned
-# by commit SHA rather than tag — a tag is mutable and can be repointed at new code under the same
-# name. Pinning gives up automatic updates, so Dependabot is what stops the pins going stale.
+# github-actions: release.yml and docs.yml pin actions by commit SHA, because a tag is mutable and
+# those two hold the crates.io token, packages: write, and the Pages deploy. Pinning gives up
+# automatic updates, so Dependabot is what stops those pins going stale. ci.yml and
+# provider-audit.yml stay on tags: read-only, no secrets, so a SHA there buys noise, not safety.
 updates:
   - package-ecosystem: cargo
     directory: /
