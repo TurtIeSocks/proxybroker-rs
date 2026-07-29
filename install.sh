@@ -49,19 +49,27 @@ Darwin)
 *) err "unsupported OS: $os (on Windows, download the .zip from the Releases page)" ;;
 esac
 
+# Both names are built from the same parts because that is how the release workflow builds them:
+# `<bin>-<version>-<target>.tar.gz` and `<bin>-<version>-<target>.sha256`. The checksum name is NOT
+# the archive name with .sha256 appended — deriving it that way asks for a URL that 404s, which
+# fails the download under `set -e` and breaks the installer on every platform.
+# tests/test_install.sh pins this against the real release-asset naming.
 asset="$BIN-$VERSION-$target.tar.gz"
+checksum_asset="$BIN-$VERSION-$target.sha256"
 base="https://github.com/$REPO/releases/download/$VERSION"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $asset ..."
-curl -fsSL "$base/$asset" -o "$tmp/$asset"
-curl -fsSL "$base/$asset.sha256" -o "$tmp/$asset.sha256"
+curl -fsSL "$base/$asset" -o "$tmp/$asset" ||
+	err "could not download $asset from $base"
+curl -fsSL "$base/$checksum_asset" -o "$tmp/$checksum_asset" ||
+	err "could not download $checksum_asset from $base"
 
 # Verify the checksum before touching the install directory. The .sha256 file may be a bare hash
 # or "<hash>  <file>"; take the first field and re-form the line the checker expects.
 echo "Verifying checksum ..."
-hash=$(cut -d' ' -f1 <"$tmp/$asset.sha256")
+hash=$(cut -d' ' -f1 <"$tmp/$checksum_asset")
 [ -n "$hash" ] || err "empty checksum"
 if command -v sha256sum >/dev/null 2>&1; then
 	(cd "$tmp" && echo "$hash  $asset" | sha256sum -c - >/dev/null) || err "checksum mismatch"

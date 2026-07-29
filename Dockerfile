@@ -15,4 +15,9 @@ RUN cargo build --release --locked
 FROM scratch
 COPY --from=build /src/target/release/proxybroker /proxybroker
 COPY LICENSE LICENSE-DATA NOTICE /
+# Run as a non-root UID. There is no /etc/passwd in a scratch image, so this has to be numeric —
+# the binary needs no user lookup, no home, and no writable path. 65532 is the conventional
+# "nonroot" UID (distroless). The listener defaults to :8888, above the privileged range, so
+# dropping root costs nothing. A bind mount for --store sqlite:// must be writable by this UID.
+USER 65532:65532
 ENTRYPOINT ["/proxybroker"]

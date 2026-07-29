@@ -97,7 +97,30 @@ jobs:
           docker run --rm pb-scratch --version | grep -q "IP Geolocation by DB-IP"
 
       - name: Shellcheck the installer
-        run: shellcheck install.sh
+        run: shellcheck install.sh tests/test_install.sh
+
+      # Linting the installer proves it parses, not that it asks for filenames the release actually
+      # publishes. That gap shipped a broken installer: it requested a checksum URL that 404s on
+      # every platform while CI stayed green.
+      - name: Installer release-asset contract
+        run: sh tests/test_install.sh
+
+  # 434 crates reach a published binary here, and nothing checked any of them against the RustSec
+  # advisory database. A vulnerable transitive dep would have shipped in every release artifact and
+  # the container image without a single red check. Its own job so an advisory does not mask a test
+  # failure, and vice versa.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Audits Cargo.lock, so this is the exact dependency set that ships.
+      - name: Audit dependencies for security advisories
+        run: cargo audit --deny warnings
 
   # store-redis (Wave 9): the RedisStore round-trip can't be faithfully mocked (Lua atomicity), so
   # its integration tests run against a real Redis service container. The main test matrix stays

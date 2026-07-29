@@ -1,0 +1,31 @@
+version: 2
+
+# Two ecosystems, for two different risks.
+#
+# cargo: 434 crates reach every published binary and the container image. `cargo audit` in CI
+# catches the ones with a filed advisory; this is what keeps the tree current enough that an
+# advisory lands on a version we can actually move off.
+#
+# github-actions: release.yml and docs.yml pin actions by commit SHA, because a tag is mutable and
+# those two hold the crates.io token, packages: write, and the Pages deploy. Pinning gives up
+# automatic updates, so Dependabot is what stops those pins going stale. ci.yml and
+# provider-audit.yml stay on tags: read-only, no secrets, so a SHA there buys noise, not safety.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine bumps; a breaking change still gets its own, where it can be read.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
