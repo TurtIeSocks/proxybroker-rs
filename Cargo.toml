@@ -97,7 +97,7 @@ clap = { version = "4.6", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 indicatif = { version = "0.18", optional = true }
 # `bundled` compiles SQLite from source: no system libsqlite3, static link (matches the musl goal).
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 # The blocking `redis::Connection`/`Client`/`Commands` are unconditional (core, not feature-gated) —
 # matches the sync `Store` trait, no tokio-comp needed. `script` (for `redis::Script`, the atomic
 # upsert) is the one extra feature we need; disabling the rest (acl/streams/geospatial/num-bigint,
