@@ -97,7 +97,13 @@ jobs:
           docker run --rm pb-scratch --version | grep -q "IP Geolocation by DB-IP"
 
       - name: Shellcheck the installer
-        run: shellcheck install.sh
+        run: shellcheck install.sh tests/test_install.sh
+
+      # Linting the installer proves it parses, not that it asks for filenames the release actually
+      # publishes. That gap shipped a broken installer: it requested a checksum URL that 404s on
+      # every platform while CI stayed green.
+      - name: Installer release-asset contract
+        run: sh tests/test_install.sh
 
   # store-redis (Wave 9): the RedisStore round-trip can't be faithfully mocked (Lua atomicity), so
   # its integration tests run against a real Redis service container. The main test matrix stays
