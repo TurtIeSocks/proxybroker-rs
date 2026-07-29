@@ -1,0 +1,63 @@
+name: Release PR
+
+# Keeps a "chore: release" PR open against main, holding the next version bump and the
+# changelog entries generated from conventional commits since the last tag. Merging it is
+# what starts a release.
+#
+# Mirrors zendriver-rs/.github/workflows/release-plz-pr.yml.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-plz-pr
+  cancel-in-progress: false
+
+jobs:
+  release-plz-pr:
+    name: Update release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plz diffs against the last tag, so it needs the full history.
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: release-plz/action@v0.5.129
+        id: release-plz
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # Auto-merge the release PR so publishing stays hands-off: the merge pushes
+      # "chore: release ..." to main, which triggers release-plz-release.yml.
+      #
+      # GH_TOKEN is the PAT, not GITHUB_TOKEN — a GITHUB_TOKEN-authored push would NOT
+      # trigger the release workflow (GitHub's anti-recursion rule). The PAT-authored
+      # merge does.
+      #
+      # `--auto` queues behind required status checks when branch protection defines
+      # them; GitHub refuses to enable auto-merge on an already-mergeable PR, so the
+      # fallback merges immediately. Add required checks later and the --auto path
+      # starts gating on green CI with no change here.
+      - name: Auto-merge the release PR
+        if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
+        run: |
+          gh pr merge --auto --merge "$PR_NUMBER" \
+            || gh pr merge --merge "$PR_NUMBER"

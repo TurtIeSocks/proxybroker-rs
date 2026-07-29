@@ -1,0 +1,43 @@
+name: Release (crates.io)
+
+# Fires when the release PR lands on main. Publishes to crates.io, tags the commit, and
+# creates the GitHub Release with the changelog as its body.
+#
+# The tag push is what triggers release.yml, which builds the platform binaries and the
+# GHCR image into that same release. That handoff only works because the tag is pushed
+# with a PAT: a GITHUB_TOKEN-authored push does not trigger further workflows.
+#
+# Mirrors zendriver-rs/.github/workflows/release-plz-release.yml.
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-plz-release
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: release-plz/action@v0.5.129
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
