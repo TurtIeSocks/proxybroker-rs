@@ -29,16 +29,17 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rust-toolchain.toml already pins stable; installing it explicitly (with the components
       # clippy/rustfmt need) matches the release workflow and avoids an implicit toolchain
       # install on the first cargo call.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Format
         run: cargo fmt --all --check
@@ -72,11 +73,12 @@ jobs:
     name: musl + docker + installer smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: musl
 
@@ -105,6 +107,25 @@ jobs:
       - name: Installer release-asset contract
         run: sh tests/test_install.sh
 
+  # 434 crates reach a published binary here, and nothing checked any of them against the RustSec
+  # advisory database. A vulnerable transitive dep would have shipped in every release artifact and
+  # the container image without a single red check. Its own job so an advisory does not mask a test
+  # failure, and vice versa.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
+        with:
+          tool: cargo-audit
+      # Audits Cargo.lock, so this is the exact dependency set that ships.
+      - name: Audit dependencies for security advisories
+        run: cargo audit --deny warnings
+
   # store-redis (Wave 9): the RedisStore round-trip can't be faithfully mocked (Lua atomicity), so
   # its integration tests run against a real Redis service container. The main test matrix stays
   # Redis-free — this is the one deliberately non-offline test path (the fold arithmetic + key
@@ -122,9 +143,11 @@ jobs:
     env:
       REDIS_URL: redis://127.0.0.1:6379/
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: store-redis
       - name: Test the Redis backend
