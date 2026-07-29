@@ -1,0 +1,25 @@
+# Docker does not read .gitignore, so the build context has to be trimmed here separately.
+# The Dockerfile only needs what `cargo build --release` reads: Cargo.toml/lock, src, data,
+# and the legal files it COPYs into the scratch stage.
+
+# The big one: a local debug+release target/ runs to several GB and is uploaded to the daemon
+# in full on every build. Nothing in it is an input — the builder stage compiles from source.
+target
+
+# Host git metadata. Not a build input, and it carries the whole object store.
+.git
+
+# Generated mdBook output (book/ sources stay — they are small and harmless).
+book/book
+
+# Local agent/tool state.
+.superpowers
+
+# Editor, compiler, and OS artifacts.
+**/*.rs.bk
+*.pdb
+.DS_Store
+**/.DS_Store
+*~
+*.swp
+*.swo
