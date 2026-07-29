@@ -13,7 +13,7 @@
 //! Imports are served by one dedicated task feeding a [`Notify`], not a per-waiter mutex over
 //! the receiver (design critique #22).
 
-use crate::negotiator::{negotiate, Stream, Target};
+use crate::negotiator::{negotiate, tunnel_proto, Stream, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
 use crate::types::{Proto, Scheme};
@@ -1117,8 +1117,14 @@ fn choose_proto(proxy: &Proxy, scheme: Scheme) -> Proto {
     let types: Vec<Proto> = proxy.types().keys().copied().collect();
     let pick = |candidates: &[Proto]| candidates.iter().find(|c| types.contains(c)).copied();
     match scheme {
-        Scheme::Https => pick(&[Proto::Https, Proto::Socks5, Proto::Socks4, Proto::Connect80])
-            .unwrap_or(Proto::Https),
+        // `Scheme::Https` only ever arrives from a CONNECT or SOCKS5 frontend, and both hand the
+        // client an *opaque* tunnel that it runs its own end-to-end TLS over. So only a tunnel
+        // proto is valid here — `Proto::Https` would terminate that TLS ourselves. See
+        // [`tunnel_proto`]. The fallback keeps a typeless proxy on a raw `CONNECT`: it may well
+        // fail, but it fails without ever pre-terminating TLS.
+        Scheme::Https => tunnel_proto(proxy).unwrap_or(Proto::Connect80),
+        // A forward-HTTP request is not a tunnel — both candidates below yield a plain stream, so
+        // there is nothing to guard against here.
         Scheme::Http => pick(&[Proto::Http, Proto::Connect80, Proto::Socks5, Proto::Socks4])
             .unwrap_or(Proto::Http),
     }
@@ -1565,6 +1571,58 @@ mod tests {
             proxy: p,
             blocked_until: None,
         }
+    }
+
+    /// A bare proxy carrying exactly `types` — enough for `choose_proto`, which reads nothing else.
+    fn typed(types: &[Proto]) -> Proxy {
+        let mut p = Proxy::new("1.1.1.1".parse().unwrap(), 80, BTreeSet::new());
+        for t in types {
+            p.add_type(*t, None);
+        }
+        p
+    }
+
+    #[test]
+    fn https_scheme_never_negotiates_a_tls_terminating_proto() {
+        // The whole point: a CONNECT/SOCKS5 client owns the end-to-end TLS, so no proxy shape may
+        // yield `Proto::Https` — its negotiation would upgrade TLS itself and swallow the client's
+        // ClientHello as application data.
+        for types in [
+            vec![Proto::Https],
+            vec![Proto::Https, Proto::Connect80],
+            vec![Proto::Https, Proto::Socks5],
+            vec![Proto::Http],
+            vec![], // no types at all — the fallback must still be a raw tunnel
+        ] {
+            let got = choose_proto(&typed(&types), Scheme::Https);
+            assert_ne!(
+                got,
+                Proto::Https,
+                "types {types:?} produced a TLS-terminating proto"
+            );
+        }
+    }
+
+    #[test]
+    fn https_scheme_prefers_a_real_tunnel_over_the_fallback() {
+        assert_eq!(
+            choose_proto(&typed(&[Proto::Socks5, Proto::Connect80]), Scheme::Https),
+            Proto::Socks5
+        );
+        assert_eq!(
+            choose_proto(&typed(&[Proto::Connect80]), Scheme::Https),
+            Proto::Connect80
+        );
+    }
+
+    #[test]
+    fn http_scheme_still_prefers_plain_passthrough() {
+        // The forward-HTTP path is untouched by the tunnel rule — both candidates yield a plain
+        // stream, and HTTP passthrough stays first.
+        assert_eq!(
+            choose_proto(&typed(&[Proto::Http, Proto::Connect80]), Scheme::Http),
+            Proto::Http
+        );
     }
 
     /// A default `Best` selection context for `scheme`.

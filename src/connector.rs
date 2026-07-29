@@ -20,7 +20,7 @@
 //!   `reqwest::Client`. A `Broker::rotating()` convenience is deferred until a consumer wants it.
 
 use crate::error::ProxyError;
-use crate::negotiator::{negotiate, Stream, Target};
+use crate::negotiator::{negotiate, tunnel_proto, Stream, Target};
 use crate::proxy::Proxy;
 use crate::resolver::Resolver;
 use crate::server::{ClientKey, Pool};
@@ -128,26 +128,17 @@ impl tower_service::Service<Uri> for RotatingProxyConnector {
     }
 }
 
-/// Pick a **raw-tunnel** protocol for `proxy` — never one that terminates TLS to the target.
+/// Pick the protocol the connector negotiates for `proxy` — always one that hands hyper a plain
+/// byte stream, so the caller's own end-to-end TLS is the only TLS on the wire.
 ///
-/// `choose_proto` (the server's picker) can return `Proto::Https`, whose negotiation upgrades TLS
-/// to the target with the checker's liveness-only accept-all verifier. That is fine for probing a
-/// proxy but a silent MITM hole for real client traffic — the caller layers its own end-to-end TLS
-/// over the tunnel, so the connector must hand hyper a plain byte stream, never a pre-terminated
-/// one. So `Proto::Https` and the SMTP-specific `Connect25` are excluded here; SOCKS/CONNECT80 (and,
-/// for a plain-HTTP target only, HTTP passthrough) all yield a `Stream::Plain`. `None` if the proxy
-/// offers no safe tunnel for the scheme.
-fn tunnel_proto(proxy: &Proxy, scheme: Scheme) -> Option<Proto> {
-    let has = |p: Proto| proxy.types().contains_key(&p);
-    for p in [Proto::Socks5, Proto::Socks4, Proto::Connect80] {
-        if has(p) {
-            return Some(p);
-        }
-    }
-    if scheme == Scheme::Http && has(Proto::Http) {
-        return Some(Proto::Http);
-    }
-    None
+/// The tunnel candidates come from the shared [`tunnel_proto`], which is what excludes
+/// `Proto::Https` (it would pre-terminate TLS with an accept-all verifier). On top of that, a
+/// *plain-HTTP* target may also fall back to HTTP passthrough — not a tunnel, but a `Stream::Plain`
+/// all the same, and there is no TLS to protect. `None` if the proxy offers neither.
+fn connect_proto(proxy: &Proxy, scheme: Scheme) -> Option<Proto> {
+    tunnel_proto(proxy).or_else(|| {
+        (scheme == Scheme::Http && proxy.types().contains_key(&Proto::Http)).then_some(Proto::Http)
+    })
 }
 
 /// The per-connection retry loop — the same shape as the server's relay path: check out a proxy,
@@ -188,7 +179,7 @@ async fn connect(
                 "no proxy available in the pool",
             ));
         };
-        let Some(proto) = tunnel_proto(&proxy, scheme) else {
+        let Some(proto) = connect_proto(&proxy, scheme) else {
             // No safe raw tunnel for this scheme (e.g. an HTTPS-only proxy would force TLS
             // termination to the target). Return it untouched and try another proxy.
             pool.put_ok(proxy);

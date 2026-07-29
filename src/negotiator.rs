@@ -125,6 +125,29 @@ pub async fn negotiate(
     }
 }
 
+/// Pick a protocol whose negotiation yields an **opaque byte tunnel** for `proxy` — the stream a
+/// caller needs when it will run its own end-to-end TLS over the result. `None` if the proxy offers
+/// none. Preference order matches [`negotiate`]'s cheapest-handshake-first ordering.
+///
+/// [`Proto::Https`] is deliberately never returned. [`negotiate`] implements it as `CONNECT` *plus a
+/// TLS upgrade of its own*, verified by the checker's liveness-only [`AcceptAllVerifier`]. That is
+/// right for probing whether a proxy can reach an HTTPS target and wrong for real client traffic
+/// twice over: the caller's own `ClientHello` would be swallowed as application data inside our
+/// session, and nobody would have checked the target's certificate. [`Proto::Connect25`] is
+/// excluded for a duller reason — it reads an SMTP banner off the tunnel before yielding it.
+///
+/// Both tunnel consumers share this: the local server's CONNECT/SOCKS5 relay and the rotating
+/// connector. Keeping one picker is what stops the two from drifting apart again.
+#[cfg(any(feature = "server", feature = "connector"))] // its only two consumers
+use crate::proxy::Proxy;
+
+#[cfg(any(feature = "server", feature = "connector"))]
+pub(crate) fn tunnel_proto(proxy: &Proxy) -> Option<Proto> {
+    [Proto::Socks5, Proto::Socks4, Proto::Connect80]
+        .into_iter()
+        .find(|p| proxy.types().contains_key(p))
+}
+
 /// Lightweight liveness/reachability probe for the pool's verify-on-lease gate: dial `proxy` and
 /// open a `CONNECT` tunnel to `target` (no TLS, no request), returning `true` iff the tunnel
 /// establishes. Catches proxies that died since admission — the dominant "dead-by-lease" failure
