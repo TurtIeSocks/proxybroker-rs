@@ -68,7 +68,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
 	(cd "$tmp" && echo "$hash  $asset" | shasum -a 256 -c - >/dev/null) || err "checksum mismatch"
 else
-	echo "install.sh: no sha256 tool found; skipping verification" >&2
+	err "no sha256 tool found (need sha256sum or shasum); refusing to install unverified"
 fi
 
 echo "Installing to $BIN_DIR ..."
