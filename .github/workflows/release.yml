@@ -57,11 +57,13 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.resolve.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Verify the tag matches the crate version
         env:
@@ -89,11 +91,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # `cargo publish` re-runs this verify-build itself; running it first fails fast with a
       # clearer log if packaging is broken (e.g. a runtime file missing from `include`).
@@ -164,18 +168,19 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # ring assembles its optimized routines with NASM on Windows/MSVC.
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
 
       # The musl targets link against musl libc; musl-tools provides the musl-gcc ring's C code
       # needs. (Only reachable now that the graph is aws-lc-free — see the matrix comment.)
@@ -183,7 +188,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -194,7 +199,7 @@ jobs:
       # pins the target release/tag so this works identically for a pushed tag and a manual
       # run (whose git ref is a branch, not the tag).
       - name: Build and upload CLI binary
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: proxybroker
           target: ${{ matrix.target }}
@@ -221,12 +226,12 @@ jobs:
       contents: read # checkout
       packages: write # push to ghcr.io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.tag }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -240,7 +245,7 @@ jobs:
       # this repo — required or the first push to a new package 403s even with packages: write.
       - name: Compute image tags and labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -251,7 +256,7 @@ jobs:
       # QEMU multi-arch: the Dockerfile compiles the crate from source, so emulated aarch64 builds
       # would be prohibitively slow — the aarch64 story is the musl binary shipped by `binaries`.
       - name: Build and push to GHCR
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
