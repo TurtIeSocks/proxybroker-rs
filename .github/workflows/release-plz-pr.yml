@@ -24,7 +24,7 @@ jobs:
     name: Update release PR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # release-plz diffs against the last tag, so it needs the full history.
           fetch-depth: 0
@@ -34,7 +34,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: release-plz/action@v0.5.129
+      - uses: release-plz/action@v0.5.131
         id: release-plz
         with:
           command: release-pr
