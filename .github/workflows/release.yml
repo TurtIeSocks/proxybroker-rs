@@ -1,16 +1,21 @@
 name: Release
 
-# On a pushed version tag: publish the crate to crates.io AND attach prebuilt CLI binaries
-# to a GitHub Release.
+# On a pushed version tag: attach prebuilt CLI binaries to the GitHub Release and push the
+# container image to GHCR.
+#
+# Normally the tag comes from release-plz, not from a human. release-plz-release.yml bumps the
+# version, writes the changelog, publishes to crates.io, tags, and creates the Release; the tag
+# push then lands here and this fills in the artifacts. That handoff depends on release-plz
+# pushing with a PAT, since a GITHUB_TOKEN-authored push triggers nothing.
+#
+# Tagging by hand still works and is the escape hatch if release-plz is wedged:
 #
 #   git tag v0.1.2 && git push origin v0.1.2
 #
-# Or run manually (Actions → Release → Run workflow) with an existing tag to build/attach
-# binaries ONLY — no crates.io publish. Useful for adding binaries to a release that shipped
-# before this workflow existed.
+# Or run manually (Actions → Release → Run workflow) with an existing tag to back-fill binaries
+# for a release that already shipped.
 #
-# The tag MUST be `v<version>` and match the version in Cargo.toml, or nothing ships. Requires
-# a CARGO_REGISTRY_TOKEN repository secret for the crates.io step.
+# The tag MUST be `v<version>` and match the version in Cargo.toml, or nothing ships.
 on:
   push:
     tags:
@@ -82,32 +87,11 @@ jobs:
       - name: Test
         run: cargo test --all-features --locked
 
-  publish:
-    needs: verify
-    # Only when a tag is pushed. Manual (workflow_dispatch) runs build binaries only and never
-    # republish — crates.io versions are immutable, so a re-publish would fail anyway.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.verify.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+  # crates.io publishing lives in release-plz-release.yml, not here. release-plz owns the
+  # version bump, the changelog, the tag, and the publish; this workflow owns only the things
+  # a tag needs afterwards — the platform binaries and the GHCR image. Two publishers racing
+  # for the same immutable version would just mean one of them always fails.
 
-      # `cargo publish` re-runs this verify-build itself; running it first fails fast with a
-      # clearer log if packaging is broken (e.g. a runtime file missing from `include`).
-      - name: Package (verify the published tarball builds)
-        run: cargo package --locked
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
 
   # Create the GitHub Release once, up front. A pushed git tag is NOT a Release, and none of
   # the matrix jobs reliably creates one (especially on a manual run, where the git ref is a

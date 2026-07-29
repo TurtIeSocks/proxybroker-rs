@@ -1,0 +1,31 @@
+# release-plz configuration.
+# Docs: https://release-plz.ieni.dev/docs/config
+#
+# Single crate, so `[workspace]` here just means "settings for every package" — there is
+# only one. Mirrors zendriver-rs/release-plz.toml; the differences are noted inline.
+
+[workspace]
+# Run cargo-semver-checks before bumping. Catches API breaks that conventional
+# commits forgot to mark with `!`. This crate is library-first, so the public API
+# is the product — worth the extra minute.
+semver_check = true
+
+# Generate CHANGELOG.md. The pre-0.4.1 entries were written by hand from git
+# history; release-plz prepends new releases above them and leaves them alone.
+changelog_update = true
+
+# Create the GitHub Release, with the changelog snippet as the body. release.yml
+# then uploads the platform binaries into it — its create-release job is a
+# no-op when the release already exists, so the two do not race.
+git_release_enable = true
+
+changelog_config = "release-plz-changelog.toml"
+
+# Don't release just because files changed — require a conventional commit that
+# maps to a bump. A docs-only or ci-only push should not cut a version.
+# release_always = false  # ← default
+
+# Don't skip the cargo-publish verify step. `include` in Cargo.toml is anchored
+# and easy to get wrong; the verify build is what catches a runtime file missing
+# from the published tarball.
+publish_no_verify = false
