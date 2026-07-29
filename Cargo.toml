@@ -90,7 +90,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 tracing = "0.1"
 url = "2"
-rand = "0.9"
+rand = "0.10"
 
 maxminddb = { version = "0.29", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
