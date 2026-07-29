@@ -22,9 +22,12 @@ on:
         required: true
         type: string
 
-# Never run two releases for the same tag at once.
+# Never run two releases for the same tag at once. Keyed on `github.ref_name` (`v0.1.2`), NOT
+# `github.ref` (`refs/tags/v0.1.2`) — a manual run supplies the bare tag via `inputs.tag`, so the
+# two trigger types would otherwise compute different group names for the same release and run
+# concurrently, which is the one thing this block exists to prevent.
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
