@@ -135,3 +135,5 @@
 # Zaeem20/FREE_PROXIES_LIST — fresh (SOCKS5)
 - url: "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt"
   protocols: [SOCKS5]
+- url: "https://rcloak.com/api/proxies/raw?protocol=all"
+  protocols: []
