@@ -685,19 +685,30 @@ fn sent_header_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Read the whole response. We send `Connection: close`, so the judge closes the connection
-/// after the body — read-to-end is correct and captures the full page.
+/// Upper bound on the bytes the checker will buffer from one judge response. A judge page is a
+/// few KiB; the response arrives through an **untrusted** proxy that can stream arbitrary bytes at
+/// line rate for the whole `deadline`, and `max_conn` of those at once would exhaust memory. A
+/// response that exceeds this is `BadResponse` (the page is not a judge page).
+const MAX_JUDGE_RESPONSE: u64 = 1024 * 1024;
+
+/// Read the whole response, up to [`MAX_JUDGE_RESPONSE`]. We send `Connection: close`, so the
+/// judge closes the connection after the body — read-to-end is correct and captures the full page.
 async fn read_response(
     stream: &mut crate::negotiator::Stream,
     deadline: Duration,
 ) -> Result<Vec<u8>, ProxyError> {
     let mut buf = Vec::with_capacity(4096);
-    let n = tokio::time::timeout(deadline, stream.read_to_end(&mut buf))
+    // Read one byte past the cap so an exactly-at-cap body is distinguishable from an oversized one.
+    let mut limited = stream.take(MAX_JUDGE_RESPONSE + 1);
+    let n = tokio::time::timeout(deadline, limited.read_to_end(&mut buf))
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|_| ProxyError::Reset)?;
     if n == 0 {
         return Err(ProxyError::EmptyRecv);
+    }
+    if buf.len() as u64 > MAX_JUDGE_RESPONSE {
+        return Err(ProxyError::BadResponse);
     }
     Ok(buf)
 }
@@ -787,6 +798,44 @@ mod tests {
         let (h, b) = split_head_body(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\nbody here");
         assert_eq!(h, b"HTTP/1.1 200 OK\r\nX: y");
         assert_eq!(b, b"body here");
+    }
+
+    /// A local "judge" that writes `total` bytes and closes. Returns the connected client stream.
+    async fn stream_of(total: usize) -> crate::negotiator::Stream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let chunk = vec![b'A'; 64 * 1024];
+            let mut left = total;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if sock.write_all(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                left -= n;
+            }
+            let _ = sock.shutdown().await;
+        });
+        crate::negotiator::Stream::Plain(TcpStream::connect(addr).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn read_response_accepts_a_body_at_the_cap() {
+        let mut s = stream_of(MAX_JUDGE_RESPONSE as usize).await;
+        let buf = read_response(&mut s, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(buf.len() as u64, MAX_JUDGE_RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_an_oversized_body_without_buffering_it() {
+        // A hostile proxy streaming far past the cap: the read stops at cap+1 and fails as
+        // BadResponse instead of growing the buffer until the deadline.
+        let mut s = stream_of(8 * MAX_JUDGE_RESPONSE as usize).await;
+        let err = read_response(&mut s, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ProxyError::BadResponse);
     }
 
     #[test]
