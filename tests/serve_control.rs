@@ -129,3 +129,27 @@ async fn control_remove_returns_204_and_evicts() {
     assert!(ctrl.contains("204 No Content"), "remove → 204: {ctrl:?}");
     assert_eq!(pool.len(), 0, "the proxy is evicted from the pool");
 }
+
+/// The `remove` gate (`control_remove_allowed`) admits loopback peers on an open server — the
+/// operator steering their own instance keeps working without `--auth`. (The LAN-peer-denied half
+/// is a pure-function unit test in `server.rs`; an offline test cannot present a non-loopback peer.)
+#[tokio::test]
+async fn control_remove_from_loopback_is_allowed_without_auth() {
+    let (up, _u) = mock_upstream("BODY").await;
+    let pool = Pool::from_proxies(vec![http_proxy_at(up)], PoolConfig::default());
+    let handle = start(pool.clone()).await;
+    let ctrl = request(
+        handle.local_addr(),
+        &format!(
+            "GET http://proxycontrol/api/remove/{}:{} HTTP/1.1\r\nHost: proxycontrol\r\n\r\n",
+            up.ip(),
+            up.port()
+        ),
+    )
+    .await;
+    assert!(
+        ctrl.contains("204 No Content"),
+        "loopback remove → 204: {ctrl:?}"
+    );
+    assert_eq!(pool.len(), 0);
+}

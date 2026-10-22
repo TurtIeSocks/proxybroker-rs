@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 /// How the pool picks an upstream for each client request.
@@ -96,6 +96,10 @@ pub struct PoolConfig {
     /// `Some`. Use a generic host to test *liveness*; a target-specific host also screens
     /// reachability to that route.
     pub verify_target: (String, u16),
+    /// Upper bound on concurrently served client connections. The accept loop stops taking new
+    /// connections at this many in flight (they wait in the TCP backlog), so a client holding
+    /// thousands of idle sockets cannot exhaust the process's descriptors or memory. Default 1024.
+    pub max_clients: usize,
 }
 
 impl Default for PoolConfig {
@@ -114,6 +118,7 @@ impl Default for PoolConfig {
             http_allowed_codes: None,
             verify_on_lease: None,
             verify_target: ("1.1.1.1".to_string(), 443),
+            max_clients: 1024,
         }
     }
 }
@@ -696,6 +701,10 @@ pub async fn serve(
     };
 
     let accept_cancel = cancel.clone();
+    // Connection cap: one permit per in-flight client, acquired *before* `accept` so that at the
+    // cap we stop draining the listener and excess connections wait in the kernel backlog instead
+    // of each getting a task and a socket. `max(1)` so a zero config cannot wedge the server.
+    let slots = Arc::new(Semaphore::new(ctx.pool.config.max_clients.max(1)));
     tokio::spawn(async move {
         // Startup gate: wait for the pool to fill to min_queue before accepting (clients queue in
         // the backlog meanwhile). wait_ready also returns on source exhaustion, so a too-small
@@ -705,6 +714,13 @@ pub async fn serve(
             _ = ctx.pool.wait_ready(min_queue) => {}
         }
         loop {
+            let permit = tokio::select! {
+                _ = accept_cancel.cancelled() => break,
+                acquired = slots.clone().acquire_owned() => match acquired {
+                    Ok(p) => p,
+                    Err(_) => break, // semaphore closed: never happens, but do not spin
+                },
+            };
             let (client, peer) = tokio::select! {
                 _ = accept_cancel.cancelled() => break,
                 accepted = listener.accept() => match accepted {
@@ -714,6 +730,7 @@ pub async fn serve(
             };
             let ctx = ctx.clone();
             tokio::spawn(async move {
+                let _permit = permit; // released when the connection's task ends
                 let _ = handle_client(client, peer.ip(), ctx).await;
             });
         }
@@ -870,7 +887,8 @@ async fn handle_client(
     }
     // B6: `proxycontrol` requests are handled locally and never consume a pool proxy.
     if req.host == "proxycontrol" {
-        return serve_control(&mut client, &req, &pool, &history, peer_ip).await;
+        let remove_allowed = control_remove_allowed(expected_auth.is_some(), peer_ip);
+        return serve_control(&mut client, &req, &pool, &history, peer_ip, remove_allowed).await;
     }
     let key = client_key(&pool.config, peer_ip, &req);
     let ip = resolver.resolve(&req.host).await.ok();
@@ -1013,16 +1031,26 @@ impl History {
     }
 }
 
+/// Whether a `proxycontrol` **remove** request from `peer_ip` may evict pool members. Eviction is
+/// a write to shared state: on an open server (no `--auth`) bound to a LAN/WAN address, any host
+/// that can reach the port could otherwise drain the pool for everyone. So: allowed when the
+/// server authenticates clients (the 407 gate already ran before the control API), or when the
+/// peer is loopback (the operator on the same machine). `history` is per-peer and stays open.
+fn control_remove_allowed(auth_configured: bool, peer_ip: IpAddr) -> bool {
+    auth_configured || peer_ip.is_loopback()
+}
+
 /// Handle a `Host: proxycontrol` request: introspect/steer the live server without a pool proxy.
-/// `GET .../api/remove/<ip:port>` evicts a proxy (always 204); `GET .../api/history/url:<url>`
-/// reports the upstream that last served `<url>` for this client (200 + JSON, or 204 on a miss).
-/// Mirrors `server.py:320`.
+/// `GET .../api/remove/<ip:port>` evicts a proxy (204; `403` when `remove_allowed` is false — see
+/// [`control_remove_allowed`]); `GET .../api/history/url:<url>` reports the upstream that last
+/// served `<url>` for this client (200 + JSON, or 204 on a miss). Mirrors `server.py:320`.
 async fn serve_control(
     client: &mut TcpStream,
     req: &ClientRequest,
     pool: &Pool,
     history: &History,
     peer_ip: IpAddr,
+    remove_allowed: bool,
 ) -> std::io::Result<()> {
     // path is `http://proxycontrol/api/<operation>/<params>`; strip the authority, split the rest.
     let rest = req
@@ -1032,6 +1060,11 @@ async fn serve_control(
         .trim_start_matches('/');
     let parts: Vec<&str> = rest.splitn(3, '/').collect();
     match parts.as_slice() {
+        [_api, "remove", _] if !remove_allowed => {
+            client
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+        }
         [_api, "remove", params] => {
             let (h, p) = split_host_port(params, 0);
             if let Ok(ip) = h.parse::<IpAddr>() {
@@ -1555,6 +1588,59 @@ fn split_host_port(s: &str, default: u16) -> (String, u16) {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn control_remove_is_gated_by_auth_or_loopback() {
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        let lo4: IpAddr = "127.0.0.1".parse().unwrap();
+        let lo6: IpAddr = "::1".parse().unwrap();
+        // Open server: only the local operator may evict.
+        assert!(!control_remove_allowed(false, lan));
+        assert!(control_remove_allowed(false, lo4));
+        assert!(control_remove_allowed(false, lo6));
+        // Authenticated server: the 407 gate already vetted the client.
+        assert!(control_remove_allowed(true, lan));
+    }
+
+    #[test]
+    fn pool_config_default_caps_clients() {
+        assert_eq!(PoolConfig::default().max_clients, 1024);
+    }
+
+    /// Drive `serve_control` directly with `remove_allowed = false` (the LAN-peer case an offline
+    /// integration test cannot produce): the request gets 403 and the pool is untouched.
+    #[tokio::test]
+    async fn control_remove_denied_returns_403_and_keeps_the_pool() {
+        let mut p = Proxy::new("1.2.3.4".parse().unwrap(), 80, BTreeSet::new());
+        p.add_type(Proto::Http, None);
+        let pool = Pool::from_proxies(vec![p], PoolConfig::default());
+        let history = History::new();
+        let req = ClientRequest {
+            scheme: Scheme::Http,
+            frontend: Frontend::HttpForward,
+            host: "proxycontrol".into(),
+            port: 80,
+            raw: Vec::new(),
+            proxy_auth: None,
+            path: "http://proxycontrol/api/remove/1.2.3.4:80".into(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client_side = TcpStream::connect(addr).await.unwrap();
+        let (mut server_side, _) = listener.accept().await.unwrap();
+        let lan_peer: IpAddr = "192.168.1.20".parse().unwrap();
+
+        serve_control(&mut server_side, &req, &pool, &history, lan_peer, false)
+            .await
+            .unwrap();
+        drop(server_side);
+
+        let mut resp = Vec::new();
+        client_side.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 403"), "{text:?}");
+        assert_eq!(pool.len(), 1, "nothing evicted");
+    }
 
     fn proxy_with(rt: f64, scheme: Proto) -> Pooled {
         proxy_at(rt, scheme, "1.2.3.4")

@@ -47,6 +47,7 @@ threaded into the pool-fill query. Protocol and anonymity values are exactly as 
 | --- | --- | --- |
 | `--host <ADDR>` | `127.0.0.1:8888` | Address to listen on. |
 | `--backlog <N>` | `1024` | TCP listen backlog (queued pending connections). |
+| `--max-clients <N>` | `1024` | Maximum concurrently served client connections; beyond this, new connections wait in the backlog. |
 | `--min-queue <N>` | `0` | Wait until the pool holds at least this many proxies before accepting clients. |
 | `--auth <USER:PASS>` | — | Require client authentication (see below). |
 | `--timeout <SECS>` | `8` | Per-request timeout, in seconds. |
@@ -177,6 +178,14 @@ curl -x http://alice:s3cret@127.0.0.1:8888 http://example.com/
 The client's gate credential is a hop-by-hop secret: it is stripped from the request before it is
 forwarded upstream, so it never leaks to the (untrusted) upstream proxy.
 
+Binding to a non-loopback address (e.g. `--host 0.0.0.0:8888`) without `--auth` prints a warning:
+every host that can reach the port can then relay through the pool. Basic auth is sent in the clear
+by HTTP clients, so it keeps strangers out of the pool; it is not a substitute for a trusted network.
+
+`--max-clients` (default 1024) bounds the connections served at once — beyond it the accept loop
+pauses and new connections wait in the kernel backlog — so a client that opens and holds many idle
+sockets cannot exhaust descriptors or memory. Raise it for a busy trusted LAN; lower it on small hosts.
+
 ## Upstream proxy authentication
 
 If a pooled proxy carries its own credentials (a paid/authenticated upstream), the server applies
@@ -217,7 +226,7 @@ checked first, so introspection cannot reveal pool membership.
 
 | Request | Result |
 | --- | --- |
-| `GET http://proxycontrol/api/remove/<ip:port>` | Evict that proxy from the live pool. Always `204 No Content`, whether or not it matched. |
+| `GET http://proxycontrol/api/remove/<ip:port>` | Evict that proxy from the live pool. `204 No Content` whether or not it matched. On an **open** server (no `--auth`) only loopback clients may evict; a remote peer gets `403 Forbidden`, so a LAN host cannot drain a shared pool. |
 | `GET http://proxycontrol/api/history/url:<url>` | Report the upstream that last served `<url>` for this client: `200` with `{"proxy": "<ip:port>"}`, or `204` on a miss. |
 
 ```sh
