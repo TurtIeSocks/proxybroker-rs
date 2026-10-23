@@ -3,9 +3,12 @@
 
 [advisories]
 ignore = [
-    # unsafe-libyaml is unmaintained (assigned 2026-10-12). It is a transitive dep
-    # of serde_yaml_ng (our only YAML parser, used for provider configs the
-    # operator writes themselves), which has no release that drops it. Not a
-    # vulnerability; revisit when serde_yaml_ng moves off it or we switch crates.
+    # unsafe-libyaml is unmaintained: https://rustsec.org/advisories/RUSTSEC-2024-0449
+    # The ID year follows the advisory's `date` (2024-03-25, when the repo was
+    # archived), not when RustSec published it (2026-10-12). Informational, not a
+    # vulnerability. It is a transitive dep of serde_yaml_ng (our only YAML parser,
+    # for operator-written provider configs), whose latest release (0.10.0) still
+    # depends on it, so there is no bump that clears this. Revisit when
+    # serde_yaml_ng moves off it or we switch to a safe-Rust YAML crate.
     "RUSTSEC-2024-0449",
 ]
