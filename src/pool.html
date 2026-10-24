@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>proxybroker pool</title>
+<style>
+  body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222;background:#fafafa}
+  h1{font-size:1.2rem;margin:0 0 .25rem}
+  #sum{color:#666;margin-bottom:1rem}
+  table{border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  th,td{padding:.35rem .7rem;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}
+  th{cursor:pointer;background:#f0f0f0;user-select:none;position:sticky;top:0}
+  th.on::after{content:" ▴"} th.on.desc::after{content:" ▾"}
+  td.n{text-align:right;font-variant-numeric:tabular-nums}
+  .High{color:#0a7d2c;font-weight:600} .Anonymous{color:#b36b00} .Transparent{color:#b00020}
+  code{font-family:ui-monospace,monospace}
+</style>
+<h1>proxybroker pool</h1>
+<div id="sum">loading…</div>
+<table><thead><tr>
+  <th data-k="addr">address</th><th data-k="types">types</th><th data-k="anon">anonymity</th>
+  <th data-k="cc">country</th><th data-k="rt" class="n">resp time (s)</th><th data-k="err" class="n">error rate</th>
+</tr></thead><tbody id="rows"></tbody></table>
+<script>
+const RANK={High:3,Anonymous:2,Transparent:1,"":0};
+let sortKey="anon",desc=true,rows=[];
+function anonOf(p){let best="";for(const t of p.types)if(RANK[t.level]>RANK[best])best=t.level;return best}
+function draw(){
+  const tb=document.getElementById("rows");tb.innerHTML="";
+  const s=[...rows].sort((a,b)=>{let x=a[sortKey],y=b[sortKey];
+    if(sortKey==="anon"){x=RANK[x];y=RANK[y]} const c=x<y?-1:x>y?1:0;return desc?-c:c});
+  for(const r of s){const tr=document.createElement("tr");
+    tr.innerHTML=`<td><code>${r.addr}</code></td><td>${r.types}</td><td class="${r.anon}">${r.anon||"—"}</td>`+
+      `<td>${r.cc}</td><td class="n">${r.rt.toFixed(2)}</td><td class="n">${(r.err*100).toFixed(0)}%</td>`;
+    tb.appendChild(tr)}
+  document.querySelectorAll("th").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortKey);th.classList.toggle("desc",th.dataset.k===sortKey&&desc)});
+  const n=rows.length,high=rows.filter(r=>r.anon==="High").length,https=rows.filter(r=>/HTTPS|SOCKS/.test(r.types)).length;
+  document.getElementById("sum").textContent=`${n} proxies · ${high} high-anonymity HTTP · ${https} tunnel-capable (HTTPS/SOCKS) · updated ${new Date().toLocaleTimeString()}`;
+}
+async function load(){try{const j=await (await fetch("/pool.json")).json();
+  rows=j.map(p=>({addr:`${p.host}:${p.port}`,types:p.types.map(t=>t.type).join(" "),anon:anonOf(p),
+    cc:p.geo?.country?.code||"",rt:p.avg_resp_time,err:p.error_rate}));draw()}catch(e){document.getElementById("sum").textContent="fetch failed: "+e}}
+document.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(k===sortKey)desc=!desc;else{sortKey=k;desc=k==="anon"||k==="err"?true:false}draw()});
+load();setInterval(load,5000);
+</script>
