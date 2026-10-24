@@ -57,7 +57,10 @@ jobs:
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
+          # Raw JSON, parsed in the shell: `fromJSON()` on an empty output (release-plz failed
+          # before setting it) is a template error that masks the real failure.
+          PR_JSON: ${{ steps.release-plz.outputs.pr }}
         run: |
+          PR_NUMBER=$(jq -r .number <<<"$PR_JSON")
           gh pr merge --auto --merge "$PR_NUMBER" \
             || gh pr merge --merge "$PR_NUMBER"
