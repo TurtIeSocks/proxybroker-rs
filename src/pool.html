@@ -28,9 +28,13 @@ function draw(){
   const tb=document.getElementById("rows");tb.innerHTML="";
   const s=[...rows].sort((a,b)=>{let x=a[sortKey],y=b[sortKey];
     if(sortKey==="anon"){x=RANK[x];y=RANK[y]} const c=x<y?-1:x>y?1:0;return desc?-c:c});
+  // Build cells with textContent only: country (and, with a user --geo-db, region/city) is
+  // untrusted text and must never be parsed as markup.
+  const cell=(txt,cls,mono)=>{const td=document.createElement("td");if(cls)td.className=cls;
+    if(mono){const c=document.createElement("code");c.textContent=txt;td.appendChild(c)}else td.textContent=txt;return td};
   for(const r of s){const tr=document.createElement("tr");
-    tr.innerHTML=`<td><code>${r.addr}</code></td><td>${r.types}</td><td class="${r.anon}">${r.anon||"—"}</td>`+
-      `<td>${r.cc}</td><td class="n">${r.rt.toFixed(2)}</td><td class="n">${(r.err*100).toFixed(0)}%</td>`;
+    tr.append(cell(r.addr,"",true),cell(r.types),cell(r.anon||"—",RANK[r.anon]!==undefined&&r.anon?r.anon:""),
+      cell(r.cc),cell(r.rt.toFixed(2),"n"),cell((r.err*100).toFixed(0)+"%","n"));
     tb.appendChild(tr)}
   document.querySelectorAll("th").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortKey);th.classList.toggle("desc",th.dataset.k===sortKey&&desc)});
   const n=rows.length,high=rows.filter(r=>r.anon==="High").length,https=rows.filter(r=>/HTTPS|SOCKS/.test(r.types)).length;

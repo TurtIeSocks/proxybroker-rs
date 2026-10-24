@@ -128,9 +128,10 @@ With the `metrics` feature built in:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--metrics <ADDR>` | — | Serve a Prometheus text metrics endpoint on this address. |
+| `--metrics-pool-page` | off | Also serve the live pool page (`/pool`) and its JSON (`/pool.json`) on that address. Requires `--metrics`. |
 
-Any request to the metrics endpoint returns the current pool metrics in Prometheus text
-exposition format (`version=0.0.4`):
+The metrics endpoint returns the current pool metrics in Prometheus text exposition format
+(`version=0.0.4`) for any path (`/`, `/metrics`, …):
 
 ```
 proxybroker_pool_size{scheme="http"}            <gauge>
@@ -143,11 +144,30 @@ proxybroker_rotations_total                     <counter>
 ```
 
 Error rate is an **aggregate** gauge over the pool, not per-address — per-proxy labels would be
-unbounded cardinality for a rotating pool. Per-proxy detail lives behind the control API below.
+unbounded cardinality for a rotating pool.
 
 ```sh
 proxybroker serve --types HTTP --metrics 127.0.0.1:9090
 curl -s http://127.0.0.1:9090/
+```
+
+#### Pool page
+
+`--metrics-pool-page` adds two routes to the same listener:
+
+| Path | Result |
+| --- | --- |
+| `GET /pool` | A self-contained HTML table of the live pool — address, confirmed types, anonymity level, country, average response time, error rate. Sortable by column; refreshes from `/pool.json` every 5 s. No external assets. Entries with no confirmed type yet (e.g. `--state` history awaiting re-check) are counted but hidden. |
+| `GET /pool.json` | The same data as JSON: each pooled proxy in the shape `--format json` emits (`host`, `port`, `geo`, `types[{type,level}]`, `avg_resp_time`, `error_rate`). |
+
+Without the flag both paths answer `404`. **The metrics listener has no authentication**: the
+page reveals pool membership to anyone who can reach the address, which the `proxycontrol` API
+deliberately does not. Keep `--metrics` on loopback or a trusted interface when enabling it.
+
+```sh
+proxybroker serve --types HTTP HTTPS --lvl High --strict \
+    --metrics 127.0.0.1:9090 --metrics-pool-page
+open http://127.0.0.1:9090/pool
 ```
 
 ### Live reload

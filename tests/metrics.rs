@@ -39,7 +39,7 @@ async fn metrics_endpoint_reports_pool_and_counters() {
         vec![http_only("1.1.1.1"), socks5("2.2.2.2")],
         PoolConfig::default(),
     );
-    let handle = serve_metrics("127.0.0.1:0".parse().unwrap(), pool.clone())
+    let handle = serve_metrics("127.0.0.1:0".parse().unwrap(), pool.clone(), false)
         .await
         .unwrap();
 
