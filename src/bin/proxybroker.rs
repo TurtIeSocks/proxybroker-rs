@@ -200,6 +200,11 @@ struct ServeArgs {
     #[arg(long, default_value_t = 1024)]
     backlog: u32,
 
+    /// Maximum concurrently served client connections; beyond this, new connections wait in the
+    /// backlog. Bounds descriptor/memory use against a client that opens and holds many sockets.
+    #[arg(long, default_value_t = 1024)]
+    max_clients: usize,
+
     /// Require clients to authenticate with `Proxy-Authorization: Basic base64(user:pass)` (also
     /// gates the SOCKS5 front-end via RFC 1929). Absent = open server.
     #[arg(long, value_name = "USER:PASS")]
@@ -783,10 +788,18 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     use std::sync::Arc;
 
     let addr: std::net::SocketAddr = args.host.parse()?;
+    if args.auth.is_none() && !addr.ip().is_loopback() {
+        eprintln!(
+            "warning: serving on {} without --auth — anyone who can reach this address can relay \
+             traffic through the pool; pass --auth USER:PASS or bind to 127.0.0.1",
+            addr
+        );
+    }
     // D2: install the upsert observer + read warm-start history from --state.
     let (broker, history) = open_state(broker, args.state.as_deref())?;
     let pool_config = PoolConfig {
         max_tries: args.max_tries,
+        max_clients: args.max_clients,
         max_error_rate: args.max_error_rate,
         max_resp_time: args.max_resp_time,
         // Uppercased allow-list so the pool screens admissions (esp. the --load path, which never

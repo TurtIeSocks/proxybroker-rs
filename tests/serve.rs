@@ -803,3 +803,61 @@ async fn server_returns_502_when_pool_is_empty() {
         .unwrap();
     assert!(String::from_utf8_lossy(&resp).contains("502"));
 }
+
+/// `PoolConfig::max_clients` bounds in-flight connections: with a cap of 1, a second client is not
+/// served until the first connection ends. Excess clients wait in the TCP backlog (the server does
+/// not read from them), so an idle-socket flood cannot spawn unbounded tasks.
+#[tokio::test]
+async fn server_caps_concurrent_clients() {
+    let (upstream, _u) = mock_upstream("CAPPED").await;
+    let pool = Pool::from_proxies(
+        vec![http_proxy_at(upstream)],
+        PoolConfig {
+            max_clients: 1,
+            ..PoolConfig::default()
+        },
+    );
+    let resolver = Arc::new(Resolver::new(Duration::from_secs(3)).unwrap());
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        pool,
+        resolver,
+        Duration::from_secs(3),
+        0,
+        1024,
+        None,
+    )
+    .await
+    .unwrap();
+    let addr = handle.local_addr();
+
+    // Client 1 connects and holds the only slot without sending anything.
+    let mut idle = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Client 2 is accepted by the kernel (backlog) but must not be served while 1 holds the slot.
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    second
+        .write_all(b"GET http://1.2.3.4/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let early = tokio::time::timeout(Duration::from_millis(300), second.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "second client served while the cap was held: {early:?}"
+    );
+
+    // Release the slot: client 1 goes away, the server's handler for it ends, permit returns.
+    idle.shutdown().await.unwrap();
+    drop(idle);
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut resp))
+        .await
+        .expect("second client served after the slot was released")
+        .unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains("CAPPED"), "relayed after release: {text:?}");
+    handle.shutdown();
+}
