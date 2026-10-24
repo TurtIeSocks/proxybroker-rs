@@ -545,38 +545,56 @@ impl Checker {
     /// (by protocol, and level if one was requested). Strict: drop confirmed types whose level
     /// does not match, then pass if any survive.
     fn types_passed(&self, proxy: &mut Proxy) -> bool {
-        if self.requested.is_empty() {
-            return true;
-        }
-        let requested: BTreeMap<Proto, Option<Vec<AnonLevel>>> = self
-            .requested
-            .iter()
-            .map(|t| (t.proto, t.levels.clone()))
-            .collect();
-
-        let confirmed: Vec<(Proto, Option<AnonLevel>)> =
-            proxy.types().iter().map(|(p, l)| (*p, *l)).collect();
-        let mut to_remove = Vec::new();
-        for (proto, lvl) in confirmed {
-            let matches = match requested.get(&proto) {
-                // proto not requested, or requested with no/empty level filter → matches any
-                None | Some(None) => true,
-                Some(Some(levels)) if levels.is_empty() => true,
-                Some(Some(levels)) => lvl.is_some_and(|l| levels.contains(&l)),
-            };
-            if matches {
-                if !self.strict {
-                    return true;
-                }
-            } else if self.strict {
-                to_remove.push(proto);
-            }
-        }
-        for p in to_remove {
-            proxy.remove_type(p);
-        }
-        self.strict && !proxy.types().is_empty()
+        types_passed(&self.requested, self.strict, proxy)
     }
+}
+
+/// The type/level admission test behind [`Checker::types_passed`], split out so it can be unit
+/// tested without a judge pool.
+///
+/// `types_from` attaches `--lvl` to every requested type, but only HTTP *has* an anonymity level
+/// ([`Proto::checks_anon_level`]); a tunnel type (HTTPS / CONNECT / SOCKS) is classified `None`.
+/// Under `--strict`, a level filter on such a type is treated as not applying, so the type
+/// survives — otherwise `--types HTTP HTTPS --lvl High --strict` strips every HTTPS type and the
+/// server has no tunnel to give a CONNECT client (every `https://` request 502s). Stripping the
+/// *HTTP* type of a `HTTP:Transparent + HTTPS` proxy is exactly what strict is for: the proxy
+/// stays in the pool as HTTPS-only, so plain-HTTP clients never get routed through it.
+///
+/// Non-strict is unchanged: a tunnel type alone does not satisfy a level filter, so admission
+/// still hinges on a confirmed HTTP type at a requested level (and then admits the proxy whole).
+fn types_passed(requested: &[TypeSpec], strict: bool, proxy: &mut Proxy) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    let requested: BTreeMap<Proto, Option<Vec<AnonLevel>>> = requested
+        .iter()
+        .map(|t| (t.proto, t.levels.clone()))
+        .collect();
+
+    let confirmed: Vec<(Proto, Option<AnonLevel>)> =
+        proxy.types().iter().map(|(p, l)| (*p, *l)).collect();
+    let mut to_remove = Vec::new();
+    for (proto, lvl) in confirmed {
+        let matches = match requested.get(&proto) {
+            // proto not requested, or requested with no/empty level filter → matches any
+            None | Some(None) => true,
+            Some(Some(levels)) if levels.is_empty() => true,
+            // strict only: a level filter does not apply to a protocol that carries no level
+            Some(Some(_)) if !proto.checks_anon_level() => strict,
+            Some(Some(levels)) => lvl.is_some_and(|l| levels.contains(&l)),
+        };
+        if matches {
+            if !strict {
+                return true;
+            }
+        } else if strict {
+            to_remove.push(proto);
+        }
+    }
+    for p in to_remove {
+        proxy.remove_type(p);
+    }
+    strict && !proxy.types().is_empty()
 }
 
 /// Outcome of one connection attempt.
@@ -792,6 +810,74 @@ fn response_is_valid(content: &str, marker: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn high_only() -> Vec<TypeSpec> {
+        let levels = Some(vec![AnonLevel::High]);
+        vec![
+            TypeSpec {
+                proto: Proto::Http,
+                levels: levels.clone(),
+            },
+            TypeSpec {
+                proto: Proto::Https,
+                levels,
+            },
+        ]
+    }
+
+    fn proxy_with(types: &[(Proto, Option<AnonLevel>)]) -> Proxy {
+        let mut p = Proxy::new("10.0.0.1".parse().unwrap(), 8080, BTreeSet::new());
+        for (proto, lvl) in types {
+            p.add_type(*proto, *lvl);
+        }
+        p
+    }
+
+    #[test]
+    fn strict_keeps_tunnel_types_that_carry_no_anon_level() {
+        // `--types HTTP HTTPS --lvl High --strict` on a proxy confirmed as both: HTTPS has no
+        // level, so the filter does not apply to it and it must survive.
+        let mut p = proxy_with(&[(Proto::Http, Some(AnonLevel::High)), (Proto::Https, None)]);
+        assert!(types_passed(&high_only(), true, &mut p));
+        assert!(p.types().contains_key(&Proto::Https));
+        assert!(p.types().contains_key(&Proto::Http));
+    }
+
+    #[test]
+    fn strict_strips_the_low_level_http_type_but_keeps_the_tunnel() {
+        // The case strict exists for: a transparent HTTP proxy that also tunnels. It stays in
+        // the pool as HTTPS-only, so a plain-HTTP client is never routed through it.
+        let mut p = proxy_with(&[
+            (Proto::Http, Some(AnonLevel::Transparent)),
+            (Proto::Https, None),
+        ]);
+        assert!(types_passed(&high_only(), true, &mut p));
+        assert!(!p.types().contains_key(&Proto::Http));
+        assert!(p.types().contains_key(&Proto::Https));
+    }
+
+    #[test]
+    fn strict_rejects_a_proxy_with_nothing_left() {
+        let mut p = proxy_with(&[(Proto::Http, Some(AnonLevel::Transparent))]);
+        assert!(!types_passed(&high_only(), true, &mut p));
+        assert!(p.types().is_empty());
+    }
+
+    #[test]
+    fn non_strict_is_unchanged() {
+        // A confirmed HTTP type at a requested level admits the proxy whole, tunnel included.
+        let mut p = proxy_with(&[(Proto::Http, Some(AnonLevel::High)), (Proto::Https, None)]);
+        assert!(types_passed(&high_only(), false, &mut p));
+        assert_eq!(p.types().len(), 2);
+        // A tunnel type alone does not satisfy the level filter: `HTTP:Transparent + HTTPS` is
+        // rejected, as before, so a plain-HTTP client is never routed through its HTTP side.
+        let mut p = proxy_with(&[
+            (Proto::Http, Some(AnonLevel::Transparent)),
+            (Proto::Https, None),
+        ]);
+        assert!(!types_passed(&high_only(), false, &mut p));
+    }
 
     #[test]
     fn split_head_body_splits_on_blank_line() {
