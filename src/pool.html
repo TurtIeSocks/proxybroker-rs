@@ -34,10 +34,14 @@ function draw(){
     tb.appendChild(tr)}
   document.querySelectorAll("th").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortKey);th.classList.toggle("desc",th.dataset.k===sortKey&&desc)});
   const n=rows.length,high=rows.filter(r=>r.anon==="High").length,https=rows.filter(r=>/HTTPS|SOCKS/.test(r.types)).length;
-  document.getElementById("sum").textContent=`${n} proxies · ${high} high-anonymity HTTP · ${https} tunnel-capable (HTTPS/SOCKS) · updated ${new Date().toLocaleTimeString()}`;
+  document.getElementById("sum").textContent=`${n} usable proxies · ${high} high-anonymity HTTP · ${https} tunnel-capable (HTTPS/SOCKS)`+(idle?` · ${idle} unconfirmed (hidden)`:"")+` · updated ${new Date().toLocaleTimeString()}`;
 }
+let idle=0;
 async function load(){try{const j=await (await fetch("/pool.json")).json();
-  rows=j.map(p=>({addr:`${p.host}:${p.port}`,types:p.types.map(t=>t.type).join(" "),anon:anonOf(p),
+  // Entries with no confirmed type (e.g. --state history not yet re-checked) serve no scheme and
+  // are never selected; count them but keep the table to usable proxies.
+  idle=j.filter(p=>p.types.length===0).length;
+  rows=j.filter(p=>p.types.length>0).map(p=>({addr:`${p.host}:${p.port}`,types:p.types.map(t=>t.type).join(" "),anon:anonOf(p),
     cc:p.geo?.country?.code||"",rt:p.avg_resp_time,err:p.error_rate}));draw()}catch(e){document.getElementById("sum").textContent="fetch failed: "+e}}
 document.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(k===sortKey)desc=!desc;else{sortKey=k;desc=k==="anon"||k==="err"?true:false}draw()});
 load();setInterval(load,5000);
