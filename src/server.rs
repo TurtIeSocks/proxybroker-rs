@@ -780,10 +780,64 @@ pub fn render_metrics(pool: &Pool) -> String {
     )
 }
 
-/// Serve [`render_metrics`] over a tiny HTTP `GET` responder on `addr` (F1). Any request returns the
-/// current metrics. Mirrors `serve`'s raw-tokio accept loop + `CancellationToken` shutdown; no hyper.
+/// The live pool as JSON — every pooled [`Proxy`] in its `Serialize` shape (host, port, geo,
+/// types with anonymity level, avg_resp_time, error_rate). Served at `/pool.json` on the
+/// `--metrics` listener; the data behind the `/pool` page.
+#[cfg(feature = "metrics")]
+pub fn render_pool_json(pool: &Pool) -> String {
+    serde_json::to_string(&pool.proxies()).unwrap_or_else(|_| "[]".into())
+}
+
+/// The `/pool` page: a self-contained HTML table of the live pool (address, types, anonymity,
+/// country, response time, error rate), sortable by column, refreshed from `/pool.json` every
+/// 5 s. No external assets, so it works on an isolated LAN.
+#[cfg(feature = "metrics")]
+const POOL_PAGE: &str = include_str!("pool.html");
+
+/// Route a request on the `--metrics` listener by its path. With `pool_page` on, `/pool` is the
+/// HTML page and `/pool.json` its data; anything else — including `/`, `/metrics`, or garbage —
+/// gets the Prometheus text, so an existing scrape config keeps working whatever path it uses.
+/// With `pool_page` off (the default) the pool routes answer `404`: the listener has no auth, and
+/// pool membership is otherwise kept behind the authenticated control API.
+#[cfg(feature = "metrics")]
+fn metrics_response(request_head: &[u8], pool: &Pool, pool_page: bool) -> String {
+    let path = std::str::from_utf8(request_head)
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (status, content_type, body) = match path {
+        "/pool" if pool_page => ("200 OK", "text/html; charset=utf-8", POOL_PAGE.to_owned()),
+        "/pool.json" if pool_page => ("200 OK", "application/json", render_pool_json(pool)),
+        "/pool" | "/pool.json" => ("404 Not Found", "text/plain", String::new()),
+        _ => ("200 OK", "text/plain; version=0.0.4", render_metrics(pool)),
+    };
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        content_type,
+        body.len(),
+        body
+    )
+}
+
+/// Serve the Prometheus metrics listener on `addr` (F1). Any path returns the metrics text; the
+/// pool routes answer `404`. Mirrors `serve`'s raw-tokio accept loop + `CancellationToken`
+/// shutdown; no hyper. See [`serve_metrics_with_pool_page`] to also expose the pool.
 #[cfg(feature = "metrics")]
 pub async fn serve_metrics(addr: SocketAddr, pool: Arc<Pool>) -> std::io::Result<ServerHandle> {
+    serve_metrics_with_pool_page(addr, pool, false).await
+}
+
+/// [`serve_metrics`], optionally with the `/pool` page and `/pool.json` enabled (see
+/// [`metrics_response`]). The listener has no authentication, so `pool_page = true` reveals pool
+/// membership to anyone who can reach `addr`.
+#[cfg(feature = "metrics")]
+pub async fn serve_metrics_with_pool_page(
+    addr: SocketAddr,
+    pool: Arc<Pool>,
+    pool_page: bool,
+) -> std::io::Result<ServerHandle> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let cancel = CancellationToken::new();
@@ -799,16 +853,10 @@ pub async fn serve_metrics(addr: SocketAddr, pool: Arc<Pool>) -> std::io::Result
             };
             let pool = pool.clone();
             tokio::spawn(async move {
-                // Drain the request (any GET returns metrics); ignore the request line.
+                // One read is enough for the request line; the rest of the request is ignored.
                 let mut buf = [0u8; 1024];
-                let _ = client.read(&mut buf).await;
-                let body = render_metrics(&pool);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let n = client.read(&mut buf).await.unwrap_or(0);
+                let resp = metrics_response(&buf[..n], &pool, pool_page);
                 let _ = client.write_all(resp.as_bytes()).await;
                 let _ = client.flush().await;
             });
@@ -1957,6 +2005,44 @@ mod tests {
             pool.try_get(Scheme::Http, Some("FR")).is_none(),
             "no FR proxy to hand out"
         );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metrics_listener_routes_by_path() {
+        let pool = Pool::spawn(futures_util::stream::empty(), PoolConfig::default());
+        let head = |p: &str| format!("GET {p} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let page = metrics_response(head("/pool").as_bytes(), &pool, true);
+        assert!(page.starts_with("HTTP/1.1 200 OK"));
+        assert!(page.contains("Content-Type: text/html"));
+        assert!(page.contains("<table"));
+        let json = metrics_response(head("/pool.json").as_bytes(), &pool, true);
+        assert!(json.contains("Content-Type: application/json"));
+        assert!(json.ends_with("\r\n\r\n[]"));
+        // Everything else — root, /metrics, or a truncated/garbage head — is the Prometheus text,
+        // whether or not the pool page is enabled.
+        for head in [head("/"), head("/metrics"), String::new()] {
+            for pool_page in [true, false] {
+                let m = metrics_response(head.as_bytes(), &pool, pool_page);
+                assert!(m.starts_with("HTTP/1.1 200 OK"));
+                assert!(m.contains("text/plain; version=0.0.4"));
+                assert!(m.contains("proxybroker_pool_size"));
+            }
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn pool_page_is_off_by_default() {
+        // The listener has no auth: unless opted in, the pool routes reveal nothing — not even
+        // the empty list.
+        let pool = Pool::from_proxies(Vec::new(), PoolConfig::default());
+        for path in ["/pool", "/pool.json"] {
+            let head = format!("GET {path} HTTP/1.1\r\n\r\n");
+            let r = metrics_response(head.as_bytes(), &pool, false);
+            assert!(r.starts_with("HTTP/1.1 404 Not Found"), "{r}");
+            assert!(r.ends_with("\r\n\r\n"), "{r}");
+        }
     }
 
     #[cfg(feature = "metrics")]

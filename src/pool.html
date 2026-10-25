@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>proxybroker pool</title>
+<style>
+  body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222;background:#fafafa}
+  h1{font-size:1.2rem;margin:0 0 .25rem}
+  #sum{color:#666;margin-bottom:1rem}
+  table{border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  th,td{padding:.35rem .7rem;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}
+  th{cursor:pointer;background:#f0f0f0;user-select:none;position:sticky;top:0}
+  th.on::after{content:" ▴"} th.on.desc::after{content:" ▾"}
+  td.n{text-align:right;font-variant-numeric:tabular-nums}
+  .High{color:#0a7d2c;font-weight:600} .Anonymous{color:#b36b00} .Transparent{color:#b00020}
+  code{font-family:ui-monospace,monospace}
+</style>
+<h1>proxybroker pool</h1>
+<div id="sum">loading…</div>
+<table><thead><tr>
+  <th data-k="addr">address</th><th data-k="types">types</th><th data-k="anon">anonymity</th>
+  <th data-k="cc">country</th><th data-k="rt" class="n">resp time (s)</th><th data-k="err" class="n">error rate</th>
+</tr></thead><tbody id="rows"></tbody></table>
+<script>
+const RANK={High:3,Anonymous:2,Transparent:1,"":0};
+let sortKey="anon",desc=true,rows=[];
+function anonOf(p){let best="";for(const t of p.types)if(RANK[t.level]>RANK[best])best=t.level;return best}
+function draw(){
+  const tb=document.getElementById("rows");tb.innerHTML="";
+  const s=[...rows].sort((a,b)=>{let x=a[sortKey],y=b[sortKey];
+    if(sortKey==="anon"){x=RANK[x];y=RANK[y]} const c=x<y?-1:x>y?1:0;return desc?-c:c});
+  // Build cells with textContent only: country (and, with a user --geo-db, region/city) is
+  // untrusted text and must never be parsed as markup.
+  const cell=(txt,cls,mono)=>{const td=document.createElement("td");if(cls)td.className=cls;
+    if(mono){const c=document.createElement("code");c.textContent=txt;td.appendChild(c)}else td.textContent=txt;return td};
+  for(const r of s){const tr=document.createElement("tr");
+    tr.append(cell(r.addr,"",true),cell(r.types),cell(r.anon||"—",RANK[r.anon]!==undefined&&r.anon?r.anon:""),
+      cell(r.cc),cell(r.rt.toFixed(2),"n"),cell((r.err*100).toFixed(0)+"%","n"));
+    tb.appendChild(tr)}
+  document.querySelectorAll("th").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortKey);th.classList.toggle("desc",th.dataset.k===sortKey&&desc)});
+  const n=rows.length,high=rows.filter(r=>r.anon==="High").length,https=rows.filter(r=>/HTTPS|SOCKS/.test(r.types)).length;
+  document.getElementById("sum").textContent=`${n} usable proxies · ${high} high-anonymity HTTP · ${https} tunnel-capable (HTTPS/SOCKS)`+(idle?` · ${idle} unconfirmed (hidden)`:"")+` · updated ${new Date().toLocaleTimeString()}`;
+}
+let idle=0;
+async function load(){try{const j=await (await fetch("/pool.json")).json();
+  // Entries with no confirmed type (e.g. --state history not yet re-checked) serve no scheme and
+  // are never selected; count them but keep the table to usable proxies.
+  idle=j.filter(p=>p.types.length===0).length;
+  rows=j.filter(p=>p.types.length>0).map(p=>({addr:`${p.host}:${p.port}`,types:p.types.map(t=>t.type).join(" "),anon:anonOf(p),
+    cc:p.geo?.country?.code||"",rt:p.avg_resp_time,err:p.error_rate}));draw()}catch(e){document.getElementById("sum").textContent="fetch failed: "+e}}
+document.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(k===sortKey)desc=!desc;else{sortKey=k;desc=k==="anon"||k==="err"?true:false}draw()});
+load();setInterval(load,5000);
+</script>

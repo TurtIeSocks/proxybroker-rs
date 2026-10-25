@@ -67,8 +67,8 @@ proxybroker_rotations_total 12
 ```
 
 Error rate is an **aggregate** gauge, not a per-address one: per-proxy labels would
-be unbounded cardinality for a constantly-rotating pool. Per-proxy detail lives
-behind the [`proxycontrol`](../cli/serve.md) control API instead.
+be unbounded cardinality for a constantly-rotating pool. For a per-proxy view, opt in
+to the [pool page](../cli/serve.md#pool-page) with `--metrics-pool-page`.
 
 Library users can render the same text directly:
 
@@ -76,9 +76,12 @@ Library users can render the same text directly:
 use proxybroker::serve_metrics; // async: serve_metrics(addr, pool) -> ServerHandle
 // or render the body yourself:
 let body = proxybroker::server::render_metrics(&pool);
+// or also expose /pool and /pool.json on the same listener (no auth — see serve.md):
+use proxybroker::serve_metrics_with_pool_page; // async: (addr, pool, pool_page: bool) -> ServerHandle
 ```
 
-Both `render_metrics` and `serve_metrics` are gated on the `metrics` feature.
+`render_metrics`, `serve_metrics` and `serve_metrics_with_pool_page` are gated on the
+`metrics` feature.
 
 ### Grafana dashboard
 
