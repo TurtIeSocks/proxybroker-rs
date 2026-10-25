@@ -71,7 +71,14 @@ proxybroker --state redis://127.0.0.1/0 serve --port 8888
 ```
 
 `--state` remembers proxies across runs: it warm-starts the pool from stored
-history and folds each fresh check back in. The backend is chosen by the spec —
+history and folds each fresh check back in. The store keeps a row for **every**
+proxy checked — rejected ones included, with whatever types the probe confirmed
+before the level filter turned them down — so `serve` screens the history
+through its own type/level admission test (`FindQuery::admits`) before seeding
+the pool, and prints `warm start: N of M remembered proxies match the serve
+flags`. A proxy a fresh `find` would refuse under this run's `--types`/`--lvl`/
+`--strict` is never served from history. Library users seeding a pool from
+`Store::load` should apply the same screen. The backend is chosen by the spec —
 a `redis://` / `rediss://` URL selects Redis, anything else is treated as a
 SQLite file path. If the matching backend feature is not compiled in, the CLI
 prints a hint (`--state <spec>: a file path needs --features store-sqlite`)

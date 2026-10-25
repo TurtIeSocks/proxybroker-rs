@@ -549,8 +549,9 @@ impl Checker {
     }
 }
 
-/// The type/level admission test behind [`Checker::types_passed`], split out so it can be unit
-/// tested without a judge pool.
+/// The type/level admission test behind [`Checker::types_passed`] and
+/// [`FindQuery::admits`](crate::broker::FindQuery::admits), split out so it can be unit tested
+/// without a judge pool.
 ///
 /// `types_from` attaches `--lvl` to every requested type, but only HTTP *has* an anonymity level
 /// ([`Proto::checks_anon_level`]); a tunnel type (HTTPS / CONNECT / SOCKS) is classified `None`.
@@ -562,7 +563,7 @@ impl Checker {
 ///
 /// Non-strict is unchanged: a tunnel type alone does not satisfy a level filter, so admission
 /// still hinges on a confirmed HTTP type at a requested level (and then admits the proxy whole).
-fn types_passed(requested: &[TypeSpec], strict: bool, proxy: &mut Proxy) -> bool {
+pub(crate) fn types_passed(requested: &[TypeSpec], strict: bool, proxy: &mut Proxy) -> bool {
     if requested.is_empty() {
         return true;
     }

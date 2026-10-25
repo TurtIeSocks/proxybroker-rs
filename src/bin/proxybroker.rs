@@ -826,7 +826,14 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
         // Find proxies to fill the pool, filtered by the serve flags (types/lvl/strict/post/
         // dnsbl/countries). The flag→query mapping lives in the pure `serve_query`. D2: seed the
         // pool with stored history first, then top up from the live find.
-        let stream = broker.find(serve_query(&args)).await?;
+        let query = serve_query(&args);
+        // The store remembers every proxy ever checked — rejected ones too, with the types the
+        // probe confirmed before the level filter turned them down — and a row checked under
+        // different flags last run may not satisfy this run's. Screen history through the same
+        // admission test the checker applies, so a warm start cannot seed the pool with a proxy
+        // a fresh find would refuse (e.g. a transparent HTTP proxy under `--lvl High`).
+        let history = screen_history(history, &query);
+        let stream = broker.find(query).await?;
         Pool::spawn(
             futures_util::stream::iter(history).chain(stream),
             pool_config,
@@ -1146,6 +1153,25 @@ fn open_state(
         eprintln!("--state requires a store backend; rebuild with --features store-sqlite (or store-redis)");
     }
     Ok((broker, Vec::new()))
+}
+
+/// Keep only the warm-start rows the serve query would admit today (see [`FindQuery::admits`]),
+/// reporting how many were set aside. Pure, so the filter is testable without a store.
+#[cfg(feature = "server")]
+fn screen_history(history: Vec<Proxy>, query: &FindQuery) -> Vec<Proxy> {
+    let before = history.len();
+    let kept: Vec<Proxy> = history
+        .into_iter()
+        .filter_map(|mut p| query.admits(&mut p).then_some(p))
+        .collect();
+    if before > 0 {
+        eprintln!(
+            "warm start: {} of {} remembered proxies match the serve flags",
+            kept.len(),
+            before
+        );
+    }
+    kept
 }
 
 /// Union two proxy sets deduped on `(host, port)`, `primary` winning a conflict (D2: DB history wins
@@ -1538,6 +1564,62 @@ mod tests {
         assert!(out.contains("checked 128"), "{out}");
         assert!(out.contains("working 34"), "{out}");
         assert!(out.contains("0.72s"), "{out}");
+    }
+
+    /// Warm-start screening applies the serve query's type/level test to the remembered types.
+    #[cfg(feature = "server")]
+    #[test]
+    fn screen_history_keeps_only_what_the_query_admits() {
+        use std::collections::BTreeSet;
+        let mk = |host: &str, types: &[(Proto, Option<AnonLevel>)]| {
+            let mut p = Proxy::new(host.parse().unwrap(), 8080, BTreeSet::new());
+            for (proto, lvl) in types {
+                p.add_type(*proto, *lvl);
+            }
+            p
+        };
+        let history = vec![
+            mk("10.0.0.1", &[(Proto::Http, Some(AnonLevel::High))]),
+            mk("10.0.0.2", &[(Proto::Http, Some(AnonLevel::Transparent))]),
+            mk("10.0.0.3", &[]), // a failed check: no confirmed types
+            mk(
+                "10.0.0.4",
+                &[
+                    (Proto::Http, Some(AnonLevel::Transparent)),
+                    (Proto::Https, None),
+                ],
+            ),
+        ];
+        let query = serve_query(&ServeArgs {
+            types: vec![Proto::Http, Proto::Https],
+            lvl: vec![AnonLevel::High],
+            strict: true,
+            ..Default::default()
+        });
+        let kept = screen_history(history, &query);
+        let hosts: Vec<String> = kept.iter().map(|p| p.host.to_string()).collect();
+        assert_eq!(hosts, ["10.0.0.1", "10.0.0.4"]);
+        // Strict stripped the transparent HTTP side; the proxy stays as a tunnel only.
+        assert!(!kept[1].types().contains_key(&Proto::Http));
+        assert!(kept[1].types().contains_key(&Proto::Https));
+
+        // Non-strict: a tunnel type alone does not satisfy the level filter.
+        let query = serve_query(&ServeArgs {
+            types: vec![Proto::Http, Proto::Https],
+            lvl: vec![AnonLevel::High],
+            ..Default::default()
+        });
+        let kept = screen_history(
+            vec![mk(
+                "10.0.0.4",
+                &[
+                    (Proto::Http, Some(AnonLevel::Transparent)),
+                    (Proto::Https, None),
+                ],
+            )],
+            &query,
+        );
+        assert!(kept.is_empty());
     }
 
     #[test]
