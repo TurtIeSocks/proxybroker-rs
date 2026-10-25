@@ -162,7 +162,8 @@ curl -s http://127.0.0.1:9090/
 
 Without the flag both paths answer `404`. **The metrics listener has no authentication**: the
 page reveals pool membership to anyone who can reach the address, which the `proxycontrol` API
-deliberately does not. Keep `--metrics` on loopback or a trusted interface when enabling it.
+deliberately does not. Keep `--metrics` on loopback or a trusted interface when enabling it;
+`serve` prints a startup warning when the page is on and the address is not loopback.
 
 ```sh
 proxybroker serve --types HTTP HTTPS --lvl High --strict \

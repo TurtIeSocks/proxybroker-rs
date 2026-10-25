@@ -95,7 +95,7 @@ pub use resolver::Resolver;
 #[cfg(all(feature = "server", feature = "persist"))]
 pub use scheduler::{decayed_score, next_interval, spawn_rechecker, RecheckConfig, RecheckHandle};
 #[cfg(feature = "metrics")]
-pub use server::{render_metrics, serve_metrics};
+pub use server::{render_metrics, serve_metrics, serve_metrics_with_pool_page};
 #[cfg(feature = "server")]
 pub use server::{serve, ClientKey, Pool, PoolConfig, PoolSnapshot, ServerHandle, Strategy};
 pub use stats::Stats;

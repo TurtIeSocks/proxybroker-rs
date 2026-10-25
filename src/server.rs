@@ -821,11 +821,19 @@ fn metrics_response(request_head: &[u8], pool: &Pool, pool_page: bool) -> String
     )
 }
 
-/// Serve the metrics listener on `addr` (F1): Prometheus text, plus — when `pool_page` is set —
-/// the `/pool` page and `/pool.json` (see [`metrics_response`]). Mirrors `serve`'s raw-tokio
-/// accept loop + `CancellationToken` shutdown; no hyper.
+/// Serve the Prometheus metrics listener on `addr` (F1). Any path returns the metrics text; the
+/// pool routes answer `404`. Mirrors `serve`'s raw-tokio accept loop + `CancellationToken`
+/// shutdown; no hyper. See [`serve_metrics_with_pool_page`] to also expose the pool.
 #[cfg(feature = "metrics")]
-pub async fn serve_metrics(
+pub async fn serve_metrics(addr: SocketAddr, pool: Arc<Pool>) -> std::io::Result<ServerHandle> {
+    serve_metrics_with_pool_page(addr, pool, false).await
+}
+
+/// [`serve_metrics`], optionally with the `/pool` page and `/pool.json` enabled (see
+/// [`metrics_response`]). The listener has no authentication, so `pool_page = true` reveals pool
+/// membership to anyone who can reach `addr`.
+#[cfg(feature = "metrics")]
+pub async fn serve_metrics_with_pool_page(
     addr: SocketAddr,
     pool: Arc<Pool>,
     pool_page: bool,

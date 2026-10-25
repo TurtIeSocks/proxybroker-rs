@@ -845,7 +845,20 @@ async fn serve_cmd(broker: Broker, args: ServeArgs) -> Result<(), Box<dyn std::e
     #[cfg(feature = "metrics")]
     let _metrics = match args.metrics {
         Some(maddr) => {
-            let h = proxybroker::serve_metrics(maddr, pool.clone(), args.metrics_pool_page).await?;
+            if args.metrics_pool_page && !maddr.ip().is_loopback() {
+                eprintln!(
+                    "warning: pool page on {} — the metrics listener has no auth, so anyone who \
+                     can reach this address can list the pool; bind --metrics to 127.0.0.1 or \
+                     drop --metrics-pool-page",
+                    maddr
+                );
+            }
+            let h = proxybroker::serve_metrics_with_pool_page(
+                maddr,
+                pool.clone(),
+                args.metrics_pool_page,
+            )
+            .await?;
             eprintln!(
                 "metrics on {}{}",
                 h.local_addr(),
