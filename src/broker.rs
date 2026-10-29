@@ -126,6 +126,15 @@ impl Default for FindQuery {
 impl FindQuery {
     /// Start building a [`FindQuery`]. Consuming setters, unset fields fall back to
     /// [`FindQuery::default`] — the same shape as [`BrokerBuilder`].
+    /// Would this query's checker admit an already-checked `proxy` as it stands? The type/level
+    /// test the checker runs after probing, applied to a proxy's *recorded* types instead — for
+    /// screening proxies that were checked earlier under possibly different flags, such as
+    /// `--state` warm-start history. Strict mode strips types that fail the level filter, as
+    /// in the checker; a proxy with no confirmed types never passes.
+    pub fn admits(&self, proxy: &mut Proxy) -> bool {
+        proxy.is_working() && crate::checker::types_passed(&self.types, self.strict, proxy)
+    }
+
     pub fn builder() -> FindQueryBuilder {
         FindQueryBuilder::default()
     }
